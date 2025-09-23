@@ -7,8 +7,7 @@ import matplotlib.pyplot as plt
 # --- 1. Define the Mathematical Model Functions ---
 def exponential_decay(x, C, A, B):
     """A 3-parameter exponential decay function."""
-    x_safe = np.maximum(x, 1e-10)
-    return C + A * np.exp(-B * x_safe)
+    return C + A * np.exp(-B * x)
 
 def exponential_decay_sq(x, C, A, B):
     """A 3-parameter exponential decay function with square root."""
@@ -524,7 +523,7 @@ class unified_extrapolator:
         self.known_convergent_value = None
         self.known_convergent_uncertainty = None
 
-        column_name = input("Please enter the name of the column to fit (or 'q' to quit): ")
+        column_name = input("Please enter the name of the column to fit: ")
         if column_name.lower() in ['q', 'quit']:
             print("Exiting.")
             return
