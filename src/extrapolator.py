@@ -103,7 +103,7 @@ class unified_extrapolator:
         best_weights = None
         best_n = None
 
-        weight_powers = [1,2,3,4,5,6,7,8,9,10]
+        weight_powers = [1]
 
         if self.known_convergent_value is not None:
             print(f"Optimizing {model_name} weights using known value: {self.known_convergent_value:.8f}")
