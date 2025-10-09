@@ -1,4 +1,5 @@
 large-dataset/
+small-dataset/
 __pycache__/
 *.pyc
 .venv/

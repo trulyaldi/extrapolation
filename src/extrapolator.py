@@ -192,18 +192,22 @@ class unified_extrapolator:
         ##############################################################
         
         if model_type == 'power':
-            B_init = _init_B(x_scaled, y_trimmed, C=y_last)
+            ### START: CALLING power_fit CLASS ###
+            # 1. Create an instance of the power_fit class
+            power_fitter = power_fit(self.df)
 
-            params['B'].set(value=B_init, min=1e-6, max=10.0)
+            # 2. Pass necessary parameters from the main class to the instance
+            power_fitter.known_convergent_value = self.known_convergent_value
+            power_fitter.known_convergent_uncertainty = self.known_convergent_uncertainty
 
-            # Amplitude guess
-            amplitude_guess = y_first - y_last
-            amplitude_bound = abs(amplitude_guess)
+            # 3. Run the internal fitting method of the power_fit class
+            power_fitter._fit_column(column_name, max_x)
 
-            if y_last < y_first:
-                params['A'].set(value=amplitude_guess, min=1e-9, max=amplitude_bound)
-            else:
-                params['A'].set(value=amplitude_guess, min=-amplitude_bound, max=-1e-9)
+            # 4. Retrieve the result and return it in the expected format
+            result = power_fitter.result
+            uncertainty = power_fitter.total_uncertainty if power_fitter.total_uncertainty is not None else 0
+            
+            return result, uncertainty
         else:
             params['A'].set(value=y_first - y_last)
             if y_last < y_first:
@@ -473,7 +477,7 @@ class unified_extrapolator:
             return
 
         try:
-            max_x_val = int(input(f"Enter the extrapolation limit for '{column_name}' (e.g., 20000): "))
+            max_x_val = int(input(f"Enter the extrapolation limit for '{column_name}': "))
         except ValueError:
             print("Invalid input. Using the max value from data as the limit.")
             max_x_val = self.x_data.max()
