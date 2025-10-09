@@ -17,22 +17,18 @@ def power_law(x, C, A, B):
     """A power law function."""
     return C + A * np.power(x, -B)
 
-
-def init_B_half_life(x, y, C=None):
+def _init_B(x, y, C=None):
     """
-    Estimate initial guess for B in y = C + A * x^(-B)
-    using a half-life analogy.
+    Correctly estimates initial guess for B in y = C + A * x^(-B).
     """
     x, y = np.asarray(x), np.asarray(y)
-
     if C is None:
-        C = y[-1]  # stable asymptote guess
+        C = y[-1]
 
     x0, y0 = x[0], y[0]
     half_val = C + 0.5 * (y0 - C)
-
     idx = np.argmin(np.abs(y - half_val))
-    x_half = x[idx]
+    x_half = x[idx] # The missing line is now present
 
     if x_half <= x0 or (y0 - C) <= 0:
         return 0.1  # fallback
@@ -58,6 +54,7 @@ class unified_extrapolator:
         self.max_x = None
         self.known_convergent_value = None
         self.known_convergent_uncertainty = None
+
 
     def _fit_with_weights(self, y_data, x_scaled, params, model, weight_power):
         """Helper method to fit with specific weight power."""
@@ -145,17 +142,6 @@ class unified_extrapolator:
 
         return result
 
-    def _calculate_monte_carlo_uncertainty(self, result, model_type):
-        """Calculate Monte Carlo uncertainty for the fitted model."""
-        C_val = result.params['C'].value
-        A_val = result.params['A'].value
-        B_val = result.params['B'].value
-        c_stderr = result.params['C'].stderr or 0.0
-        a_stderr = result.params['A'].stderr or 0.0
-        b_stderr = result.params['B'].stderr or 0.0
-        return None
-
-
     def _fit_model(self, column_name, max_x, model_func, model_name, model_type):
         """Fit a specific model to the data."""
         print(f"\n--- Fitting {model_name} Model ---")
@@ -163,31 +149,31 @@ class unified_extrapolator:
         y_data = self.df[column_name].values
 
         # --- Extended: Check multiple initial points for misleading values ---
-        if len(y_data) >= 3:
-            # Check first few points (up to 3) for misleading values
-            points_to_check = min(3, len(y_data) - 1)  # Don't check all points
-            bad_points = []
 
-            for i in range(points_to_check):
-                # If point is significantly lower than last point, mark as bad
-                if y_data[i] < y_data[-1] - 0.5 * (y_data[-1] - np.min(y_data[1:])):
-                    bad_points.append(i)
-                else:
-                    # Stop at first "good" point
-                    break
+        ######################## Early data points!
+        y_data = np.asarray(y_data, dtype=float)
+        x_data = np.asarray(self.x_data.values)
 
-            # Remove bad points but keep at least 2 points
-            if bad_points and len(bad_points) < len(y_data) - 1:
-                keep_indices = [i for i in range(len(y_data)) if i not in bad_points]
-                x_trimmed = self.x_data.values[keep_indices]
-                y_trimmed = y_data[keep_indices]
-                print(f"Removed {len(bad_points)} early outlier(s) for '{column_name}'")
-            else:
-                x_trimmed = self.x_data.values
-                y_trimmed = y_data
+        if len(y_data) < 4:
+            x_trimmed, y_trimmed = x_data, y_data
         else:
-            x_trimmed = self.x_data.values
-            y_trimmed = y_data
+            # 1. Detect global trend direction
+            slope = np.polyfit(np.arange(len(y_data)), y_data, 1)[0]
+            trend = "decreasing" if slope < 0 else "increasing"
+
+            # 2. Identify the key point (max for decreasing, min for increasing)
+            if trend == "decreasing":
+                key_idx = np.argmax(y_data)
+            else:
+                key_idx = np.argmin(y_data)
+
+            # 3. Trim only if the key point is not at the start
+            if key_idx > 0:
+                x_trimmed = x_data[key_idx:]
+                y_trimmed = y_data[key_idx:]
+                print(f"Removed {key_idx} early inconsistent point(s) for '{column_name}'")
+            else:
+                x_trimmed, y_trimmed = x_data, y_data
 
         x_min_orig, x_max_orig = x_trimmed.min(), x_trimmed.max()
 
@@ -203,12 +189,10 @@ class unified_extrapolator:
         y_last, y_first = y_trimmed[-1], y_trimmed[0]
         params['C'].set(value=y_last)
 
+        ##############################################################
+        
         if model_type == 'power':
-            # Use half-life initializer for B
-            try:
-                B_init = init_B_half_life(x_trimmed, y_trimmed, C=y_last)
-            except Exception:
-                B_init = 2  # fallback if init fails
+            B_init = _init_B(x_scaled, y_trimmed, C=y_last)
 
             params['B'].set(value=B_init, min=1e-6, max=10.0)
 
@@ -291,6 +275,9 @@ class unified_extrapolator:
             if self.known_convergent_value is not None:
                 difference = extrapolated_limit - self.known_convergent_value
                 print(f"  Difference from known:  {difference:.18f}")
+
+
+
 
     def _draw_model_plot(self, ax, model_key, model_name):
         """Draw a specific model's fit on the given axis."""
@@ -509,10 +496,9 @@ class unified_extrapolator:
         self.plot_all_results()
 
 
-# --- 2. Create the Enhanced Fitter Class ---
-class exponential_fit_sq:
+class power_fit:
     """
-    A class to interactively fit an exponential model using a
+    A class to interactively fit a power law model using a
     Self-Consistent Iteratively Reweighted Least Squares (IRLS) approach
     and calculate a comprehensive uncertainty for the extrapolated limit.
     """
@@ -536,9 +522,10 @@ class exponential_fit_sq:
             'residual_std': []
         }
 
+
     def _fit_column(self, column_name, max_x):
         """
-        Performs a self-consistent, data-driven exponential fit using IRLS.
+        Performs a self-consistent, data-driven power law fit using IRLS with weight optimization.
         """
         self.column_name = column_name
         self.max_x = max_x
@@ -547,55 +534,50 @@ class exponential_fit_sq:
         # Clear iteration history for new fit
         for key in self.iteration_history:
             self.iteration_history[key] = []
+        ######################## Early data points!
+        y_data = np.asarray(y_data, dtype=float)
+        x_data = np.asarray(self.x_data.values)
 
-        # --- Extended: Check multiple initial points for misleading values ---
-        if len(y_data) >= 3:
-            # Check first few points (up to 3) for misleading values
-            points_to_check = min(3, len(y_data) - 1)  # Don't check all points
-            bad_points = []
-            
-            for i in range(points_to_check):
-                # If point is significantly lower than last point, mark as bad
-                if y_data[i] < y_data[-1] - 0.5 * (y_data[-1] - np.min(y_data[1:])):
-                    bad_points.append(i)
-                else:
-                    # Stop at first "good" point
-                    break
-            
-            # Remove bad points but keep at least 2 points
-            if bad_points and len(bad_points) < len(y_data) - 1:
-                keep_indices = [i for i in range(len(y_data)) if i not in bad_points]
-                x_trimmed = self.x_data.values[keep_indices]
-                y_trimmed = y_data[keep_indices]
-                print(f"Removed {len(bad_points)} early outlier(s) for '{column_name}'")
-            else:
-                x_trimmed = self.x_data.values
-                y_trimmed = y_data
+        if len(y_data) < 4:
+            x_trimmed, y_trimmed = x_data, y_data
         else:
-            x_trimmed = self.x_data.values
-            y_trimmed = y_data
+            # 1. Detect global trend direction
+            slope = np.polyfit(np.arange(len(y_data)), y_data, 1)[0]
+            trend = "decreasing" if slope < 0 else "increasing"
+
+            # 2. Identify the key point (max for decreasing, min for increasing)
+            if trend == "decreasing":
+                key_idx = np.argmax(y_data)
+            else:
+                key_idx = np.argmin(y_data)
+
+            # 3. Trim only if the key point is not at the start
+            if key_idx > 0:
+                x_trimmed = x_data[key_idx:]
+                y_trimmed = y_data[key_idx:]
+                print(f"Removed {key_idx} early inconsistent point(s) for '{column_name}'")
+            else:
+                x_trimmed, y_trimmed = x_data, y_data
 
         # Use trimmed data for all fitting calculations
         x_min_orig, x_max_orig = x_trimmed.min(), x_trimmed.max()
-        x_scaled = (x_trimmed - x_min_orig) / (x_max_orig - x_min_orig)
+        x_scaled = x_trimmed / x_max_orig
+        power_model = Model(power_law)
+        params = power_model.make_params()
 
-        exp_model = Model(exponential_decay_sq)
-        params = exp_model.make_params()
-
+        # Initial guesses for the parameters using trimmed data
         y_last, y_first = y_trimmed[-1], y_trimmed[0]
         params['C'].set(value=y_last)
-        params['A'].set(value=y_first - y_last)
-        if y_last < y_first:
-            params['A'].set(min=0.0)
-        else:
-            params['A'].set(max=0.0)
+        B0 = _init_B(x_scaled, y_trimmed)
+        params['B'].set(value=B0, min=1e-6, max=5)
 
-        try:
-            half_life_y = y_last + (y_first - y_last) / 2.0
-            half_life_x = x_scaled[np.argmin(np.abs(y_trimmed - half_life_y))]
-            params['B'].set(value=np.log(2) / np.sqrt(half_life_x) if half_life_x > 1e-6 else 0.1, min=1e-6)
-        except:
-            params['B'].set(value=0.1, min=1e-6)
+        amplitude_guess = y_first - y_last
+        amplitude_bound = abs(amplitude_guess)
+
+        if y_last < y_first:  # Decreasing trend -> A must be positive
+            params['A'].set(value=amplitude_guess, min=1e-9, max=amplitude_bound)
+        else:  # Increasing trend -> A must be negative
+            params['A'].set(value=amplitude_guess, min=-amplitude_bound, max=-1e-9)
 
         print("\n--- Starting Self-Consistent IRLS with Weight Optimization ---")
 
@@ -605,7 +587,7 @@ class exponential_fit_sq:
         best_weights = None
         best_n = None
 
-        weight_powers = [1, 2, 3, 4, 5]
+        weight_powers = [1]
 
         if self.known_convergent_value is not None:
             print(f"Optimizing weights using known value: {self.known_convergent_value:.8f}")
@@ -614,7 +596,7 @@ class exponential_fit_sq:
             for n in weight_powers:
                 try:
                     temp_result, temp_weights = self._fit_with_weights(
-                        y_trimmed, x_scaled, params.copy(), exp_model, n
+                        y_trimmed, x_scaled, params.copy(), power_model, n
                     )
 
                     # Calculate distance to known value
@@ -640,35 +622,25 @@ class exponential_fit_sq:
             else:
                 print("Weight optimization failed, using default weights (n=1)")
                 result, current_weights = self._fit_with_weights(
-                    y_trimmed, x_scaled, params.copy(), exp_model, 1
+                    y_trimmed, x_scaled, params.copy(), power_model, 1
                 )
         else:
             # No known value, use default weight power
             print("No known convergent value provided, using weight power n=1")
             result, current_weights = self._fit_with_weights(
-                y_trimmed, x_scaled, params.copy(), exp_model, 1
+                y_trimmed, x_scaled, params.copy(), power_model, 1
             )
 
         self.result = result
         final_weights = current_weights
 
-        C_val = self.result.params['C'].value
-        A_val = self.result.params['A'].value
-        B_val = self.result.params['B'].value
-        c_stderr = self.result.params['C'].stderr 
-        a_stderr = self.result.params['A'].stderr 
-        b_stderr = self.result.params['B'].stderr 
 
-        ########################################################
-      
+        # For finite extrapolation point
+        x_extrap_actual = self.max_x
+        x_scaled_extrap = x_extrap_actual / x_max_orig
 
-
-
-
-
-        ##########################################################
         # Total uncertainty (no arbitrary constants!)
-        # self.total_uncertainty = 
+        self.total_uncertainty = 0
 
         print("\n--- Final Fitted Parameters (after Self-Consistent IRLS) ---")
         for param_name, param in self.result.params.items():
@@ -678,7 +650,7 @@ class exponential_fit_sq:
 
         print(f"\n--- Final Result for '{self.column_name}' ---")
         print(f"Extrapolated Limit (C): {extrapolated_limit:.8f}")
-        # print(f"Total Combined Uncertainty: ± {self.total_uncertainty:.8f}")
+        print(f"Total Combined Uncertainty: ± {self.total_uncertainty:.8f}")
 
         if self.known_convergent_value is not None:
             print(f"Known Convergent Value:   {self.known_convergent_value:.8f}")
@@ -692,20 +664,11 @@ class exponential_fit_sq:
         convergence_threshold = 1e-8
         current_weights = np.ones(len(x_scaled))
 
-        # Store iteration history temporarily
-        temp_history = {
-            'C': [params['C'].value],
-            'A': [params['A'].value],
-            'B': [params['B'].value],
-            'param_change': [0.0],
-            'residual_std': [0.0]
-        }
-
         for i in range(n_iterations):
             result = model.fit(y_data, params, x=x_scaled, weights=current_weights)
             residuals = result.residual
 
-            W_pos = np.exp(params['B'].value * np.sqrt(x_scaled))
+            W_pos = x_scaled ** params['B'].value
             W_pos /= np.mean(W_pos)
 
             # Apply weight power
@@ -720,11 +683,11 @@ class exponential_fit_sq:
             param_change = np.sum((old_params - new_params)**2)
 
             # Store iteration data
-            temp_history['C'].append(result.params['C'].value)
-            temp_history['A'].append(result.params['A'].value)
-            temp_history['B'].append(result.params['B'].value)
-            temp_history['param_change'].append(param_change)
-            temp_history['residual_std'].append(np.std(residuals))
+            self.iteration_history['C'].append(result.params['C'].value)
+            self.iteration_history['A'].append(result.params['A'].value)
+            self.iteration_history['B'].append(result.params['B'].value)
+            self.iteration_history['param_change'].append(param_change)
+            self.iteration_history['residual_std'].append(np.std(residuals))
 
             if param_change < convergence_threshold and i > 0:
                 break
@@ -739,13 +702,13 @@ class exponential_fit_sq:
         ax.plot(self.x_data, y_data, 'o', label='Original Data')
 
         plot_x_orig = np.linspace(x_min_orig, self.max_x, 400)
-        plot_x_scaled = (plot_x_orig - x_min_orig) / (x_max_orig - x_min_orig)
+        plot_x_scaled = plot_x_orig / x_max_orig
         plot_y = self.result.eval(x=plot_x_scaled)
         ax.plot(plot_x_orig, plot_y, '-', label='Best Fit', linewidth=2)
 
         extrap_x_orig = np.arange(x_max_orig + 1000, self.max_x + 1, 1000)
         if len(extrap_x_orig) > 0:
-            extrap_x_scaled = (extrap_x_orig - x_min_orig) / (x_max_orig - x_min_orig)
+            extrap_x_scaled = extrap_x_orig / x_max_orig
             extrap_y = self.result.eval(x=extrap_x_scaled)
             ax.plot(extrap_x_orig, extrap_y, 'o', color='red', markersize=6, label='Extrapolated Points')
 
@@ -755,15 +718,15 @@ class exponential_fit_sq:
         ax.axhline(extrapolated_limit, color='red', linestyle='--', label=f'Extrapolated Limit')
         if uncertainty > 0:
             ax.axhspan(extrapolated_limit - uncertainty, extrapolated_limit + uncertainty,
-                      color='red', alpha=0.15, label='Total Uncertainty Band')
+                       color='red', alpha=0.15, label='Total Uncertainty Band')
 
         if self.known_convergent_value is not None:
             ax.axhline(self.known_convergent_value, color='black', linestyle=':', linewidth=2.5,
-                      label=f'Known CV ({self.known_convergent_value:.6f})')
+                       label=f'Known CV ({self.known_convergent_value:.6f})')
             if self.known_convergent_uncertainty is not None:
                 ax.axhspan(self.known_convergent_value - self.known_convergent_uncertainty,
-                          self.known_convergent_value + self.known_convergent_uncertainty,
-                          color='black', alpha=0.15, label='Known CV Uncertainty')
+                           self.known_convergent_value + self.known_convergent_uncertainty,
+                           color='black', alpha=0.15, label='Known CV Uncertainty')
 
         ax.set_xlabel("Basis Size")
         ax.set_ylabel(self.column_name)
@@ -780,7 +743,7 @@ class exponential_fit_sq:
         ax1 = fig.add_subplot(gs[0, 0])  # Overall view (left)
         ax2 = fig.add_subplot(gs[0, 1])  # Zoomed view (right)
 
-        fig.suptitle(f"Exponential Fit for '{self.column_name}' using IRLS", fontsize=16)
+        fig.suptitle(f"Power-Law Fit for '{self.column_name}' using IRLS", fontsize=16)
 
         # Draw main plots
         self._draw_plots_on_axis(ax1)
