@@ -44,7 +44,28 @@ def _init_B(x, y, C=None):
         return float(np.clip(B_est, 1e-6, 5.0))
     except:
         return 0.1
+    
+def _scale_covariance_with_weights(result, weights):
+    """
+    Scale parameter uncertainties based on reduced chi-squared.
+    Used by both exponential and power law fits.
+    """
+    residuals = result.residual
+    weighted_residuals = residuals * np.sqrt(weights)
+    n_data = len(residuals)
+    n_params = len(result.params)
+    chi2_reduced = np.sum(weighted_residuals**2) / (n_data - n_params)
 
+    if chi2_reduced > 1.0:
+        scale_factor = np.sqrt(chi2_reduced)
+        
+        for param_name in result.params:
+            if result.params[param_name].stderr is not None:
+                result.params[param_name].stderr *= scale_factor
+        
+        print(f"      Scaled uncertainties by {scale_factor:.3f} (χ²_red = {chi2_reduced:.3f})")
+
+    return result
 # --- 2. Create the Unified Fitter Class ---
 class unified_extrapolator:
     """
@@ -147,7 +168,7 @@ class unified_extrapolator:
         dC = params['C'].stderr if params['C'].stderr is not None else 0
         
         return dC
-
+###########################################################################################
     def _fit_with_weights(self, y_data, x_scaled, params, model, weight_power):
         """Helper method to fit with specific weight power."""
         n_iterations = 100
@@ -182,7 +203,8 @@ class unified_extrapolator:
 
             if param_change < convergence_threshold and i > 0:
                 break
-
+###########################################################################
+        result = _scale_covariance_with_weights(result, current_weights)
         return result, current_weights
 
     def _optimize_weights_and_fit(self, y_data, x_scaled, params, model, model_name):
@@ -192,7 +214,7 @@ class unified_extrapolator:
         best_weights = None
         best_n = None
 
-        weight_powers = [1]
+        weight_powers = [1,2]
 
         if self.known_convergent_value is not None:
             print(f"Optimizing {model_name} weights using known value: {self.known_convergent_value:.8f}")
@@ -819,7 +841,7 @@ class power_fit:
         # Weight optimization if known value provided
         best_result = None
         best_distance = np.inf
-        weight_powers = [1]
+        weight_powers = [1,2]
 
         if self.known_convergent_value is not None:
             print(f"Optimizing weights using known value: {self.known_convergent_value:.8f}")
@@ -889,7 +911,8 @@ class power_fit:
             
             if param_change < convergence_threshold and i > 0:
                 break
-
+        
+        result = _scale_covariance_with_weights(result, current_weights)
         return result, current_weights
     
     def get_uncertainty_band(self, x_values, x_max_orig):
@@ -914,3 +937,5 @@ class power_fit:
             f_max_curve.append(f_max)
         
         return np.array(f_min_curve), np.array(f_max_curve)
+
+
