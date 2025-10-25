@@ -2,6 +2,7 @@ import matplotlib.patches as patches
 from lmfit import Model
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
 
 # --- 1. Define the Mathematical Model Functions ---
 
@@ -262,7 +263,7 @@ class FittingMixin:
         best_distance = np.inf
         best_n = None
 
-        weight_powers = [1, 2]
+        weight_powers = [1]
 
         if self.known_convergent_value is not None:
             print(f"Optimizing {model_name} weights using known value: {self.known_convergent_value:.8f}")
@@ -495,174 +496,170 @@ class unified_extrapolator(UncertaintyCalculator, FittingMixin):
         
         return np.array(f_min_curve), np.array(f_max_curve)
 
-    def _draw_model_plot(self, ax, model_key, model_name):
-        """Draw a specific model's fit on the given axis."""
-        if model_key not in self.results:
+    def _draw_combined_plot(self, ax, zoom=False):
+        """Draw all three models on a single axis."""
+        if not self.results:
             return
 
-        result = self.results[model_key]
-        uncertainty = self.uncertainties[model_key]
         y_data = self.df[self.column_name]
         x_min_orig, x_max_orig = self.x_data.min(), self.x_data.max()
 
+        # Define distinct colors for each model
+        colors = {
+            'exponential': '#1f77b4',      # Blue
+            'exponential_sq': '#ff7f0e',   # Orange
+            'power': '#2ca02c'              # Green
+        }
+
         # Plot original data
-        ax.plot(self.x_data, y_data, 'o', label='Original Data', markersize=6)
+        ax.plot(self.x_data, y_data, 'ko', label='Original Data', markersize=6, zorder=5)
 
-        # Plot fitted curve
-        if model_key == 'power':
+        model_names = {
+            'exponential': 'Exponential',
+            'exponential_sq': 'Exponential √x',
+            'power': 'Power Law'
+        }
+
+        model_keys = ['exponential', 'exponential_sq', 'power']
+        
+        # --- MODIFIED ZOOM LOGIC ---
+        if zoom:
+            # Determine the x-range for the zoom (e.g., last 25% of the data)
+            x_data_values = self.x_data.values
+            zoom_start_idx = max(0, int(len(x_data_values) * 0.75))
+            x_zoom_min = x_data_values[zoom_start_idx]
+            
+            ax.set_xlim(x_zoom_min, self.max_x)
+
+            # Find the min/max y-values within this new x-range to set y-limits
+            y_values_in_zoom = []
+            
+            # 1. Add original data points in the zoom range
+            zoom_mask = self.x_data >= x_zoom_min
+            y_values_in_zoom.extend(y_data[zoom_mask].values)
+
+            # 2. Add fitted curve points in the zoom range
+            plot_x_zoom = np.linspace(x_zoom_min, self.max_x, 100)
+            for model_key in model_keys:
+                result = self.results[model_key]
+                if model_key == 'power':
+                    plot_x_scaled = plot_x_zoom / x_max_orig
+                else:
+                    plot_x_scaled = (plot_x_zoom - x_min_orig) / (x_max_orig - x_min_orig)
+                y_values_in_zoom.extend(result.eval(x=plot_x_scaled))
+
+            # 3. Add the known CV value to ensure it's visible
+            if self.known_convergent_value is not None:
+                y_values_in_zoom.append(self.known_convergent_value)
+
+            # Calculate y-limits with padding
+            if y_values_in_zoom:
+                y_min_zoom = np.min(y_values_in_zoom)
+                y_max_zoom = np.max(y_values_in_zoom)
+                y_range = y_max_zoom - y_min_zoom
+                
+                # Add padding to the y-axis
+                y_padding = y_range * 0.2  # 20% padding
+                if y_padding < 1e-9: # Add a small absolute padding if range is tiny
+                    y_padding = 0.1 * abs(y_min_zoom) if y_min_zoom != 0 else 0.1
+                    
+                ax.set_ylim(y_min_zoom - y_padding, y_max_zoom + y_padding)
+        # --- END OF MODIFIED ZOOM LOGIC ---
+
+        # Plot each model
+        for model_key in model_keys:
+            if model_key not in self.results:
+                continue
+
+            result = self.results[model_key]
+            uncertainty = self.uncertainties[model_key]
+            color = colors[model_key]
+
+            # Generate x values for plotting
             plot_x_orig = np.linspace(x_min_orig, self.max_x, 400)
-            plot_x_scaled = plot_x_orig / x_max_orig
-            extrap_x_orig = np.arange(x_max_orig + 1000, self.max_x + 1, 1000)
+
+            # Scale x values based on model type
+            if model_key == 'power':
+                plot_x_scaled = plot_x_orig / x_max_orig
+                extrap_x_orig = np.arange(x_max_orig + 1000, self.max_x + 1, 1000)
+                if len(extrap_x_orig) > 0:
+                    extrap_x_scaled = extrap_x_orig / x_max_orig
+            else:
+                plot_x_scaled = (plot_x_orig - x_min_orig) / (x_max_orig - x_min_orig)
+                extrap_x_orig = np.arange(x_max_orig + 1000, self.max_x + 1, 1000)
+                if len(extrap_x_orig) > 0:
+                    extrap_x_scaled = (extrap_x_orig - x_min_orig) / (x_max_orig - x_min_orig)
+
+            # Plot fitted curve
+            plot_y = result.eval(x=plot_x_scaled)
+            ax.plot(plot_x_orig, plot_y, '-', color=color, label=f'{model_names[model_key]} Fit',
+                   linewidth=2, zorder=4)
+
+            # Plot extrapolated points
             if len(extrap_x_orig) > 0:
-                extrap_x_scaled = extrap_x_orig / x_max_orig
-        else:
-            plot_x_orig = np.linspace(x_min_orig, self.max_x, 400)
-            plot_x_scaled = (plot_x_orig - x_min_orig) / (x_max_orig - x_min_orig)
-            extrap_x_orig = np.arange(x_max_orig + 1000, self.max_x + 1, 1000)
-            if len(extrap_x_orig) > 0:
-                extrap_x_scaled = (extrap_x_orig - x_min_orig) / (x_max_orig - x_min_orig)
+                extrap_y = result.eval(x=extrap_x_scaled)
+                ax.plot(extrap_x_orig, extrap_y, 'o', color=color, markersize=5, zorder=3)
 
-        # Plot fitted curve
-        plot_y = result.eval(x=plot_x_scaled)
-        ax.plot(plot_x_orig, plot_y, '-', label=f'{model_name} Fit', linewidth=2)
+            # Plot extrapolated limit
+            extrapolated_limit = result.params['C'].value
+            ax.axhline(extrapolated_limit, color=color, linestyle='--', linewidth=1.5,
+                      label=f'{model_names[model_key]} Limit', zorder=2)
 
-        # Plot extrapolated points
-        if len(extrap_x_orig) > 0:
-            extrap_y = result.eval(x=extrap_x_scaled)
-            ax.plot(extrap_x_orig, extrap_y, 'o', color='red', markersize=6, label='Extrapolated Points')
-
-        # Plot extrapolated limit and uncertainty
-        extrapolated_limit = result.params['C'].value
-        ax.axhline(extrapolated_limit, color='red', linestyle='--', label=f'Extrapolated Limit')
-        if uncertainty > 0:
-            ax.axhspan(extrapolated_limit - uncertainty, extrapolated_limit + uncertainty,
-                      color='red', alpha=0.15, label='Limit Uncertainty (ΔC)')
+            # Plot uncertainty band with dashed lines
+            if uncertainty > 0:
+                # Create uncertainty band with dashed border lines
+                upper_bound = extrapolated_limit + uncertainty
+                lower_bound = extrapolated_limit - uncertainty
+                
+                ax.axhline(upper_bound, color=color, linestyle='--', linewidth=1, alpha=0.5, zorder=1)
+                ax.axhline(lower_bound, color=color, linestyle='--', linewidth=1, alpha=0.5, zorder=1)
+                
+                # Fill uncertainty band with light shade
+                ax.axhspan(lower_bound, upper_bound, color=color, alpha=0.12, zorder=0,
+                          label=f'{model_names[model_key]} Uncertainty (ΔC)')
 
         # Plot known convergent value if provided
         if self.known_convergent_value is not None:
             ax.axhline(self.known_convergent_value, color='black', linestyle=':', linewidth=2.5,
-                      label=f'Known CV ({self.known_convergent_value:.6f})')
+                      label=f'Known CV ({self.known_convergent_value:.6f})', zorder=6)
             if self.known_convergent_uncertainty is not None:
-                ax.axhspan(self.known_convergent_value - self.known_convergent_uncertainty,
-                          self.known_convergent_value + self.known_convergent_uncertainty,
-                          color='black', alpha=0.15, label='Known CV Uncertainty')
+                upper_cv = self.known_convergent_value + self.known_convergent_uncertainty
+                lower_cv = self.known_convergent_value - self.known_convergent_uncertainty
+                ax.axhline(upper_cv, color='black', linestyle='--', linewidth=1, alpha=0.5, zorder=1)
+                ax.axhline(lower_cv, color='black', linestyle='--', linewidth=1, alpha=0.5, zorder=1)
+                ax.axhspan(lower_cv, upper_cv, color='black', alpha=0.08, zorder=0,
+                          label='Known CV Uncertainty')
 
-        ax.set_xlabel("Basis Size")
-        ax.set_ylabel(self.column_name)
-        ax.set_title(f"{model_name} Model")
+        ax.set_xlabel("Basis Size", fontsize=11)
+        ax.set_ylabel(self.column_name, fontsize=11)
         ax.grid(True, linestyle='--', alpha=0.5)
-        ax.legend()
-
-    def _draw_zoom_plot(self, ax, model_key, model_name):
-        """Draw a zoomed view of a specific model's fit."""
-        if model_key not in self.results:
-            return
-
-        result = self.results[model_key]
-        uncertainty = self.uncertainties[model_key]
-        y_data = self.df[self.column_name]
-        x_min_orig, x_max_orig = self.x_data.min(), self.x_data.max()
-
-        # Plot original data
-        ax.plot(self.x_data, y_data, 'o', label='Original Data', markersize=6)
-
-        # Determine zoom range
-        x_data_values = self.x_data.values
-        zoom_start_idx = max(0, int(len(x_data_values) * 0.75))
-        x_zoom_min = x_data_values[zoom_start_idx]
-        if len(x_data_values) <= 3:
-            x_zoom_min = x_data_values[0]
-
-        ax.set_xlim(x_zoom_min, self.max_x)
-
-        # Plot fitted curve in zoom range
-        if model_key == 'power':
-            plot_x_orig = np.linspace(x_zoom_min, self.max_x, 200)
-            plot_x_scaled = plot_x_orig / x_max_orig
-            extrap_x_orig = np.arange(x_max_orig + 1000, self.max_x + 1, 1000)
-            if len(extrap_x_orig) > 0:
-                extrap_x_scaled = extrap_x_orig / x_max_orig
+        ax.legend(loc='best', fontsize=9)
+        
+        if zoom:
+            ax.set_title(f"Zoom: All Models", fontsize=12, fontweight='bold')
         else:
-            plot_x_orig = np.linspace(x_zoom_min, self.max_x, 200)
-            plot_x_scaled = (plot_x_orig - x_min_orig) / (x_max_orig - x_min_orig)
-            extrap_x_orig = np.arange(x_max_orig + 1000, self.max_x + 1, 1000)
-            if len(extrap_x_orig) > 0:
-                extrap_x_scaled = (extrap_x_orig - x_min_orig) / (x_max_orig - x_min_orig)
-
-        # Plot fitted curve
-        plot_y = result.eval(x=plot_x_scaled)
-        ax.plot(plot_x_orig, plot_y, '-', label=f'{model_name} Fit', linewidth=2)
-
-        # Plot extrapolated points
-        if len(extrap_x_orig) > 0:
-            extrap_y = result.eval(x=extrap_x_scaled)
-            ax.plot(extrap_x_orig, extrap_y, 'o', color='red', markersize=6, label='Extrapolated Points')
-
-        # Plot extrapolated limit and uncertainty
-        extrapolated_limit = result.params['C'].value
-        ax.axhline(extrapolated_limit, color='red', linestyle='--', label=f'Extrapolated Limit')
-        if uncertainty > 0:
-            ax.axhspan(extrapolated_limit - uncertainty, extrapolated_limit + uncertainty,
-                      color='red', alpha=0.15, label='Limit Uncertainty (ΔC)')
-
-        # Plot known convergent value if provided
-        if self.known_convergent_value is not None:
-            ax.axhline(self.known_convergent_value, color='black', linestyle=':', linewidth=2.5,
-                      label=f'Known CV ({self.known_convergent_value:.18f})')
-            if self.known_convergent_uncertainty is not None:
-                ax.axhspan(self.known_convergent_value - self.known_convergent_uncertainty,
-                          self.known_convergent_value + self.known_convergent_uncertainty,
-                          color='black', alpha=0.15, label='Known CV Uncertainty')
-
-        # Smart y-range determination
-        mask = self.x_data >= x_zoom_min
-        visible_y_data = y_data[mask].values
-
-        if len(visible_y_data) > 0:
-            y_min_zoom = min(np.min(visible_y_data), extrapolated_limit)
-            y_max_zoom = max(np.max(visible_y_data), extrapolated_limit)
-        else:
-            y_min_zoom = min(y_data.min(), extrapolated_limit)
-            y_max_zoom = max(y_data.max(), extrapolated_limit)
-
-        y_range = y_max_zoom - y_min_zoom
-        if y_range < 1e-12:
-            y_range = abs(extrapolated_limit * 0.1) if abs(extrapolated_limit) > 1e-12 else 0.1
-
-        y_padding = y_range * 0.3
-        ax.set_ylim(y_min_zoom - y_padding, y_max_zoom + y_padding)
-
-        ax.set_xlabel("Basis Size")
-        ax.set_ylabel(self.column_name)
-        ax.set_title(f"Zoom: {model_name} Model")
-        ax.grid(True, linestyle='--', alpha=0.5)
-        ax.legend()
+            ax.set_title(f"All Models Overview", fontsize=12, fontweight='bold')
 
     def plot_all_results(self):
-        """Create a 3x2 grid plot with all models and their zoomed views."""
+        """Create a 1x2 grid plot with all models on each subplot."""
         if not self.results:
             print("No results to plot. Run fit_column() first.")
             return
 
-        fig = plt.figure(figsize=(20, 20))
+        fig = plt.figure(figsize=(18, 7))
 
-        # Create 3 rows x 2 columns grid
-        gs = fig.add_gridspec(3, 2, height_ratios=[1, 1, 1], width_ratios=[1, 1])
+        # Create 1 row x 2 columns grid
+        gs = fig.add_gridspec(1, 2, width_ratios=[1, 1])
 
-        model_names = ['Exponential', 'Exponential √x', 'Power Law']
-        model_keys = ['exponential', 'exponential_sq', 'power']
+        # Left plot: Overall view with all models
+        ax_left = fig.add_subplot(gs[0, 0])
+        self._draw_combined_plot(ax_left, zoom=False)
 
-        # Plot full views (left column)
-        for i, (key, name) in enumerate(zip(model_keys, model_names)):
-            ax = fig.add_subplot(gs[i, 0])
-            self._draw_model_plot(ax, key, name)
+        # Right plot: Zoomed view with all models
+        ax_right = fig.add_subplot(gs[0, 1])
+        self._draw_combined_plot(ax_right, zoom=True)
 
-        # Plot zoomed views (right column)
-        for i, (key, name) in enumerate(zip(model_keys, model_names)):
-            ax = fig.add_subplot(gs[i, 1])
-            self._draw_zoom_plot(ax, key, name)
-
-        fig.suptitle(f"Unified Extrapolation Results for '{self.column_name}'", fontsize=18)
+        fig.suptitle(f"Unified Extrapolation Results for '{self.column_name}'", fontsize=16, fontweight='bold')
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         plt.show()
 
@@ -710,3 +707,86 @@ class unified_extrapolator(UncertaintyCalculator, FittingMixin):
 
         self.fit_column(column_name, max_x_val)
         self.plot_all_results()
+
+
+def upload_df(file_path, start_basis_size = 900):
+  df = pd.read_csv(file_path)
+  df['Basis Size'] = df['Basis Size'].astype(int)
+
+  for i in range(df['Basis Size'].values[0],start_basis_size + 1,100):
+    df.drop(df[df['Basis Size'] == i].index, inplace = True)
+
+  return df
+
+def upload_basis(file_path):
+  df = pd.read_csv(file_path)
+  df['basis size'] = df['basis size'].astype(int)
+
+  return df[:-1]
+
+def upload_error(file_path):
+  df = pd.read_csv(file_path)
+  df['basis size'] = df['basis size'].astype(int)
+
+  return df.tail(1)
+
+
+def graph(df: pd.DataFrame, n_cols: int = 4):
+    """
+    Generates and displays a grid of plots for each feature in a DataFrame
+    against the 'basis size' column.
+
+    Args:
+        df (pd.DataFrame): The input DataFrame. It must contain a column
+                           named 'basis size' (case-insensitive).
+        n_cols (int): The number of columns to use in the plot grid.
+                      Defaults to 4.
+    """
+    # Create a copy to avoid changing the original DataFrame
+    df_plot = df.copy()
+
+    # Standardize column names to lowercase for consistency
+    df_plot.columns = [col.lower() for col in df_plot.columns]
+
+    # Check for the required 'basis size' column
+    if 'basis size' not in df_plot.columns:
+        raise ValueError("Input DataFrame must contain a 'basis size' column.")
+
+    # Prepare the data and identify features to plot
+    df_plot['basis size'] = df_plot['basis size'].astype(int)
+    features = sorted([col for col in df_plot.columns if col != 'basis size'])
+    n_features = len(features)
+
+    # Handle the case of no features to plot
+    if n_features == 0:
+        print("No feature columns found to plot.")
+        return
+
+    # Calculate the required number of rows for the grid
+    n_rows = (n_features + n_cols - 1) // n_cols
+
+    # Create the figure and subplots
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.5 * n_rows), sharex=True)
+    fig.suptitle('Features vs. Basis Size', fontsize=16, y=1.03)
+
+    # Flatten the axes array for easy, single-loop iteration
+    axes = axes.flatten()
+
+    # Plot each feature against the basis size
+    for i, feature in enumerate(features):
+        ax = axes[i]
+        ax.scatter(df_plot['basis size'], df_plot[feature], marker='o')
+
+        # Format titles and labels for readability
+        ax.set_title(feature.replace('_', ' ').title())
+        ax.set_xlabel('Basis Size')
+        ax.set_ylabel('Value')
+        ax.grid(True, linestyle='--', alpha=0.6)
+
+    # Clean up by removing any empty, unused subplots
+    for j in range(i + 1, len(axes)):
+        fig.delaxes(axes[j])
+
+    # Adjust layout to prevent plot elements from overlapping
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    plt.show()
