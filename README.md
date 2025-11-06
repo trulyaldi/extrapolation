@@ -1,17 +1,19 @@
 # Extrapolation
 
-A comprehensive data analysis and experimentation repository focused on exploring and implementing extrapolation techniques across various dataset sizes.
+A comprehensive data analysis and experimentation repository focused on exploring and implementing extrapolation techniques for **exponential decay convergence** datasets across various scales and scientific domains.
 
-## Table of Contents
+## 📋 Table of Contents
 
 - [Overview](#overview)
-- [Repository Structure](#repository-structure)
+- [Scientific Background](#scientific-background)
+- [Applications](#applications)
 - [Features](#features)
 - [Getting Started](#getting-started)
   - [Prerequisites](#prerequisites)
   - [Installation](#installation)
   - [Running the Notebooks](#running-the-notebooks)
 - [Dataset Guide](#dataset-guide)
+- [Extrapolation Methods](#extrapolation-methods)
 - [Project Structure](#project-structure)
 - [Usage](#usage)
 - [License](#license)
@@ -19,42 +21,80 @@ A comprehensive data analysis and experimentation repository focused on explorin
 
 ## Overview
 
-This repository contains a collection of Jupyter Notebooks and Python utilities for exploring extrapolation methodologies. It provides a structured framework for experimenting with different extrapolation techniques on datasets of varying sizes, from small quick-start datasets to large-scale comprehensive analyses.
+This repository contains a collection of Jupyter Notebooks and Python utilities for exploring and implementing **large basis function extrapolation** techniques. It specializes in working with datasets that follow **exponential decay patterns converging to a limit at infinity**, a fundamental challenge in computational physics and engineering.
 
 The project is designed to be both educational and practical, allowing researchers and data scientists to:
-- Understand extrapolation fundamentals
-- Compare different extrapolation approaches
-- Test algorithms on multiple dataset scales
-- Visualize and interpret results
-- Build reproducible analysis pipelines
+- Understand exponential decay extrapolation fundamentals
+- Compare different extrapolation approaches for convergent sequences
+- Test basis function algorithms on multiple dataset scales
+- Visualize and interpret asymptotic convergence behavior
+- Build reproducible analysis pipelines for scientific computing
+- Apply techniques across diverse scientific domains
 
-## 📁 Repository Structure
+## Scientific Background
 
-```
-extrapolation/
-├── src/                          # Python source code and utilities
-│   ├── *.ipynb                  # Python notebooks to test
-│   └── *.py                     # Helper functions and modules
-├── small-dataset/               # Small datasets for quick testing
-│   ├── data files
-│   └── analysis notebooks
-├── large-dataset/               # Large datasets for comprehensive analysis
-│   ├── data files
-│   └── detailed notebooks
-├── new-dataset/                 # Experimental or new datasets
-│   ├── data files
-│   └── exploration notebooks
-├── .gitignore                   # Git ignore rules
-└── README.md                    # This file
-```
+### Exponential Decay Convergence
+
+This repository focuses on extrapolating data points that exhibit the following characteristics:
+
+- **Pattern**: Values approach a limiting value (asymptote) as the variable approaches infinity
+- **Mathematical Form**: $f(x) = L + A \cdot e^{-\lambda x}$, where:
+  - $L$ = asymptotic limit (target value at infinity)
+  - $A$ = amplitude
+  - $\lambda$ = decay rate
+
+- **Challenge**: Accurately estimating the limiting value from finite data points
+
+### Large Basis Function Extrapolation
+
+This project implements techniques for basis function extrapolation, which:
+- Represents sequences using expanded basis sets
+- Extracts limiting behavior from partial sequence information
+- Improves convergence rate estimation
+- Enables accurate prediction of asymptotic values
+
+## Applications
+
+This extrapolation methodology is widely used in:
+
+### **Finite Element Methods (FEM)**
+- Mesh convergence studies
+- Richardson extrapolation for solution refinement
+- Basis function expansion in Galerkin methods
+
+### **Quantum Mechanics**
+- Basis set convergence in quantum chemistry calculations
+- Hartree-Fock and DFT convergence studies
+- Electronic correlation energy extrapolation
+
+### **Chemistry & Molecular Dynamics**
+- Computational chemistry convergence analysis
+- Potential energy surface extrapolation
+- Vibrational frequency convergence
+
+### **Biology & Biophysics**
+- Molecular dynamics trajectory analysis
+- Protein fold prediction convergence
+- Ensemble averaging for stability estimation
+
+### **General Scientific Computing**
+- Numerical sequence acceleration
+- Series convergence analysis
+- Asymptotic behavior prediction
+
+
 
 ## Features
 
-- **Multi-scale Dataset Analysis**: Work with small, large, and experimental datasets
+- **Specialized for Exponential Decay**: Optimized algorithms for convergent sequences approaching asymptotic limits
+- **Multi-scale Dataset Analysis**: Work with small synthetic data, large realistic datasets, and experimental new data
 - **Jupyter Notebook-based**: Interactive, well-documented analyses (98.5% of codebase)
-- **Reusable Python Utilities**: Helper functions and modules in the `src/` directory
+- **Reusable Python Utilities**: Basis function implementations and extrapolation algorithms in `src/`
+- **Multiple Basis Function Approaches**: Support for various basis function sets (polynomial, exponential, rational, etc.)
+- **Convergence Analysis Tools**: Detect and quantify convergence rates
+- **Cross-Domain Application**: Examples from FEM, QM, chemistry, and biology
 - **Reproducible Workflows**: Clear, step-by-step analysis pipelines
-- **Visualization Support**: Built-in data visualization and result interpretation
+- **Visualization Support**: Built-in convergence plots and result interpretation
 - **Modular Design**: Easy to extend and adapt for new analyses
 
 ## Getting Started
@@ -92,9 +132,9 @@ Before you begin, ensure you have the following installed:
    pip install -r requirements.txt
    ```
 
-   If `requirements.txt` doesn't exist, you can install common data science packages:
+   If `requirements.txt` doesn't exist, install the required packages:
    ```bash
-   pip install jupyter numpy pandas matplotlib seaborn scikit-learn scipy
+   pip install jupyter numpy pandas matplotlib seaborn scikit-learn scipy sympy
    ```
 
 ### Running the Notebooks
@@ -122,87 +162,160 @@ Before you begin, ensure you have the following installed:
 ## Dataset Guide
 
 ### Small Dataset
-- **Purpose**: Quick iterations, prototyping, and testing new approaches
+- **Purpose**: Quick iterations with synthetic exponential decay sequences
 - **Location**: `small-dataset/`
-- **Use Case**: Fast feedback loops, algorithm validation, educational purposes
-- **Advantages**: Quick execution, manageable file sizes, easy to inspect
+- **Contents**:
+  - Toy examples with known asymptotic limits
+  - Synthetic sequences: $f(n) = L + A \cdot e^{-\lambda n}$
+  - Simple basis function convergence tests
+- **Use Case**: Algorithm validation, educational exploration, quick feedback loops
+- **Advantages**: Fast execution, transparent data generation, easy to inspect and understand
 
 ### Large Dataset
-- **Purpose**: Comprehensive analysis with more complex patterns and larger scale
+- **Purpose**: Realistic data from scientific applications with complex convergence behavior
 - **Location**: `large-dataset/`
-- **Use Case**: Production-level analysis, performance testing, detailed studies
-- **Advantages**: More robust results, better pattern detection, real-world scenarios
+- **Contents**:
+  - Finite Element Method mesh convergence studies
+  - Quantum chemistry basis set extrapolation data
+  - Scientific computing benchmark datasets
+  - Real-world convergence sequences
+- **Use Case**: Production-level analysis, performance testing, domain-specific applications
+- **Advantages**: Realistic patterns, robust results, practical validation
 
 ### New Dataset
-- **Purpose**: Experimental datasets or alternative data for comparison
+- **Purpose**: Experimental datasets for novel convergence patterns and comparison studies
 - **Location**: `new-dataset/`
-- **Use Case**: Testing new hypotheses, dataset comparison, exploratory analysis
-- **Advantages**: Flexibility, support for innovation, comparative studies
+- **Contents**:
+  - Custom exponential decay sequences
+  - Benchmark datasets from literature
+  - Exploratory data for hypothesis testing
+- **Use Case**: Testing new hypotheses, algorithm benchmarking, comparative studies
+- **Advantages**: Flexibility, innovation support, comparative performance analysis
+
+## Extrapolation Methods
+
+This repository implements and compares several extrapolation techniques:
+
+### 1. **Polynomial Basis Extrapolation**
+- Fit polynomial basis functions to sequence data
+- Estimate asymptotic limit from polynomial expansion
+- Best for: Smooth convergence behavior
+
+### 2. **Exponential Basis Extrapolation**
+- Use exponential basis: $\{1, e^{-\lambda_1 x}, e^{-\lambda_2 x}, ...\}$
+- Directly model decay rates
+- Best for: Exponential decay patterns
+
+### 3. **Rational Function Extrapolation**
+- Approximate sequences with rational functions
+- Capture multiple timescales
+- Best for: Complex multi-rate convergence
+
+### 4. **Richardson Extrapolation**
+- Classic method for finite difference convergence
+- Successive refinement approach
+- Best for: Mesh and grid refinement studies
+
+### 5. **Sequence Transformation Methods**
+- Shanks transformation
+- Epsilon algorithm
+- Levin transformation
+- Best for: General sequence acceleration
 
 ## Project Structure Details
 
 ### `src/` Directory
-Contains reusable Python modules and utility functions:
-- Data preprocessing utilities
-- Extrapolation algorithms
-- Helper functions for common tasks
-- Custom visualization tools
 
-Import these utilities in your notebooks:
+Contains reusable Python modules implementing extrapolation techniques:
+
 ```python
-import sys
-sys.path.append('src')
-from your_module import your_function
+# basis_functions.py - Basis function definitions
+from src.basis_functions import ExponentialBasis, PolynomialBasis
+
+# extrapolation.py - Extrapolation algorithms
+from src.extrapolation import ExtrapolationFitter, estimate_asymptotic_limit
+
+# convergence.py - Analysis tools
+from src.convergence import analyze_convergence_rate, detect_exponential_decay
+
+# utils.py - Helper functions
+from src.utils import generate_synthetic_data, plot_convergence
 ```
 
 ### Notebook Organization
+
 Each notebook follows a standard structure:
-1. **Introduction** - Overview and objectives
-2. **Data Loading** - Import and inspect data
-3. **Exploratory Analysis** - Initial data exploration
-4. **Preprocessing** - Data cleaning and preparation
-5. **Modeling** - Extrapolation implementation
-6. **Evaluation** - Results analysis and visualization
-7. **Conclusions** - Summary and insights
 
-## 💡 Usage Examples
+1. **Introduction** - Problem statement and objectives
+2. **Data Loading** - Import and inspect convergent sequences
+3. **Exploratory Analysis** - Visualize exponential decay patterns
+4. **Preprocessing** - Normalize and prepare data
+5. **Basis Function Selection** - Choose appropriate basis functions
+6. **Modeling & Extrapolation** - Fit and extrapolate to asymptotic limit
+7. **Convergence Analysis** - Quantify convergence rates
+8. **Evaluation & Visualization** - Compare results and visualize convergence
+9. **Conclusions** - Summary and insights
 
-### Basic Workflow
+## Usage Examples
+
+### Basic Extrapolation Workflow
 
 ```python
-# Load data
-import pandas as pd
-df = pd.read_csv('path/to/data.csv')
+import numpy as np
+import matplotlib.pyplot as plt
+from src.extrapolation import ExtrapolationFitter
+from src.basis_functions import ExponentialBasis
 
-# Explore
-print(df.head())
-print(df.describe())
+# Generate or load exponential decay data
+x = np.linspace(0, 10, 50)
+asymptotic_limit = 100
+data = asymptotic_limit + 50 * np.exp(-0.5 * x)
 
-# Preprocess
-df_clean = df.dropna()
+# Fit basis functions
+basis = ExponentialBasis(num_terms=3)
+fitter = ExtrapolationFitter(basis)
+fitter.fit(x, data)
 
-# Analyze/Extrapolate
-# (Your custom analysis here)
+# Estimate asymptotic limit
+estimated_limit = fitter.extrapolate()
+print(f"True limit: {asymptotic_limit}")
+print(f"Estimated limit: {estimated_limit}")
 
 # Visualize
-import matplotlib.pyplot as plt
-plt.plot(df_clean)
+x_extended = np.linspace(0, 20, 200)
+y_fitted = fitter.predict(x_extended)
+plt.plot(x, data, 'o', label='Data')
+plt.plot(x_extended, y_fitted, '-', label='Fitted')
+plt.axhline(estimated_limit, '--', label=f'Extrapolated limit: {estimated_limit:.2f}')
+plt.legend()
 plt.show()
+```
+
+### Convergence Rate Analysis
+
+```python
+from src.convergence import analyze_convergence_rate
+
+# Analyze convergence behavior
+convergence_rate, decay_constant = analyze_convergence_rate(x, data)
+print(f"Exponential decay rate: {decay_constant:.4f}")
+print(f"Convergence rate: {convergence_rate}")
 ```
 
 ### Running Specific Analyses
 
-1. Start with the **small dataset** notebooks for quick understanding
-2. Move to **large dataset** notebooks for deeper analysis
-3. Experiment with **new dataset** notebooks for custom explorations
+1. **Start with small-dataset** notebooks for quick understanding of exponential decay patterns
+2. **Move to large-dataset** notebooks for domain-specific applications (FEM, QM, Chemistry, Biology)
+3. **Experiment with new-dataset** notebooks for custom explorations and novel problems
 
 ### Guidelines
 
 - Write clear, descriptive commit messages
-- Add comments and documentation to your code
-- Keep notebooks organized and well-structured
-- Test your code before submitting
-- Update this README if adding new features
+- Add detailed comments and documentation to code
+- Include docstrings for all functions
+- Test new algorithms on multiple datasets
+- Add usage examples for new methods
+- Update this README if adding major features
 
 ## License
 
@@ -215,3 +328,24 @@ This project is open source. Please check the LICENSE file in the repository for
 For questions, suggestions, or issues:
 - Open an [Issue](https://github.com/trulyaldi/extrapolation/issues) on GitHub
 - Contact the author directly through GitHub
+
+
+## Typical Workflow by Domain
+
+### Finite Element Analysis
+```
+Load mesh convergence data → Identify exponential convergence
+→ Apply Richardson extrapolation → Estimate exact solution
+```
+
+### Quantum Chemistry
+```
+Generate basis set data → Fit exponential basis functions
+→ Extrapolate to infinite basis limit → Obtain CBS (Complete Basis Set) result
+```
+
+### Molecular Dynamics
+```
+Analyze trajectory convergence → Detect decay rates
+→ Accelerate sequence convergence → Compute bulk properties
+```
