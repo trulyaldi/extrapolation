@@ -1,574 +1,347 @@
-import matplotlib.patches as patches
-from lmfit import Model
+from scipy.optimize import least_squares, lsq_linear
 import numpy as np
-import matplotlib.pyplot as plt
 import pandas as pd
+import matplotlib.pyplot as plt 
 
-# --- 1. Define the Mathematical Model Functions ---
-
-def exponential_decay(x, C, A, B):
-    """3-parameter exponential decay: y = C + A * exp(-B * x)."""
-    x = np.asarray(x, float)
-    arg = -B * x
-    arg = np.clip(arg, -700, 700)  # avoid overflow in exp
-    return C + A * np.exp(arg)
-
-def exponential_decay_sq(x, C, A, B):
-    """3-parameter exponential decay with sqrt(x): y = C + A * exp(-B * sqrt(x))."""
-    x = np.asarray(x, float)
-    sqrt_x = np.sqrt(np.clip(x, 0.0, None))
-    arg = -B * sqrt_x
-    arg = np.clip(arg, -700, 700)  # avoid overflow
-    return C + A * np.exp(arg)
-
-def power_law(x, C, A, B):
-    """3-parameter power law: y = C + A * x^(-B)."""
-    x = np.asarray(x, float)
-    eps = 1e-12
-    x_safe = np.clip(x, eps, None)  # avoid x=0 and negative x
-    return C + A * np.power(x_safe, -B)
-
-
-# --- 2. Shared B initialisation: grid search over B for all models ---
-
-def _init_B(x_scaled, y, C=None, model_type='exp'):
-    """
-    Grid-search initializer for B for all three models:
-
-        model_type = 'power'  : y ≈ C + A * x_scaled^(-B)
-        model_type = 'exp'    : y ≈ C + A * exp(-B * x_scaled)
-        model_type = 'exp_sq' : y ≈ C + A * exp(-B * sqrt(x_scaled))
-
-    x_scaled should be the scaled x used in the fit.
-    We scan B in (0.1, 0.2, ..., 10.0), fix B, and fit only C and A.
-    """
-    x_scaled = np.asarray(x_scaled, float)
-    y = np.asarray(y, float)
-
-    if C is None:
-        C = y[-1]
-
-    if model_type == 'power':
-        model = Model(power_law)
-    elif model_type == 'exp':
-        model = Model(exponential_decay)
-    elif model_type == 'exp_sq':
-        model = Model(exponential_decay_sq)
-    else:
-        raise ValueError(f"Unknown model_type '{model_type}'. Use 'power', 'exp', or 'exp_sq'.")
-
-    A0 = y[0] - C
-    C0 = C
-
-    B_candidates = np.arange(0.1, 10.0, 0.1)
-
-    best_B = None
-    best_chi2 = np.inf
-
-    for B0 in B_candidates:
-        params = model.make_params(C=C0, A=A0, B=B0)
-        params['B'].vary = False
-
-        try:
-            tmp_result = model.fit(y, params, x=x_scaled)
-        except Exception:
-            continue
-
-        chi2 = np.sum(tmp_result.residual**2)
-        if chi2 < best_chi2:
-            best_chi2 = chi2
-            best_B = B0
-
-    if best_B is None:
-        best_B = 1.0
-
-    return float(best_B)
-
-
-# --- 3. Base Uncertainty Calculator (Shared Logic) ---
-
-class UncertaintyCalculator:
-
-    def _calculate_uncertainty_at_x(self, params, x_value, model_type='exp'):
-
-        C = params['C'].value
-        A = params['A'].value
-        B = params['B'].value
+class VarProIRLS:
+    def __init__(self, df, x_col, y_col, err_df=None, b_init=None):
         
-        dC = params['C'].stderr if params['C'].stderr is not None else 0
-        dA = params['A'].stderr if params['A'].stderr is not None else 0
-        dB = params['B'].stderr if params['B'].stderr is not None else 0
+        self.raw_x = df[x_col].values.astype(float)
+        self.raw_y = df[y_col].values.astype(float)
+        self.x_col = x_col
+        self.y_col = y_col
+        self.err_df = err_df 
         
-        try:
-            if model_type == 'power':
-                return self._calculate_power_uncertainty(C, A, B, dC, dA, dB, x_value)
-            else:
-                return self._calculate_exponential_uncertainty(C, A, B, dC, dA, dB, x_value, model_type)
-        except (OverflowError, ValueError, ZeroDivisionError) as e:
-            print(f"Warning: Uncertainty calculation failed at x={x_value}: {e}")
-            return C, C
-    
-    def _calculate_exponential_uncertainty(self, C, A, B, dC, dA, dB, x_value, model_type='exp'):
-        x_term = np.sqrt(x_value) if model_type == 'exp_sq' else x_value
-        
-        if A >= 0:
-            term_min = (A - dA) * np.exp(-(B + dB) * x_term)
-            term_max = (A + dA) * np.exp(-(B - dB) * x_term)
-        else:
-            term_min = (A - dA) * np.exp(-(B - dB) * x_term)
-            term_max = (A + dA) * np.exp(-(B + dB) * x_term)
-        
-        f_min = (C - dC) + term_min
-        f_max = (C + dC) + term_max
-        
-        if f_min > f_max:
-            f_min, f_max = f_max, f_min
-        
-        return f_min, f_max
-    
-    def _calculate_power_uncertainty(self, C, A, B, dC, dA, dB, x_value):
-        x_value = max(x_value, 1e-12)  # avoid x=0
-        if A >= 0:
-            term_min = (A - dA) / np.power(x_value, B + dB)
-            term_max = (A + dA) / np.power(x_value, B - dB)
-        else:
-            term_min = (A - dA) / np.power(x_value, B - dB)
-            term_max = (A + dA) / np.power(x_value, B + dB)
-        
-        f_min = (C - dC) + term_min
-        f_max = (C + dC) + term_max
-        
-        if f_min > f_max:
-            f_min, f_max = f_max, f_min
-        
-        return f_min, f_max
-    
-    def _calculate_extrapolation_uncertainty(self, result):
-        params = result.params
-        C = params['C'].value
-        dC = params['C'].stderr if params['C'].stderr is not None else 0
-        
-        if dC == 0:
-            try:
-                from lmfit import conf_interval
-                ci = conf_interval(result.minimizer, result, sigmas=[-1, 1])
-                lower_sigma, lower_val = ci['C'][0]
-                upper_sigma, upper_val = ci['C'][1]
-                dC_lower = C - lower_val
-                dC_upper = upper_val - C
-                dC = max(dC_lower, dC_upper)
-            except Exception as e:
-                print(f"Warning: Confidence interval calculation failed: {e}")
-                dC = 0
-        
-        return dC
+        # We need to identify the min and max values for x to perform scaling on them. 
+        self.x_min = self.raw_x.min()
+        self.x_max = self.raw_x.max()
+        self.range_x = self.x_max - self.x_min
+        # ---------------------------------------
 
-
-# --- 4. IRLS-style weighted fitting (same logic for all models) ---
-
-class FittingMixin:
-
-    def _fit_with_weights(self, y_data, x_scaled, params, model, model_type, weight_power=1):
-
-        n_iterations = 100
-        convergence_threshold = 1e-10
-        current_weights = np.ones(len(x_scaled))
-
-        for i in range(n_iterations):
-            result = model.fit(y_data, params, x=x_scaled, weights=current_weights)
-
-            B_val = result.params['B'].value
-
-            if model_type == 'exp':
-                W_pos = np.exp(B_val * x_scaled)
-            elif model_type == 'exp_sq':
-                W_pos = np.exp(B_val * np.sqrt(x_scaled))
-            elif model_type == 'power':
-                W_pos = np.power(x_scaled, B_val)
-                W_pos = np.nan_to_num(W_pos, nan=0.0, posinf=0.0, neginf=0.0)
-                if np.all(W_pos == 0):
-                    W_pos = np.ones_like(x_scaled)
-            else:
-                raise ValueError(f"Unknown model_type '{model_type}' in _fit_with_weights")
-
-            W_pos /= np.mean(W_pos)
-
-            new_weights = W_pos**weight_power
-            new_weights /= np.mean(new_weights)
-
-            current_weights = 0.5 * current_weights + 0.5 * new_weights
-            print(f"Iteration {i}, weights: {current_weights}")
-
-            old_params = np.array(list(params.valuesdict().values()))
-            params = result.params
-            new_params = np.array(list(params.valuesdict().values()))
-            param_change = np.sum((old_params - new_params)**2)
-
-            if param_change < convergence_threshold and i > 0:
-                break
-
-        return result
-    
-    def _optimize_weights_and_fit(self, y_data, x_scaled, params, model, model_name, model_type):
-        print(f"  No known convergent value provided, using weight power n=1 for {model_name}")
-        return self._fit_with_weights(y_data, x_scaled, params, model, model_type, weight_power=1)
-
-
-# --- 5. Unified Fitter Class ---
-
-class unified_extrapolator(UncertaintyCalculator, FittingMixin):
-
-    def __init__(self, dataframe):
-        if 'basis size' not in dataframe.columns:
-            raise ValueError("Input DataFrame must contain a 'basis size' column.")
-        self.df = dataframe
-        self.x_data = self.df['basis size']
+        # --- TREND DETECTION --- TO DETERMINE IF THE TREND IS INCREASING / DECREASING
+        slope, _ = np.polyfit(self.raw_x, self.raw_y, 1)
+        self.is_increasing = slope > 0
+        # --------------------------------
+        # User can provide the initial guess for B, if not provided, default value is 1.0. 
+        self.override_b_init = b_init
+        self.b_init = 1.0  
         self.results = {}
-        self.uncertainties = {}
-        self.column_name = None
-        self.max_x = None
-        self.known_convergent_value = None
-        self.known_convergent_uncertainty = None
+        # --------------------------------
+    def _setup_model(self, model_type):
+        ''' Before fitting the data with different functions, we have to scale the x-axis accordingly. 
+            For power-law and sqrt-exponential functions, we are dividing x by max(x) to avoid having 0 (causes problems).
 
-    def _fit_model(self, column_name, max_x, model_func, model_name, model_type):
+            As for exponential function, we are using min-max scaling.
+        '''
 
-        print(f"\n--- Fitting {model_name} Model ---")
-
-        y_data = np.asarray(self.df[column_name].values, dtype=float)
-        x_data = np.asarray(self.x_data.values, dtype=float)
-
-        if max_x is None:
-            max_x = x_data.max()
-
-        if len(y_data) > 1:
-            max_allowed_uncertainty = np.abs(y_data[0] - y_data[-1])
+        self.model_type = model_type
+        if self.model_type in ['power_law', 'sqrt_exponential']:
+            safe_x = np.maximum(self.raw_x, self.x_max * 1e-6)
+            self.t_scaled = safe_x / self.x_max
         else:
-            max_allowed_uncertainty = np.inf
+            self.t_scaled = (self.raw_x - self.x_min) / self.range_x
 
-        # common scaling
-        x_min = x_data.min()
-        x_max = x_data.max()
-        if x_max == x_min:
-            raise ValueError("All x values identical; cannot scale.")
-        x_scaled = (x_data - x_min) / (x_max - x_min)
-        if model_type == 'power':
-            x_scaled = x_scaled + 1e-6  # avoid 0
-
-        print(f'x_scaled ({model_name}): {x_scaled}')
-
-        model = Model(model_func)
-        params = model.make_params()
-
-        y_first = y_data[0]
-
-        n_tail = min(5, max(3, len(y_data) // 3))
-        C_guess = float(np.mean(y_data[-n_tail:]))
-        print(f"{model_name}: C_guess = {C_guess}")
-        params['C'].set(value=C_guess)
-
-        A_guess = float(y_first - C_guess)
-        if A_guess >= 0:
-            params['A'].set(value=A_guess, min=1e-9, max=abs(A_guess)*3 + 1e-10)
+        # If the user provides the initial guess for B, the algorithm starts off with this value.    
+        if self.override_b_init is not None:
+            self.b_init = self.override_b_init
+        # If the user does not provide any initial guess for B, the algorithm starts grid search scanning. 
         else:
-            params['A'].set(value=A_guess, min=-abs(A_guess)*3 - 1e-10, max=-1e-9)
+            self.b_init = self._grid_search_initialization()
 
-        if model_type == 'power':
-            B_init = _init_B(x_scaled, y_data, C=C_guess, model_type='power')
-        elif model_type == 'exp_sq':
-            B_init = _init_B(x_scaled, y_data, C=C_guess, model_type='exp_sq')
-        else:
-            B_init = _init_B(x_scaled, y_data, C=C_guess, model_type='exp')
+    def _get_A_bounds(self):
+        """Only constrain A based on curve direction, C is unconstrained."""
+        if self.is_increasing:
+            lb = [-np.inf, -np.inf] # [C,A] C captures [-inf,inf], while A captures [-inf,0]. 
+            ub = [np.inf, 0] # [C,A] 
+        else: 
+            lb = [-np.inf, 0] # [C,A]
+            ub = [np.inf, np.inf] # [C,A]
+        return lb, ub
 
-        params['B'].set(value=B_init, min=1e-6, max=50.0)
-
-        print(f"{model_name} initial guesses: C={C_guess:.6g}, A={A_guess:.6g}, B={B_init:.6g}")
-
-        result = self._optimize_weights_and_fit(y_data, x_scaled, params, model, model_name, model_type)
-
-        raw_uncertainty = self._calculate_extrapolation_uncertainty(result)
-        final_uncertainty = min(raw_uncertainty, max_allowed_uncertainty)
-        if final_uncertainty < raw_uncertainty:
-            print(f"  Uncertainty CAPPED. Original: {raw_uncertainty:.4e}, Capped: {final_uncertainty:.4e}")
+    def _grid_search_initialization(self):
+        lb, ub = self._get_A_bounds()
         
-        C = result.params['C'].value
-        A = result.params['A'].value
-        B = result.params['B'].value
-        dC = result.params['C'].stderr if result.params['C'].stderr is not None else 0.0
-        dA = result.params['A'].stderr if result.params['A'].stderr is not None else 0.0
-        dB = result.params['B'].stderr if result.params['B'].stderr is not None else 0.0
-
-        print(f"\n{model_name} fitted parameters:")
-        print(f"  C = {C:.10f} ± {dC:.10f}  (asymptote)")
-        print(f"  A = {A:.10f} ± {dA:.10f}  (amplitude)")
-        print(f"  B = {B:.10f} ± {dB:.10f}  (decay / exponent)")
-
-        residuals = result.residual
-        chi2 = np.sum(residuals**2)
-        rmse = np.sqrt(np.mean(residuals**2))
-        print(f"{model_name} fit quality: χ² = {chi2:.6e}, RMSE = {rmse:.6e}")
-
-        return result, final_uncertainty
-
-    def fit_column(self, column_name, max_x):
-        self.column_name = column_name
-        self.max_x = max_x
-        self.results = {}
-        self.uncertainties = {}
-
-        result1, unc1 = self._fit_model(column_name, max_x, exponential_decay,    "Exponential",      "exp")
-        result2, unc2 = self._fit_model(column_name, max_x, exponential_decay_sq, "Exponential SQ",   "exp_sq")
-        result3, unc3 = self._fit_model(column_name, max_x, power_law,            "Power Law",        "power")
-
-        self.results = {
-            'exponential': result1,
-            'exponential_sq': result2,
-            'power': result3
-        }
-
-        self.uncertainties = {
-            'exponential': unc1,
-            'exponential_sq': unc2,
-            'power': unc3
-        }
-
-        print(f"\n{'='*60}")
-        print(f"FINAL RESULTS FOR '{column_name}'")
-        print(f"{'='*60}")
-
-        model_names = ['Exponential', 'Exponential √x', 'Power Law']
-        model_keys  = ['exponential', 'exponential_sq', 'power']
-
-        for name, key in zip(model_names, model_keys):
-            result = self.results[key]
-            uncertainty = self.uncertainties[key]
-            extrapolated_limit = result.params['C'].value
-
-            print(f"\n{name} Model:")
-            print(f"  Extrapolated Limit (C): {extrapolated_limit:.18f}")
-            print(f"  Total Uncertainty:      ± {uncertainty:.18f}")
-
-            if self.known_convergent_value is not None:
-                difference = extrapolated_limit - self.known_convergent_value
-                print(f"  Difference from known:  {difference:.18f}")
-
-    def get_uncertainty_band(self, model_key, x_values_orig):
-
-        if model_key not in self.results:
-            return None, None
-        
-        result = self.results[model_key]
-        x_min_orig = self.x_data.min()
-        x_max_orig = self.x_data.max()
-        
-        f_min_curve = []
-        f_max_curve = []
-        
-        if model_key == 'power':
-            x_scaled = (x_values_orig - x_min_orig) / (x_max_orig - x_min_orig)
-            x_scaled = x_scaled + 1e-6
-            model_type = 'power'
-        else:
-            x_scaled = (x_values_orig - x_min_orig) / (x_max_orig - x_min_orig)
-            model_type = 'exp_sq' if model_key == 'exponential_sq' else 'exp'
-        
-        for x_val in x_scaled:
-            f_min, f_max = self._calculate_uncertainty_at_x(result.params, x_val, model_type)
-            f_min_curve.append(f_min)
-            f_max_curve.append(f_max)
-        
-        return np.array(f_min_curve), np.array(f_max_curve)
-
-    def _draw_combined_plot(self, ax, zoom=False):
-        if not self.results:
-            return
-
-        y_data = self.df[self.column_name]
-        x_min_orig, x_max_orig = self.x_data.min(), self.x_data.max()
-
-        colors = {
-            'exponential':    '#1f77b4',
-            'exponential_sq': '#ff7f0e',
-            'power':          '#2ca02c'
-        }
-
-        ax.plot(self.x_data, y_data, 'ko', label='Original Data', markersize=6, zorder=5)
-
-        model_names = {
-            'exponential':    'Exponential',
-            'exponential_sq': 'Exponential √x',
-            'power':          'Power Law'
-        }
-
-        model_keys = ['exponential', 'exponential_sq', 'power']
-        
-        if zoom:
-            x_data_values = self.x_data.values
-            zoom_start_idx = max(0, int(len(x_data_values) * 0.75))
-            x_zoom_min = x_data_values[zoom_start_idx]
+        def evaluate_grid(grid_values, current_best_ssr, current_best_b):
+            local_best_ssr = current_best_ssr
+            local_best_b = current_best_b
             
-            ax.set_xlim(x_zoom_min, self.max_x)
-
-            y_values_in_zoom = []
-            zoom_mask = self.x_data >= x_zoom_min
-            y_values_in_zoom.extend(y_data[zoom_mask].values)
-
-            plot_x_zoom = np.linspace(x_zoom_min, self.max_x, 100)
-            for model_key in model_keys:
-                result = self.results[model_key]
-                if model_key == 'power':
-                    plot_x_scaled = (plot_x_zoom - x_min_orig) / (x_max_orig - x_min_orig)
-                    plot_x_scaled = plot_x_scaled + 1e-6
-                else:
-                    plot_x_scaled = (plot_x_zoom - x_min_orig) / (x_max_orig - x_min_orig)
-                y_values_in_zoom.extend(result.eval(x=plot_x_scaled))
-
-            if self.known_convergent_value is not None:
-                y_values_in_zoom.append(self.known_convergent_value)
-
-            if y_values_in_zoom:
-                y_min_zoom = np.min(y_values_in_zoom)
-                y_max_zoom = np.max(y_values_in_zoom)
-                y_range = y_max_zoom - y_min_zoom
+            for b_val in grid_values:
+                phi = self._compute_basis(b_val, self.t_scaled)
+                try:
+                    # Solving the linear problem for fixed B
+                    res = lsq_linear(phi, self.raw_y, bounds=(lb, ub), method='bvls')
+                    y_pred = np.dot(phi, res.x)
+                    ssr = np.sum((self.raw_y - y_pred)**2)
+                except:
+                    ssr = np.inf
                 
-                y_padding = y_range * 0.2
-                if y_padding < 1e-9:
-                    y_padding = 0.1 * abs(y_min_zoom) if y_min_zoom != 0 else 0.1
-                    
-                ax.set_ylim(y_min_zoom - y_padding, y_max_zoom + y_padding)
+                if ssr < local_best_ssr:
+                    local_best_ssr = ssr
+                    local_best_b = b_val
+            return local_best_ssr, local_best_b
 
-        for model_key in model_keys:
-            if model_key not in self.results:
-                continue
 
-            result = self.results[model_key]
-            uncertainty = self.uncertainties[model_key]
-            color = colors[model_key]
-
-            plot_x_orig = np.linspace(x_min_orig, self.max_x, 400)
-
-            if model_key == 'power':
-                plot_x_scaled = (plot_x_orig - x_min_orig) / (x_max_orig - x_min_orig)
-                plot_x_scaled = plot_x_scaled + 1e-6
-                extrap_x_orig = np.arange(x_max_orig + 1000, self.max_x + 1, 1000)
-                if len(extrap_x_orig) > 0:
-                    extrap_x_scaled = (extrap_x_orig - x_min_orig) / (x_max_orig - x_min_orig)
-                    extrap_x_scaled = extrap_x_scaled + 1e-6
-            else:
-                plot_x_scaled = (plot_x_orig - x_min_orig) / (x_max_orig - x_min_orig)
-                extrap_x_orig = np.arange(x_max_orig + 1000, self.max_x + 1, 1000)
-                if len(extrap_x_orig) > 0:
-                    extrap_x_scaled = (extrap_x_orig - x_min_orig) / (x_max_orig - x_min_orig)
-
-            plot_y = result.eval(x=plot_x_scaled)
-            ax.plot(plot_x_orig, plot_y, '-', color=color,
-                    label=f'{model_names[model_key]} Fit',
-                    linewidth=2, zorder=4)
-
-            if len(extrap_x_orig) > 0:
-                extrap_y = result.eval(x=extrap_x_scaled)
-                ax.plot(extrap_x_orig, extrap_y, 'o', color=color,
-                        markersize=5, zorder=3)
-
-            extrapolated_limit = result.params['C'].value
-            ax.axhline(extrapolated_limit, color=color, linestyle='--',
-                       linewidth=1.5,
-                       label=f'{model_names[model_key]} Limit', zorder=2)
-
-            if uncertainty > 0:
-                upper_bound = extrapolated_limit + uncertainty
-                lower_bound = extrapolated_limit - uncertainty
-                
-                ax.axhline(upper_bound, color=color, linestyle='--',
-                           linewidth=1, alpha=0.5, zorder=1)
-                ax.axhline(lower_bound, color=color, linestyle='--',
-                           linewidth=1, alpha=0.5, zorder=1)
-                
-                ax.axhspan(lower_bound, upper_bound, color=color,
-                           alpha=0.12, zorder=0,
-                           label=f'{model_names[model_key]} Uncertainty (ΔC)')
-
-        if self.known_convergent_value is not None:
-            ax.axhline(self.known_convergent_value, color='black', linestyle=':',
-                       linewidth=2.5,
-                       label=f'Known CV ({self.known_convergent_value:.6f})', zorder=6)
-            if self.known_convergent_uncertainty is not None:
-                upper_cv = self.known_convergent_value + self.known_convergent_uncertainty
-                lower_cv = self.known_convergent_value - self.known_convergent_uncertainty
-                ax.axhline(upper_cv, color='black', linestyle='--',
-                           linewidth=1, alpha=0.5, zorder=1)
-                ax.axhline(lower_cv, color='black', linestyle='--',
-                           linewidth=1, alpha=0.5, zorder=1)
-                ax.axhspan(lower_cv, upper_cv, color='black', alpha=0.08,
-                           zorder=0, label='Known CV Uncertainty')
-
-        ax.set_xlabel("Basis Size", fontsize=11)
-        ax.set_ylabel(self.column_name, fontsize=11)
-        ax.grid(True, linestyle='--', alpha=0.5)
-        ax.legend(loc='best', fontsize=9)
+        coarse_grid = np.linspace(1, 50, 50)
+        best_ssr, best_B = evaluate_grid(coarse_grid, np.inf, 1.0)
         
-        if zoom:
-            ax.set_title(f"Zoom: All Models", fontsize=12, fontweight='bold')
-        else:
-            ax.set_title(f"All Models Overview", fontsize=12, fontweight='bold')
+        step_size = coarse_grid[1] - coarse_grid[0]
+        
+        fine_min = max(1.0, best_B - step_size)
+        fine_max = best_B + step_size
 
-    def plot_all_results(self):
-        if not self.results:
-            print("No results to plot. Run fit_column() first.")
+        fine_grid = np.linspace(fine_min, fine_max, 50)
+        best_ssr, best_B = evaluate_grid(fine_grid, best_ssr, best_B)
+        
+        return best_B
+
+    def _compute_basis(self, B, t):
+        phi = np.zeros((len(t), 2))
+        phi[:, 0] = 1.0
+        if self.model_type == 'exponential':
+            phi[:, 1] = np.exp(-B * t)
+        elif self.model_type == 'sqrt_exponential':
+            phi[:, 1] = np.exp(-B * np.sqrt(t))
+        elif self.model_type == 'power_law': 
+            phi[:, 1] = np.power(t, -B)
+        return phi
+
+    def _compute_model_weights(self, B, t):
+        # Calculate raw components first
+        if self.model_type == 'exponential':
+            log_w = B * t
+        elif self.model_type == 'sqrt_exponential': 
+            log_w = B * np.sqrt(t)
+        elif self.model_type == 'power_law': 
+            t_safe = np.maximum(t, 1e-12)
+            log_w = B * np.log(t_safe)
+        
+        # Multiply by 2 because we want w^2 (inverse variance approximation)
+        log_w = 2.0 * log_w
+        
+        # Normalize in log-space: subtract max log value
+        # This guarantees the largest weight is exactly 1.0
+        max_log_w = np.max(log_w)
+        normalized_w = np.exp(log_w - max_log_w)
+        
+        return normalized_w
+
+    def _solve_varpro_step(self, weights, start_b=None):
+        y_w = self.raw_y * np.sqrt(weights)
+        if start_b is None:  
+            start_b = self.b_init
+        
+        lb, ub = self._get_A_bounds()
+
+        def residual_func(alpha_curr):
+            phi = self._compute_basis(alpha_curr[0], self.t_scaled)
+            phi_w = phi * np.sqrt(weights)[:, np.newaxis]
+            res_lin = lsq_linear(phi_w, y_w, bounds=(lb, ub), method='bvls')
+            y_model = np.dot(phi, res_lin.x)
+            return (self.raw_y - y_model) * np.sqrt(weights)
+
+        res_opt = least_squares(residual_func, x0=[start_b], bounds=(1, np.inf), 
+                                method='trf', loss='soft_l1')
+        
+        best_B = res_opt.x[0]
+        phi = self._compute_basis(best_B, self.t_scaled)
+        phi_w = phi * np.sqrt(weights)[:, np.newaxis]
+        final_lin = lsq_linear(phi_w, y_w, bounds=(lb, ub), method='bvls')
+        
+        return best_B, final_lin.x[0], final_lin.x[1]
+
+    def fit_irls(self, max_iter=100, tol=1e-8, damping=0.5, models=None, verbose=True, compute_uq=True, max_weight_ratio=100):
+        if models is None: 
+            models = ['exponential', 'sqrt_exponential', 'power_law']
+        
+        for model in models: 
+            self._setup_model(model)
+            if verbose:
+                print(f"\n--- Fitting Model: {self.model_type} ---")
+                print(f"{'Iter':<5} | {'B (Decay)':<12} | {'C (Asymptote)':<15} | {'Weight Ratio':<25}")
+                print("-" * 65)
+
+            current_weights = np.ones(len(self.raw_x))
+            prev_C = np.inf
+            current_B_guess = self.b_init
+            
+            final_B, final_C, final_A = 0, 0, 0
+
+            for k in range(max_iter):
+                B, C, A = self._solve_varpro_step(current_weights, start_b=current_B_guess)
+                current_B_guess = B
+                final_B, final_C, final_A = B, C, A
+
+                if abs(C - prev_C) < tol and k > 0:
+                    if verbose:
+                        print("-" * 65)
+                        print(f"Converged at iteration {k}")
+                    break
+                prev_C = C
+
+                new_weights = self._compute_model_weights(B, self.t_scaled)
+                
+                # --- NEW LOGIC: Cap the ratio of weights ---
+                # 1. Weights are already normalized so max is 1.0. 
+                # 2. We just need to make sure the minimum weight isn't too small.
+                min_allowed_weight = 1.0 / max_weight_ratio
+                new_weights = np.maximum(new_weights, min_allowed_weight)
+                # -------------------------------------------
+
+                current_weights = (1 - damping) * current_weights + damping * new_weights
+                
+                if verbose: 
+                    w_ratio = 1.0 / (np.min(current_weights) + 1e-12)
+                    print(f"{k: <5} | {B:<12.6f} | {C: <15.6f} | {w_ratio:<25.2f}")
+
+            phi = self._compute_basis(final_B, self.t_scaled)
+            y_pred = final_C + final_A * phi[:, 1]
+            ssr = np.sum((self.raw_y - y_pred)**2)
+            
+            dof = max(1, len(self.raw_y) - 1)
+            sigma_noise = np.sqrt(ssr / dof)
+
+            self.results[model] = {
+                'B': final_B, 'C': final_C, 'A': final_A, 
+                'ssr': ssr, 't_scaled': self.t_scaled.copy(),
+                'sigma_noise': sigma_noise,
+                'y_pred': y_pred,
+                'final_weights': current_weights
+            }
+        
+        if compute_uq and len(self.results) > 0:
+            self.estimate_monte_carlo_uncertainty()
+            
+        return self.results
+
+    def estimate_monte_carlo_uncertainty(self, n_samples=30, seed = 1):
+
+        rng = np.random.default_rng(seed)
+        
+        for model_name, res in self.results.items():
+            y_pred = res['y_pred']
+            sigma_noise = res['sigma_noise']
+            warm_start_b = res['B']
+            final_weights = res['final_weights']
+            
+            mc_Cs = []
+            
+            w_max = np.max(final_weights)
+            if w_max == 0:
+                 noise_scale_factors = np.ones_like(final_weights)
+            else:
+                 noise_scale_factors = final_weights / w_max
+            
+            for i in range(n_samples):
+                base_noise = rng.normal(0, sigma_noise, size=len(y_pred))
+                weighted_noise = base_noise * noise_scale_factors
+                y_synthetic = y_pred + weighted_noise
+                
+                sub_df = pd.DataFrame({self.x_col: self.raw_x, self.y_col: y_synthetic})
+                sub_solver = self.__class__(sub_df, self.x_col, self.y_col, b_init=warm_start_b)
+                
+                sub_solver.fit_irls(models=[model_name], verbose=False, compute_uq=False)
+                
+                if model_name in sub_solver.results:
+                    mc_Cs.append(sub_solver.results[model_name]['C'])
+            
+            # q75, q25 = np.percentile(mc_Cs, [75, 25])
+            # sigma_robust = (q75 - q25) / 1.35
+            
+            # if sigma_robust < 1e-12:
+            #     sigma_robust = np.std(mc_Cs)
+                
+            self.results[model_name]['sigma_mc'] = np.std(mc_Cs)
+
+    def plot(self, truth_val=None):
+        if not self.results: 
             return
+        
+        plt.figure(figsize=(12, 7))
+        plt.plot(self.raw_x, self.raw_y, 'ko', label='Data', zorder=5, markersize=6)
+        
+        colors = {'exponential': 'blue', 'sqrt_exponential': 'orange', 'power_law': 'green'}
+        labels = {'exponential': 'Exp($e^{-Bx}$)', 'sqrt_exponential': 'SqrtExp($e^{-B\\sqrt{x}}$)', 'power_law': 'Power($x^{-B}$)'}
+        
+        print("\n" + "="*80)
+        print(f"{'Model':<20} | {'C (Asymptote)':<15} | {'MC Uncertainty':<20} | {'Diff from Truth'}")
+        print("="*80)
 
-        fig = plt.figure(figsize=(18, 7))
+        for model, res in self.results.items():
+            C = res['C']
+            sigma = res.get('sigma_mc', 0.0)
+            
+            diff_str = "-"
+            if truth_val is not None:
+                diff_str = f"{abs(C - truth_val):.2e}"
+            
+            print(f"{model:<20} | {C:<15.9f} | {sigma:<20.2e} | {diff_str}")
+            
+            x_plot = np.linspace(self.x_min, self.x_max * 1.5, 200)
+            
+            if model in ['power_law', 'sqrt_exponential']: 
+                t_plot = x_plot / self.x_max
+            else: 
+                t_plot = (x_plot - self.x_min) / self.range_x
+            
+            self.model_type = model
+            phi_plot = self._compute_basis(res['B'], t_plot)
+            y_plot = C + res['A'] * phi_plot[:, 1]
+            
+            plt.plot(x_plot, y_plot, '-', color=colors[model], linewidth=2, alpha=0.8, label=f"{labels[model]}")
+            
+            plt.fill_between([self.x_min, self.x_max * 1.5], 
+                             C - sigma, C + sigma, 
+                             color=colors[model], alpha=0.1)
+            
+            plt.axhline(C, color=colors[model], linestyle='--', alpha=0.3)
 
-        gs = fig.add_gridspec(1, 2, width_ratios=[1, 1])
-
-        ax_left = fig.add_subplot(gs[0, 0])
-        self._draw_combined_plot(ax_left, zoom=False)
-
-        ax_right = fig.add_subplot(gs[0, 1])
-        self._draw_combined_plot(ax_right, zoom=True)
-
-        fig.suptitle(f"Unified Extrapolation Results for '{self.column_name}'",
-                     fontsize=16, fontweight='bold')
-        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        if truth_val is not None: 
+            plt.axhline(truth_val, color='r', linestyle=':', linewidth=2, label=f'Truth ({truth_val:.8f})')
+            
+            if self.err_df is not None and self.y_col in self.err_df.columns:
+                try:
+                    truth_err = self.err_df[self.y_col].values[-1]
+                    plt.fill_between([self.x_min, self.x_max * 1.5], 
+                                     truth_val - truth_err, truth_val + truth_err, 
+                                     color='r', alpha=0.15, zorder=0,
+                                     label=f'Truth Error (±{truth_err:.1e})')
+                except IndexError:
+                    print(f"Warning: Could not extract error from {self.y_col} column.")
+        
+        plt.title(f"{self.y_col}")
+        plt.xlabel("Basis Size")
+        plt.ylabel("Value")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
         plt.show()
 
-    def fit(self):
-        available_columns = self.df.columns.drop('basis size').tolist()
-        print("Available columns to analyze:")
-        for col in available_columns:
-            print(f"- {col}")
-        print("-" * 30)
-
-        self.known_convergent_value = None
-        self.known_convergent_uncertainty = None
-
-        column_name = input("Please enter the name of the column to fit: ")
-        if column_name.lower() in ['q', 'quit']:
-            print("Exiting.")
-            return
-
-        if column_name not in available_columns:
-            print(f"Error: Invalid column name '{column_name}'. Please choose from the list above.")
-            return
-
-        try:
-            max_x_val = int(input(f"Enter the extrapolation limit for '{column_name}': "))
-        except ValueError:
-            print("Invalid input. Using the max value from data as the limit.")
-            max_x_val = self.x_data.max()
-
-        cv_input = input("Enter a known convergent value for comparison (or press Enter to skip): ").strip()
-        if cv_input:
+    def plot_ssr_profile(self, model_type='exponential', b_range=(0.1, 20), num_points=200):
+        self._setup_model(model_type)
+        b_grid = np.linspace(b_range[0], b_range[1], num_points)
+        ssr_values = []
+        lb, ub = self._get_A_bounds()
+        for b_val in b_grid:
+            phi = self._compute_basis(b_val, self.t_scaled)
             try:
-                self.known_convergent_value = float(cv_input)
-                cv_unc_input = input(f"Enter the uncertainty for {self.known_convergent_value} (or press Enter to skip): ").strip()
-                if cv_unc_input:
-                    try:
-                        self.known_convergent_uncertainty = float(cv_unc_input)
-                    except ValueError:
-                        print("Invalid number for uncertainty. It will be ignored.")
-            except ValueError:
-                print("Invalid number for convergent value. It will be ignored.")
-                self.known_convergent_value = None
+                res = lsq_linear(phi, self.raw_y, bounds=(lb, ub), method='bvls')
+                y_pred = np.dot(phi, res.x)
+                ssr = np.sum((self.raw_y - y_pred)**2)
+            except:
+                ssr = np.nan
+            ssr_values.append(ssr)
 
-        self.fit_column(column_name, max_x_val)
-        self.plot_all_results()
+        plt.figure(figsize=(10, 6))
+        plt.plot(b_grid, ssr_values, label=f'SSR Profile ({model_type})', color='purple')
+        if model_type in self.results:
+            opt_b = self.results[model_type]['B']
+            opt_ssr = self.results[model_type]['ssr']
+            plt.plot(opt_b, opt_ssr, 'r*', markersize=15, label=f'Final Solution (B={opt_b:.3f})')
+        plt.title(f"SSR Landscape vs Parameter B ({model_type})")
+        plt.xlabel("B (Decay Rate)")
+        plt.ylabel("Sum of Squared Residuals (SSR)")
+        plt.yscale('log')
+        plt.grid(True, which="both", ls="-", alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
