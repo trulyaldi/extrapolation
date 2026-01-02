@@ -81,7 +81,7 @@ class VarProIRLS:
             return local_best_ssr, local_best_b
 
 
-        coarse_grid = np.linspace(1, 50, 50)
+        coarse_grid = np.linspace(1, 100, 100)
         best_ssr, best_B = evaluate_grid(coarse_grid, np.inf, 1.0)
         
         step_size = coarse_grid[1] - coarse_grid[0]
@@ -89,7 +89,7 @@ class VarProIRLS:
         fine_min = max(1.0, best_B - step_size)
         fine_max = best_B + step_size
 
-        fine_grid = np.linspace(fine_min, fine_max, 50)
+        fine_grid = np.linspace(fine_min, fine_max, 100)
         best_ssr, best_B = evaluate_grid(fine_grid, best_ssr, best_B)
         
         return best_B
@@ -149,7 +149,7 @@ class VarProIRLS:
         
         return best_B, final_lin.x[0], final_lin.x[1]
 
-    def fit_irls(self, max_iter=100, tol=1e-8, damping=0.5, models=None, verbose=True, compute_uq=True, max_weight_ratio=100):
+    def fit_irls(self, max_iter=100, tol=1e-10, damping=0.5, models=None, verbose=False, compute_uq=True, max_weight_ratio=1000):
         if models is None: 
             models = ['exponential', 'sqrt_exponential', 'power_law']
         
@@ -157,12 +157,13 @@ class VarProIRLS:
             self._setup_model(model)
             if verbose:
                 print(f"\n--- Fitting Model: {self.model_type} ---")
-                print(f"{'Iter':<5} | {'B (Decay)':<12} | {'C (Asymptote)':<15} | {'Weight Ratio':<25}")
+                print(f"{'Iter':<5} | {'B (Decay)':<15} | {'C (Asymptote)':<15} | {'Weight Ratio':<25}")
                 print("-" * 65)
 
             current_weights = np.ones(len(self.raw_x))
             prev_C = np.inf
             current_B_guess = self.b_init
+            
             
             final_B, final_C, final_A = 0, 0, 0
 
@@ -191,7 +192,7 @@ class VarProIRLS:
                 
                 if verbose: 
                     w_ratio = 1.0 / (np.min(current_weights) + 1e-12)
-                    print(f"{k: <5} | {B:<12.6f} | {C: <15.6f} | {w_ratio:<25.2f}")
+                    print(f"{k: <5} | {B:<12.10f} | {C: <15.10f} | {w_ratio:<25.3f}")
 
             phi = self._compute_basis(final_B, self.t_scaled)
             y_pred = final_C + final_A * phi[:, 1]
@@ -213,7 +214,7 @@ class VarProIRLS:
             
         return self.results
 
-    def estimate_monte_carlo_uncertainty(self, n_samples=30, seed = 1):
+    def estimate_monte_carlo_uncertainty(self, n_samples=40, seed = 1):
 
         rng = np.random.default_rng(seed)
         
@@ -244,13 +245,13 @@ class VarProIRLS:
                 if model_name in sub_solver.results:
                     mc_Cs.append(sub_solver.results[model_name]['C'])
             
-            # q75, q25 = np.percentile(mc_Cs, [75, 25])
-            # sigma_robust = (q75 - q25) / 1.35
+            q75, q25 = np.percentile(mc_Cs, [75, 25])
+            sigma_robust = (q75 - q25) / 1.35
             
-            # if sigma_robust < 1e-12:
-            #     sigma_robust = np.std(mc_Cs)
+            if sigma_robust < 1e-12:
+                sigma_robust = np.std(mc_Cs)
                 
-            self.results[model_name]['sigma_mc'] = np.std(mc_Cs)
+            self.results[model_name]['sigma_mc'] = sigma_robust
 
     def plot(self, truth_val=None):
         if not self.results: 
@@ -263,7 +264,7 @@ class VarProIRLS:
         labels = {'exponential': 'Exp($e^{-Bx}$)', 'sqrt_exponential': 'SqrtExp($e^{-B\\sqrt{x}}$)', 'power_law': 'Power($x^{-B}$)'}
         
         print("\n" + "="*80)
-        print(f"{'Model':<20} | {'C (Asymptote)':<15} | {'MC Uncertainty':<20} | {'Diff from Truth'}")
+        print(f"{'Model':<20} | {'C (Asymptote)':<15} | {'MC Uncertainty':<20} | {'Diff from Reference'}")
         print("="*80)
 
         for model, res in self.results.items():
@@ -304,7 +305,7 @@ class VarProIRLS:
                     plt.fill_between([self.x_min, self.x_max * 1.5], 
                                      truth_val - truth_err, truth_val + truth_err, 
                                      color='r', alpha=0.15, zorder=0,
-                                     label=f'Truth Error (±{truth_err:.1e})')
+                                     label=f'Reference Error (±{truth_err:.1e})')
                 except IndexError:
                     print(f"Warning: Could not extract error from {self.y_col} column.")
         
@@ -316,7 +317,7 @@ class VarProIRLS:
         plt.tight_layout()
         plt.show()
 
-    def plot_ssr_profile(self, model_type='exponential', b_range=(0.1, 20), num_points=200):
+    def plot_ssr_profile(self, model_type='exponential', b_range=(1, 100), num_points=200):
         self._setup_model(model_type)
         b_grid = np.linspace(b_range[0], b_range[1], num_points)
         ssr_values = []
