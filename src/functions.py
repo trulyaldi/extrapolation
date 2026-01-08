@@ -25,16 +25,7 @@ def upload_error(file_path):
 
 
 def graph(df: pd.DataFrame, n_cols: int = 4):
-    """
-    Generates and displays a grid of plots for each feature in a DataFrame
-    against the 'basis size' column.
 
-    Args:
-        df (pd.DataFrame): The input DataFrame. It must contain a column
-                           named 'basis size' (case-insensitive).
-        n_cols (int): The number of columns to use in the plot grid.
-                      Defaults to 4.
-    """
     # Create a copy to avoid changing the original DataFrame
     df_plot = df.copy()
 
