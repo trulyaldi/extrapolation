@@ -1,4 +1,5 @@
 from scipy.optimize import least_squares, lsq_linear
+from sklearn.linear_model import HuberRegressor
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt 
@@ -19,8 +20,9 @@ class VarProIRLS:
         # ---------------------------------------
 
         # --- TREND DETECTION --- TO DETERMINE IF THE TREND IS INCREASING / DECREASING
-        slope, _ = np.polyfit(self.raw_x, self.raw_y, 1)
-        self.is_increasing = slope > 0
+        huber = HuberRegressor()
+        huber.fit(self.raw_x.reshape(-1, 1), self.raw_y)
+        self.is_increasing = huber.coef_[0] > 0
         # --------------------------------
         # User can provide the initial guess for B, if not provided, default value is 1.0. 
         self.override_b_init = b_init
@@ -28,11 +30,6 @@ class VarProIRLS:
         self.results = {}
         # --------------------------------
     def _setup_model(self, model_type):
-        ''' Before fitting the data with different functions, we have to scale the x-axis accordingly. 
-            For power-law and sqrt-exponential functions, we are dividing x by max(x) to avoid having 0 (causes problems).
-
-            As for exponential function, we are using min-max scaling.
-        '''
 
         self.model_type = model_type
         if self.model_type in ['power_law', 'sqrt_exponential']:
@@ -80,6 +77,7 @@ class VarProIRLS:
                     local_best_b = b_val
             return local_best_ssr, local_best_b
 
+        # Consider other efficient methods. 
 
         coarse_grid = np.linspace(1, 100, 100)
         best_ssr, best_B = evaluate_grid(coarse_grid, np.inf, 1.0)
@@ -106,24 +104,34 @@ class VarProIRLS:
         return phi
 
     def _compute_model_weights(self, B, t):
-        # Calculate raw components first
+        # Calculate raw log components
         if self.model_type == 'exponential':
             log_w = B * t
         elif self.model_type == 'sqrt_exponential': 
             log_w = B * np.sqrt(t)
         elif self.model_type == 'power_law': 
-            t_safe = np.maximum(t, 1e-12)
-            log_w = B * np.log(t_safe)
+            safe_t = np.maximum(t, 1e-12)
+            log_w = B * np.log(safe_t)
         
-        # Multiply by 2 because we want w^2 (inverse variance approximation)
+        # Inverse variance approximation (square the weights)
         log_w = 2.0 * log_w
         
-        # Normalize in log-space: subtract max log value
-        # This guarantees the largest weight is exactly 1.0
-        max_log_w = np.max(log_w)
-        normalized_w = np.exp(log_w - max_log_w)
+        # --- ROBUSTNESS LOGIC ---
+        # 1. Shift by the MEDIAN or MEAN log value instead of MAX.
+        #    This centers the exponent around 0, so you get numbers like 
+        #    e^-50 (small) to e^+50 (huge). 
+        #    This preserves the massive ratio but keeps both ends representable.
+        log_center = np.median(log_w)
+        log_w_shifted = log_w - log_center
+
+        # 2. Clip strictly to avoid 'inf'. 
+        #    exp(700) is approx 1e304. This allows for a relative weight 
+        #    ratio of 10^300 (which is effectively infinite/fierce).
+        log_w_safe = np.clip(log_w_shifted, -700, 700)
         
-        return normalized_w
+        weights = np.exp(log_w_safe)
+        
+        return weights
 
     def _solve_varpro_step(self, weights, start_b=None):
         y_w = self.raw_y * np.sqrt(weights)
@@ -140,7 +148,7 @@ class VarProIRLS:
             return (self.raw_y - y_model) * np.sqrt(weights)
 
         res_opt = least_squares(residual_func, x0=[start_b], bounds=(1, np.inf), 
-                                method='trf', loss='soft_l1')
+                                method='trf', loss='linear')
         
         best_B = res_opt.x[0]
         phi = self._compute_basis(best_B, self.t_scaled)
@@ -149,7 +157,7 @@ class VarProIRLS:
         
         return best_B, final_lin.x[0], final_lin.x[1]
 
-    def fit_irls(self, max_iter=100, tol=1e-10, damping=0.5, models=None, verbose=False, compute_uq=True, max_weight_ratio=1000):
+    def fit_irls(self, max_iter=100, tol=1e-12, damping=0.5, models=None, verbose=False, compute_uq=True):
         if models is None: 
             models = ['exponential', 'sqrt_exponential', 'power_law']
         
@@ -180,13 +188,6 @@ class VarProIRLS:
                 prev_C = C
 
                 new_weights = self._compute_model_weights(B, self.t_scaled)
-                
-                # --- NEW LOGIC: Cap the ratio of weights ---
-                # 1. Weights are already normalized so max is 1.0. 
-                # 2. We just need to make sure the minimum weight isn't too small.
-                min_allowed_weight = 1.0 / max_weight_ratio
-                new_weights = np.maximum(new_weights, min_allowed_weight)
-                # -------------------------------------------
 
                 current_weights = (1 - damping) * current_weights + damping * new_weights
                 
@@ -198,7 +199,7 @@ class VarProIRLS:
             y_pred = final_C + final_A * phi[:, 1]
             ssr = np.sum((self.raw_y - y_pred)**2)
             
-            dof = max(1, len(self.raw_y) - 1)
+            dof = max(1, len(self.raw_y) - 3)
             sigma_noise = np.sqrt(ssr / dof)
 
             self.results[model] = {
@@ -210,55 +211,103 @@ class VarProIRLS:
             }
         
         if compute_uq and len(self.results) > 0:
-            self.estimate_monte_carlo_uncertainty()
+            self.compute_uncertainty()
             
         return self.results
-
-    def estimate_monte_carlo_uncertainty(self, n_samples=40, seed = 1):
-
-        rng = np.random.default_rng(seed)
-        
+    
+    # RETHINK ON HOW TO COMPUTE THE UNCERTAINTY.
+    def compute_uncertainty(self):
+        """
+        Computes uncertainty using the Jacobian (Asymptotic Covariance) method.
+        Instantaneous and deterministic.
+        """
         for model_name, res in self.results.items():
+            B = res['B']
+            C = res['C']
+            A = res['A']
+            weights = res['final_weights']
             y_pred = res['y_pred']
-            sigma_noise = res['sigma_noise']
-            warm_start_b = res['B']
-            final_weights = res['final_weights']
             
-            mc_Cs = []
+            # 1. Number of data points (N) and parameters (p=3: A, B, C)
+            N = len(self.raw_x)
+            p = 3
             
-            w_max = np.max(final_weights)
-            if w_max == 0:
-                 noise_scale_factors = np.ones_like(final_weights)
+            # 2. Estimate the Variance of the residuals (sigma squared)
+            residuals = self.raw_y - y_pred
+            # Weighted Sum of Squared Residuals
+            ssr = np.sum(weights * residuals**2)
+            # Unbiased estimator of variance
+            sigma_sq = ssr / max(1, N - p) 
+            
+            # 3. Construct the Jacobian Matrix (J) of size (N, 3)
+            # The model is: y = C + A * phi(t, B)
+            # We need derivatives dy/dC, dy/dA, dy/dB
+            
+            J = np.zeros((N, p))
+            
+            # Pre-compute terms
+            t = res['t_scaled']
+            
+            # Derivative w.r.t C (Constant term) -> dy/dC = 1
+            J[:, 0] = 1.0 
+            
+            # Derivative w.r.t A (Linear coeff) -> dy/dA = phi(t, B)
+            # Recalculate phi column for B
+            if model_name == 'exponential':
+                phi_B = np.exp(-B * t)
+            elif model_name == 'sqrt_exponential':
+                phi_B = np.exp(-B * np.sqrt(t))
+            elif model_name == 'power_law':
+                safe_t = np.maximum(t, 1e-12)
+                phi_B = np.exp(-B * np.log(safe_t))
             else:
-                 noise_scale_factors = final_weights / w_max
+                raise ValueError(f"Unknown model: {model_name}")
+                
+            J[:, 1] = phi_B
             
-            for i in range(n_samples):
-                base_noise = rng.normal(0, sigma_noise, size=len(y_pred))
-                weighted_noise = base_noise * noise_scale_factors
-                y_synthetic = y_pred + weighted_noise
+            # Derivative w.r.t B (Non-linear decay) -> dy/dB = A * d(phi)/dB
+            if model_name == 'exponential':
+                # d/dB (e^-Bt) = -t * e^-Bt
+                deriv_phi_B = -t * phi_B
+            elif model_name == 'sqrt_exponential':
+                # d/dB (e^-B*sqrt(t)) = -sqrt(t) * e^-B*sqrt(t)
+                deriv_phi_B = -np.sqrt(t) * phi_B
+            elif model_name == 'power_law':
+                # d/dB (t^-B) = d/dB (e^(-B*ln(t))) = -ln(t) * t^-B
+                # Handle t=0 or negative t safely if necessary
+                safe_t = np.maximum(t, 1e-12)
+                deriv_phi_B = -np.log(safe_t) * phi_B
                 
-                sub_df = pd.DataFrame({self.x_col: self.raw_x, self.y_col: y_synthetic})
-                sub_solver = self.__class__(sub_df, self.x_col, self.y_col, b_init=warm_start_b)
-                
-                sub_solver.fit_irls(models=[model_name], verbose=False, compute_uq=False)
-                
-                if model_name in sub_solver.results:
-                    mc_Cs.append(sub_solver.results[model_name]['C'])
+            J[:, 2] = A * deriv_phi_B
             
-            q75, q25 = np.percentile(mc_Cs, [75, 25])
-            sigma_robust = (q75 - q25) / 1.35
+            # 4. Compute Hessian Approximation: H = J.T * W * J
+            # W is diagonal, so we can multiply row-wise
+            J_weighted = J * np.sqrt(weights)[:, np.newaxis]
+            H = np.dot(J_weighted.T, J_weighted)
             
-            if sigma_robust < 1e-12:
-                sigma_robust = np.std(mc_Cs)
+            # 5. Invert Hessian to get Covariance Matrix
+            try:
+                # Add tiny jitter to diagonal for numerical stability if B is huge
+                H_safe = H + np.eye(p) * 1e-12
+                Covariance = np.linalg.inv(H_safe) * sigma_sq
                 
-            self.results[model_name]['sigma_mc'] = sigma_robust
+                # 6. Extract diagonal elements (Variances of C, A, B)
+                var_C = Covariance[0, 0]
+                var_A = Covariance[1, 1]
+                var_B = Covariance[2, 2]
+                
+                # If variance is negative (numerical error), return 0
+                sigma_C = np.sqrt(max(0, var_C))
+                
+                self.results[model_name]['sigma_mc'] = sigma_C # Using same key for compatibility
+                
+            except np.linalg.LinAlgError:
+                print(f"Warning: Hessian for {model_name} was singular. Could not compute analytical uncertainty.")
+                self.results[model_name]['sigma_mc'] = 0.0
 
     def plot(self, truth_val=None):
         if not self.results: 
             return
-        
-        plt.figure(figsize=(12, 7))
-        plt.plot(self.raw_x, self.raw_y, 'ko', label='Data', zorder=5, markersize=6)
         
         colors = {'exponential': 'blue', 'sqrt_exponential': 'orange', 'power_law': 'green'}
         labels = {'exponential': 'Exp($e^{-Bx}$)', 'sqrt_exponential': 'SqrtExp($e^{-B\\sqrt{x}}$)', 'power_law': 'Power($x^{-B}$)'}
@@ -276,6 +325,14 @@ class VarProIRLS:
                 diff_str = f"{abs(C - truth_val):.2e}"
             
             print(f"{model:<20} | {C:<15.9f} | {sigma:<20.2e} | {diff_str}")
+
+        # --- PLOT 1: FULL DATA ---
+        plt.figure(figsize=(12, 7))
+        plt.plot(self.raw_x, self.raw_y, 'ko', label='Data', zorder=5, markersize=6)
+        
+        for model, res in self.results.items():
+            C = res['C']
+            sigma = res.get('sigma_mc', 0.0)
             
             x_plot = np.linspace(self.x_min, self.x_max * 1.5, 200)
             
@@ -298,7 +355,6 @@ class VarProIRLS:
 
         if truth_val is not None: 
             plt.axhline(truth_val, color='r', linestyle=':', linewidth=2, label=f'Truth ({truth_val:.8f})')
-            
             if self.err_df is not None and self.y_col in self.err_df.columns:
                 try:
                     truth_err = self.err_df[self.y_col].values[-1]
@@ -307,9 +363,87 @@ class VarProIRLS:
                                      color='r', alpha=0.15, zorder=0,
                                      label=f'Reference Error (±{truth_err:.1e})')
                 except IndexError:
-                    print(f"Warning: Could not extract error from {self.y_col} column.")
+                    pass
         
-        plt.title(f"{self.y_col}")
+        plt.title(f"{self.y_col} - Full View")
+        plt.xlabel("Basis Size")
+        plt.ylabel("Value")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+        # --- PLOT 2: ZOOMED TAIL & EXTRAPOLATION ---
+        plt.figure(figsize=(12, 7))
+        plt.plot(self.raw_x, self.raw_y, 'ko', label='Data', zorder=5, markersize=6)
+        
+        # Calculate limits for the zoom based on tail of data + extrapolation
+        zoom_start = self.x_min + 0.6 * self.range_x # Start from last 40% of data
+        zoom_end = self.x_max * 1.5
+        
+        y_min_zoom, y_max_zoom = np.inf, -np.inf
+        # Find data range within zoom
+        mask = self.raw_x >= zoom_start
+        if np.any(mask):
+            y_min_zoom = min(y_min_zoom, np.min(self.raw_y[mask]))
+            y_max_zoom = max(y_max_zoom, np.max(self.raw_y[mask]))
+
+        for model, res in self.results.items():
+            C = res['C']
+            sigma = res.get('sigma_mc', 0.0)
+            
+            x_plot = np.linspace(self.x_min, self.x_max * 1.5, 200)
+            
+            if model in ['power_law', 'sqrt_exponential']: 
+                t_plot = x_plot / self.x_max
+            else: 
+                t_plot = (x_plot - self.x_min) / self.range_x
+            
+            self.model_type = model
+            phi_plot = self._compute_basis(res['B'], t_plot)
+            y_plot = C + res['A'] * phi_plot[:, 1]
+            
+            plt.plot(x_plot, y_plot, '-', color=colors[model], linewidth=2, alpha=0.8, label=f"{labels[model]}")
+            
+            plt.fill_between([self.x_min, self.x_max * 1.5], 
+                             C - sigma, C + sigma, 
+                             color=colors[model], alpha=0.1)
+            
+            plt.axhline(C, color=colors[model], linestyle='--', alpha=0.3)
+            
+            # Update zoom y-limits based on asymptotes and curves in this region
+            y_min_zoom = min(y_min_zoom, C - sigma*2)
+            y_max_zoom = max(y_max_zoom, C + sigma*2)
+            
+            # Check curve values in zoom region
+            mask_plot = (x_plot >= zoom_start) & (x_plot <= zoom_end)
+            if np.any(mask_plot):
+                 y_min_zoom = min(y_min_zoom, np.min(y_plot[mask_plot]))
+                 y_max_zoom = max(y_max_zoom, np.max(y_plot[mask_plot]))
+
+        if truth_val is not None: 
+            plt.axhline(truth_val, color='r', linestyle=':', linewidth=2, label=f'Truth ({truth_val:.8f})')
+            if self.err_df is not None and self.y_col in self.err_df.columns:
+                 # Re-add truth error fill for second plot
+                try:
+                    truth_err = self.err_df[self.y_col].values[-1]
+                    plt.fill_between([self.x_min, self.x_max * 1.5], 
+                                     truth_val - truth_err, truth_val + truth_err, 
+                                     color='r', alpha=0.15, zorder=0,
+                                     label=f'Reference Error')
+                except IndexError:
+                    pass
+
+        # Apply Zoom
+        plt.xlim(zoom_start, zoom_end)
+        
+        # Add slight buffer to y-limits
+        if not np.isinf(y_min_zoom) and not np.isinf(y_max_zoom):
+            y_span = y_max_zoom - y_min_zoom
+            if y_span == 0: y_span = 0.1
+            plt.ylim(y_min_zoom - 0.1*y_span, y_max_zoom + 0.1*y_span)
+
+        plt.title(f"{self.y_col} - Zoomed Tail & Extrapolation")
         plt.xlabel("Basis Size")
         plt.ylabel("Value")
         plt.grid(True, alpha=0.3)
@@ -322,12 +456,24 @@ class VarProIRLS:
         b_grid = np.linspace(b_range[0], b_range[1], num_points)
         ssr_values = []
         lb, ub = self._get_A_bounds()
+
+            # --- use final weights (must have run fit_irls first) ---
+        if model_type in self.results and 'final_weights' in self.results[model_type]:
+            weights = self.results[model_type]['final_weights']
+        else:
+            # fallback: unweighted profile
+            weights = np.ones_like(self.raw_y)
+
+        sqrt_w = np.sqrt(weights)
+        y_w = self.raw_y * sqrt_w
+
         for b_val in b_grid:
             phi = self._compute_basis(b_val, self.t_scaled)
             try:
-                res = lsq_linear(phi, self.raw_y, bounds=(lb, ub), method='bvls')
-                y_pred = np.dot(phi, res.x)
-                ssr = np.sum((self.raw_y - y_pred)**2)
+                phi_w = phi * sqrt_w[:, None]
+                res = lsq_linear(phi_w, y_w, bounds=(lb, ub), method='bvls')
+                y_pred = phi @ res.x
+                ssr = np.sum(weights * (self.raw_y - y_pred)**2)   # weighted SSR
             except:
                 ssr = np.nan
             ssr_values.append(ssr)

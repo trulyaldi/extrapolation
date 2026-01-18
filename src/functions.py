@@ -24,53 +24,76 @@ def upload_error(file_path):
   return df.tail(1)
 
 
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+
 def graph(df: pd.DataFrame, n_cols: int = 4):
-
-    # Create a copy to avoid changing the original DataFrame
     df_plot = df.copy()
-
-    # Standardize column names to lowercase for consistency
     df_plot.columns = [col.lower() for col in df_plot.columns]
 
-    # Check for the required 'basis size' column
     if 'basis size' not in df_plot.columns:
         raise ValueError("Input DataFrame must contain a 'basis size' column.")
 
-    # Prepare the data and identify features to plot
     df_plot['basis size'] = df_plot['basis size'].astype(int)
     features = sorted([col for col in df_plot.columns if col != 'basis size'])
     n_features = len(features)
 
-    # Handle the case of no features to plot
     if n_features == 0:
-        print("No feature columns found to plot.")
         return
 
-    # Calculate the required number of rows for the grid
     n_rows = (n_features + n_cols - 1) // n_cols
 
-    # Create the figure and subplots
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.5 * n_rows), sharex=True)
-    fig.suptitle('Features vs. Basis Size', fontsize=16, y=1.03)
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(7 * n_cols, 5.5 * n_rows)
+    )
+    
+    fig.suptitle(r'Be($^3D^e$)', fontsize=22, y=1.05, fontweight='bold')
 
-    # Flatten the axes array for easy, single-loop iteration
-    axes = axes.flatten()
+    if n_features == 1:
+        axes = [axes]
+    else:
+        axes = axes.flatten()
 
-    # Plot each feature against the basis size
+    # Define the data points and the limit
+    basis_sizes = df_plot['basis size'].values
+    # This is the x-value of the point just before the last one
+    x_limit = basis_sizes[-2] 
+
     for i, feature in enumerate(features):
         ax = axes[i]
-        ax.scatter(df_plot['basis size'], df_plot[feature], marker='o')
+        y = df_plot[feature].values
 
-        # Format titles and labels for readability
-        ax.set_title(feature.replace('_', ' ').title())
-        ax.set_xlabel('Basis Size')
-        ax.set_ylabel('Value')
-        ax.grid(True, linestyle='--', alpha=0.6)
+        # Plot points up until the second to last
+        ax.scatter(basis_sizes[:-1], y[:-1], marker='o', s=50, edgecolors='royalblue', alpha=0.8)
 
-    # Clean up by removing any empty, unused subplots
+        # Horizontal dashed line at the very last value
+        ax.axhline(y[-1], color='red', linestyle='--', linewidth=2, alpha=0.9)
+
+        ax.set_title(feature, fontsize=15, pad=10)
+        ax.set_xlabel('Basis Size', fontsize=12)
+        ax.set_ylabel('Value', fontsize=12)
+        
+        # --- KEY FIX: SET X-AXIS LIMIT ---
+        # This cuts the plot off right at the last scatter point
+        ax.set_xlim(left=basis_sizes[0], right=x_limit)
+        
+        # Clean up ticks so they don't overlap
+        ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=5, integer=True))
+        ax.ticklabel_format(style='plain', axis='x')
+        ax.grid(True, linestyle='--', alpha=0.3)
+
     for j in range(i + 1, len(axes)):
         fig.delaxes(axes[j])
 
-    # Adjust layout to prevent plot elements from overlapping
-    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    plt.tight_layout(pad=3.0)
     plt.show()
