@@ -26,7 +26,7 @@ class VarProIRLS:
         # --------------------------------
         # User can provide the initial guess for B, if not provided, default value is 1.0. 
         self.override_b_init = b_init
-        self.b_init = 1.0  
+        self.b_init = None
         self.results = {}
         # --------------------------------
     def _setup_model(self, model_type):
@@ -157,63 +157,69 @@ class VarProIRLS:
         
         return best_B, final_lin.x[0], final_lin.x[1]
 
-    def fit_irls(self, max_iter=100, tol=1e-12, damping=0.5, models=None, verbose=False, compute_uq=True):
-        if models is None: 
+    def fit_irls(self, max_iter=100, tol=1e-9, damping=0.5, models=None, verbose=False, compute_uq=False):
+        if models is None:
             models = ['exponential', 'sqrt_exponential', 'power_law']
-        
-        for model in models: 
+
+        for model in models:
             self._setup_model(model)
             if verbose:
                 print(f"\n--- Fitting Model: {self.model_type} ---")
-                print(f"{'Iter':<5} | {'B (Decay)':<15} | {'C (Asymptote)':<15} | {'Weight Ratio':<25}")
-                print("-" * 65)
+                print(f"{'Iter':<5} | {'B (Decay)':<15} | {'C (Asymptote)':<15} | {'A (Scale)':<15} | {'Weight Ratio':<25}")
+                print("-" * 85)
 
             current_weights = np.ones(len(self.raw_x))
+
+            # Track all three parameters for convergence
+            prev_B = np.inf
             prev_C = np.inf
+            prev_A = np.inf
+
             current_B_guess = self.b_init
-            
-            
-            final_B, final_C, final_A = 0, 0, 0
+            final_B, final_C, final_A = 0.0, 0.0, 0.0
 
             for k in range(max_iter):
                 B, C, A = self._solve_varpro_step(current_weights, start_b=current_B_guess)
                 current_B_guess = B
                 final_B, final_C, final_A = B, C, A
 
-                if abs(C - prev_C) < tol and k > 0:
-                    if verbose:
-                        print("-" * 65)
-                        print(f"Converged at iteration {k}")
-                    break
-                prev_C = C
+                # Converge when ALL parameters stabilize
+                if k > 0:
+                    if (abs(B - prev_B) < tol) and (abs(C - prev_C) < tol) and (abs(A - prev_A) < tol):
+                        if verbose:
+                            print("-" * 85)
+                            print(f"Converged at iteration {k}")
+                        break
+
+                prev_B, prev_C, prev_A = B, C, A
 
                 new_weights = self._compute_model_weights(B, self.t_scaled)
-
                 current_weights = (1 - damping) * current_weights + damping * new_weights
-                
-                if verbose: 
+
+                if verbose:
                     w_ratio = 1.0 / (np.min(current_weights) + 1e-12)
-                    print(f"{k: <5} | {B:<12.10f} | {C: <15.10f} | {w_ratio:<25.3f}")
+                    print(f"{k:<5} | {B:<15.10f} | {C:<15.10f} | {A:<15.10f} | {w_ratio:<25.3f}")
 
             phi = self._compute_basis(final_B, self.t_scaled)
             y_pred = final_C + final_A * phi[:, 1]
-            ssr = np.sum((self.raw_y - y_pred)**2)
-            
+            ssr = np.sum((self.raw_y - y_pred) ** 2)
+
             dof = max(1, len(self.raw_y) - 3)
             sigma_noise = np.sqrt(ssr / dof)
 
             self.results[model] = {
-                'B': final_B, 'C': final_C, 'A': final_A, 
+                'B': final_B, 'C': final_C, 'A': final_A,
                 'ssr': ssr, 't_scaled': self.t_scaled.copy(),
                 'sigma_noise': sigma_noise,
                 'y_pred': y_pred,
                 'final_weights': current_weights
             }
-        
+
         if compute_uq and len(self.results) > 0:
             self.compute_uncertainty()
-            
+
         return self.results
+
     
     # RETHINK ON HOW TO COMPUTE THE UNCERTAINTY.
     def compute_uncertainty(self):
