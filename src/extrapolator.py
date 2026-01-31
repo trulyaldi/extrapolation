@@ -87,7 +87,7 @@ class VarProIRLS:
                     local_best_b = b_val
             return local_best_ssr, local_best_b
 
-        coarse_grid = np.linspace(1, 100, 100)
+        coarse_grid = np.linspace(0.01, 100, 100)
         best_ssr, best_B = evaluate_grid(coarse_grid, np.inf, 1.0)
         
         step_size = coarse_grid[1] - coarse_grid[0]
@@ -145,7 +145,7 @@ class VarProIRLS:
             y_model = np.dot(phi, res_lin.x)
             return (self.raw_y - y_model) * np.sqrt(weights)
 
-        res_opt = least_squares(residual_func, x0=[start_b], bounds=(1, np.inf), 
+        res_opt = least_squares(residual_func, x0=[start_b], bounds=(0.01, np.inf), 
                                 method='trf', loss='linear')
         
         best_B = res_opt.x[0]
@@ -159,42 +159,72 @@ class VarProIRLS:
         if models is None:
             models = ['exponential', 'sqrt_exponential', 'power_law']
 
+        # stopping hyperparams (kept internal so you don't change the signature)
+        eps = 1e-12
+        stall = 0
+        stall_patience = 3
+        tol_w = 10.0 * tol  # weight-change tolerance (usually looser than objective tolerance)
+
         for model in models:
             self._setup_model(model)
             if verbose:
                 print(f"\n--- Fitting Model: {self.model_type} ---")
-                print(f"{'Iter':<5} | {'B (Decay)':<15} | {'C (Asymptote)':<15} | {'A (Scale)':<15} | {'Weight Ratio':<25}")
-                print("-" * 85)
+                print(f"{'Iter':<5} | {'B (Decay)':<15} | {'C (Asymptote)':<15} | {'A (Scale)':<15} | {'Weight Ratio':<25} | {'rel_obj':<12} | {'rel_w':<12}")
+                print("-" * 120)
 
-            current_weights = np.ones(len(self.raw_x))
-
-            prev_B = np.inf
-            prev_C = np.inf
-            prev_A = np.inf
+            current_weights = np.ones(len(self.raw_x), dtype=float)
 
             current_B_guess = self.b_init
             final_B, final_C, final_A = 0.0, 0.0, 0.0
 
+            prev_obj = np.inf
+
             for k in range(max_iter):
+                # ---- VarPro solve under current weights ----
                 B, C, A = self._solve_varpro_step(current_weights, start_b=current_B_guess)
                 current_B_guess = B
                 final_B, final_C, final_A = B, C, A
 
-                if k > 0:
-                    if (abs(B - prev_B) < tol) and (abs(C - prev_C) < tol) and (abs(A - prev_A) < tol):
-                        if verbose:
-                            print("-" * 85)
-                            print(f"Converged at iteration {k}")
-                        break
+                # ---- objective under current weights (what you're minimizing this iter) ----
+                phi = self._compute_basis(B, self.t_scaled)
+                y_pred = C + A * phi[:, 1]
+                resid = self.raw_y - y_pred
+                obj = float(np.sum(current_weights * resid**2))  # weighted SSR
 
-                prev_B, prev_C, prev_A = B, C, A
+                rel_obj = abs(obj - prev_obj) / (abs(prev_obj) + eps)
 
+                # ---- propose next weights and measure how much they change ----
                 new_weights = self._compute_model_weights(B, self.t_scaled)
-                current_weights = (1 - damping) * current_weights + damping * new_weights
+
+
+
+
+                proposed_weights = (1 - damping) * current_weights + damping * new_weights
+
+
+
+
+
+                rel_w = np.sum(np.abs(proposed_weights - current_weights)) / (np.sum(np.abs(current_weights)) + eps)
+
+                # ---- stopping: objective + weights both stagnate ----
+                if k > 0:
+                    if (rel_obj < tol) and (rel_w < tol_w):
+                        stall += 1
+                        if stall >= stall_patience:
+                            if verbose:
+                                print("-" * 120)
+                                print(f"Converged at iteration {k} (rel_obj={rel_obj:.3e}, rel_w={rel_w:.3e})")
+                            break
+                    else:
+                        stall = 0
+
+                prev_obj = obj
+                current_weights = proposed_weights
 
                 if verbose:
-                    w_ratio = 1.0 / (np.min(current_weights) + 1e-12)
-                    print(f"{k:<5} | {B:<15.10f} | {C:<15.10f} | {A:<15.10f} | {w_ratio:<25.3f}")
+                    w_ratio = float(np.max(current_weights) / (np.min(current_weights) + eps))
+                    print(f"{k:<5} | {B:<15.10f} | {C:<15.10f} | {A:<15.10f} | {w_ratio:<25.3f} | {rel_obj:<12.3e} | {rel_w:<12.3e}")
 
             phi = self._compute_basis(final_B, self.t_scaled)
             y_pred = final_C + final_A * phi[:, 1]
@@ -215,6 +245,7 @@ class VarProIRLS:
             self.compute_uncertainty()
 
         return self.results
+
 
     def compute_uncertainty(self):
         """
