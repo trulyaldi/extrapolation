@@ -87,7 +87,7 @@ class VarProIRLS:
                     local_best_b = b_val
             return local_best_ssr, local_best_b
 
-        coarse_grid = np.linspace(0.01, 100, 100)
+        coarse_grid = np.linspace(1, 100, 100)
         best_ssr, best_B = evaluate_grid(coarse_grid, np.inf, 1.0)
         
         step_size = coarse_grid[1] - coarse_grid[0]
@@ -145,7 +145,7 @@ class VarProIRLS:
             y_model = np.dot(phi, res_lin.x)
             return (self.raw_y - y_model) * np.sqrt(weights)
 
-        res_opt = least_squares(residual_func, x0=[start_b], bounds=(0.01, np.inf), 
+        res_opt = least_squares(residual_func, x0=[start_b], bounds=(1, 100), 
                                 method='trf', loss='linear')
         
         best_B = res_opt.x[0]
@@ -195,12 +195,20 @@ class VarProIRLS:
 
                 # ---- propose next weights and measure how much they change ----
                 new_weights = self._compute_model_weights(B, self.t_scaled)
+                # Robust scale of residuals
+                med_resid = np.median(resid)
+                mad_resid = np.median(np.abs(resid - med_resid))
+                sigma_resid = 1.4826 * mad_resid
 
+                # Points with large residuals are likely noise — reduce their weight
+                if sigma_resid > 0:
+                    z = resid / sigma_resid
+                    # Huber-like taper: full weight up to z=2, then decays
+                    reliability = np.where(z <= 2.0, 1.0, (2.0 / z) ** 2)
+                else:
+                    reliability = np.ones_like(resid)
 
-
-
-                proposed_weights = (1 - damping) * current_weights + damping * new_weights
-
+                proposed_weights = (1 - damping) * current_weights + damping * (new_weights * reliability)
 
 
 
@@ -248,66 +256,7 @@ class VarProIRLS:
 
 
     def compute_uncertainty(self):
-        """
-        Computes uncertainty using the Jacobian (Asymptotic Covariance) method.
-        Instantaneous and deterministic.
-        """
-        for model_name, res in self.results.items():
-            B = res['B']
-            C = res['C']
-            A = res['A']
-            weights = res['final_weights']
-            y_pred = res['y_pred']
-            
-            N = len(self.raw_x)
-            p = 3
-            
-            residuals = self.raw_y - y_pred
-            ssr = np.sum(weights * residuals**2)
-            sigma_sq = ssr / max(1, N - p) 
-            
-            J = np.zeros((N, p))
-            t = res['t_scaled']
-            
-            J[:, 0] = 1.0 
-            
-            if model_name == 'exponential':
-                phi_B = np.exp(-B * t)
-            elif model_name == 'sqrt_exponential':
-                phi_B = np.exp(-B * np.sqrt(t))
-            elif model_name == 'power_law':
-                safe_t = np.maximum(t, 1e-12)
-                phi_B = np.exp(-B * np.log(safe_t))
-            else:
-                raise ValueError(f"Unknown model: {model_name}")
-                
-            J[:, 1] = phi_B
-            
-            if model_name == 'exponential':
-                deriv_phi_B = -t * phi_B
-            elif model_name == 'sqrt_exponential':
-                deriv_phi_B = -np.sqrt(t) * phi_B
-            elif model_name == 'power_law':
-                safe_t = np.maximum(t, 1e-12)
-                deriv_phi_B = -np.log(safe_t) * phi_B
-                
-            J[:, 2] = A * deriv_phi_B
-            
-            J_weighted = J * np.sqrt(weights)[:, np.newaxis]
-            H = np.dot(J_weighted.T, J_weighted)
-            
-            try:
-                H_safe = H + np.eye(p) * 1e-12
-                Covariance = np.linalg.inv(H_safe) * sigma_sq
-                
-                var_C = Covariance[0, 0]
-                sigma_C = np.sqrt(max(0, var_C))
-                
-                self.results[model_name]['sigma_mc'] = sigma_C
-                
-            except np.linalg.LinAlgError:
-                print(f"Warning: Hessian for {model_name} was singular. Could not compute analytical uncertainty.")
-                self.results[model_name]['sigma_mc'] = 0.0
+        pass
 
     def plot(self, truth_val=None):
         if not self.results:
