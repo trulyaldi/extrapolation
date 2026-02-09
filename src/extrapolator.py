@@ -75,7 +75,6 @@ class VarProIRLS:
             for b_val in grid_values:
                 phi = self._compute_basis(b_val, self.t_scaled)
                 try:
-                    # Solving the linear problem for fixed B
                     res = lsq_linear(phi, self.raw_y, bounds=(lb, ub), method='bvls')
                     y_pred = np.dot(phi, res.x)
                     ssr = np.sum((self.raw_y - y_pred)**2)
@@ -87,15 +86,16 @@ class VarProIRLS:
                     local_best_b = b_val
             return local_best_ssr, local_best_b
 
-        coarse_grid = np.linspace(1, 100, 100)
+        # Logarithmic grid: dense at low B, sparse at high B
+        coarse_grid = np.geomspace(1, 100, 100)
         best_ssr, best_B = evaluate_grid(coarse_grid, np.inf, 1.0)
         
-        step_size = coarse_grid[1] - coarse_grid[0]
+        # Fine grid: also logarithmic around the best B
+        idx = np.searchsorted(coarse_grid, best_B)
+        fine_min = coarse_grid[max(0, idx - 1)]
+        fine_max = coarse_grid[min(len(coarse_grid) - 1, idx + 1)]
         
-        fine_min = max(1.0, best_B - step_size)
-        fine_max = best_B + step_size
-
-        fine_grid = np.linspace(fine_min, fine_max, 100)
+        fine_grid = np.geomspace(fine_min, fine_max, 100)
         best_ssr, best_B = evaluate_grid(fine_grid, best_ssr, best_B)
         
         return best_B
@@ -155,7 +155,7 @@ class VarProIRLS:
         
         return best_B, final_lin.x[0], final_lin.x[1]
 
-    def fit_irls(self, max_iter=100, tol=1e-9, damping=0.5, models=None, verbose=False, compute_uq=False):
+    def fit_irls(self, max_iter=110, tol=1e-9, damping=0.5, models=None, verbose=False, compute_uq=False):
         if models is None:
             models = ['exponential', 'sqrt_exponential', 'power_law']
 
@@ -193,24 +193,29 @@ class VarProIRLS:
 
                 rel_obj = abs(obj - prev_obj) / (abs(prev_obj) + eps)
 
-                # ---- propose next weights and measure how much they change ----
                 new_weights = self._compute_model_weights(B, self.t_scaled)
-                # Robust scale of residuals
+
+                # Robust scale of residuals (MAD — unchanged)
                 med_resid = np.median(resid)
                 mad_resid = np.median(np.abs(resid - med_resid))
                 sigma_resid = 1.4826 * mad_resid
 
-                # Points with large residuals are likely noise — reduce their weight
                 if sigma_resid > 0:
-                    z = resid / sigma_resid
-                    # Huber-like taper: full weight up to z=2, then decays
+                    z = np.abs(resid) / sigma_resid
                     reliability = np.where(z <= 2.0, 1.0, (2.0 / z) ** 2)
                 else:
                     reliability = np.ones_like(resid)
 
-                proposed_weights = (1 - damping) * current_weights + damping * (new_weights * reliability)
+                effective_new = new_weights * reliability
 
+                # Normalize both to sum to 1 before blending
+                current_normed = current_weights / np.sum(current_weights)
+                new_normed = effective_new / np.sum(effective_new)
 
+                proposed_normed = (1 - damping) * current_normed + damping * new_normed
+
+                # Restore to original scale of current weights
+                proposed_weights = proposed_normed * np.sum(current_weights)
 
 
                 rel_w = np.sum(np.abs(proposed_weights - current_weights)) / (np.sum(np.abs(current_weights)) + eps)
