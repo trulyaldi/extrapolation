@@ -126,7 +126,7 @@ class VarProIRLS:
         log_center = np.median(log_w)
         log_w_shifted = log_w - log_center
 
-        log_w_safe = np.clip(log_w_shifted, -700, 700)
+        log_w_safe = np.clip(log_w_shifted, -50, 50)
         weights = np.exp(log_w_safe)
         
         return weights
@@ -163,7 +163,7 @@ class VarProIRLS:
         eps = 1e-12
         stall = 0
         stall_patience = 3
-        tol_w = 10.0 * tol  # weight-change tolerance (usually looser than objective tolerance)
+        tol_w = 10.0 * tol  
 
         for model in models:
             self._setup_model(model)
@@ -212,7 +212,12 @@ class VarProIRLS:
                 current_normed = current_weights / np.sum(current_weights)
                 new_normed = effective_new / np.sum(effective_new)
 
-                proposed_normed = (1 - damping) * current_normed + damping * new_normed
+                log_cur = np.log(current_normed + eps)
+                log_new = np.log(new_normed + eps)
+
+                log_prop = (1 - damping) * log_cur + damping * log_new
+                proposed_normed = np.exp(log_prop)
+                proposed_normed /= proposed_normed.sum()
 
                 # Restore to original scale of current weights
                 proposed_weights = proposed_normed * np.sum(current_weights)
