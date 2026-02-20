@@ -181,6 +181,7 @@ class VarProIRLS:
 
             for k in range(max_iter):
                 # ---- VarPro solve under current weights ----
+                
                 B, C, A = self._solve_varpro_step(current_weights, start_b=current_B_guess)
                 current_B_guess = B
                 final_B, final_C, final_A = B, C, A
@@ -413,44 +414,50 @@ class VarProIRLS:
         plt.legend()
         plt.tight_layout()
         plt.show()
+        
+    def plot_final_weights(self, model_type='exponential', sort_by_x=True, normalize=False):
+        """
+        Bar chart of final IRLS weights for each data point.
 
+        Parameters
+        ----------
+        model_type : str
+            One of: 'exponential', 'sqrt_exponential', 'power_law'
+        sort_by_x : bool
+            If True, bars follow increasing x. If False, uses original row order.
+        normalize : bool
+            If True, scales weights to sum to 1 for easier comparison.
+        """
+        if not self.results:
+            raise RuntimeError("No results found. Run fit_irls() first.")
 
-    def plot_ssr_profile(self, model_type='exponential', b_range=(1, 100), num_points=200):
-        self._setup_model(model_type)
-        b_grid = np.linspace(b_range[0], b_range[1], num_points)
-        ssr_values = []
-        lb, ub = self._get_A_bounds()
+        if model_type not in self.results:
+            raise ValueError(f"Model '{model_type}' not found in results. Available: {list(self.results.keys())}")
 
-        if model_type in self.results and 'final_weights' in self.results[model_type]:
-            weights = self.results[model_type]['final_weights']
+        w = np.asarray(self.results[model_type].get('final_weights', None), dtype=float)
+        if w is None or w.size == 0:
+            raise RuntimeError(f"No 'final_weights' stored for model '{model_type}'.")
+
+        x = np.asarray(self.raw_x, dtype=float)
+
+        if normalize:
+            s = w.sum()
+            if s > 0:
+                w = w / s
+
+        if sort_by_x:
+            idx = np.argsort(x)
+            x_plot = x[idx]
+            w_plot = w[idx]
         else:
-            weights = np.ones_like(self.raw_y)
+            x_plot = x
+            w_plot = w
 
-        sqrt_w = np.sqrt(weights)
-        y_w = self.raw_y * sqrt_w
-
-        for b_val in b_grid:
-            phi = self._compute_basis(b_val, self.t_scaled)
-            try:
-                phi_w = phi * sqrt_w[:, None]
-                res = lsq_linear(phi_w, y_w, bounds=(lb, ub), method='bvls')
-                y_pred = phi @ res.x
-                ssr = np.sum(weights * (self.raw_y - y_pred)**2)
-            except:
-                ssr = np.nan
-            ssr_values.append(ssr)
-
-        plt.figure(figsize=(10, 6))
-        plt.plot(b_grid, ssr_values, label=f'SSR Profile ({model_type})', color='purple')
-        if model_type in self.results:
-            opt_b = self.results[model_type]['B']
-            opt_ssr = self.results[model_type]['ssr']
-            plt.plot(opt_b, opt_ssr, 'r*', markersize=15, label=f'Final Solution (B={opt_b:.3f})')
-        plt.title(f"SSR Landscape vs Parameter B ({model_type})")
-        plt.xlabel("B (Decay Rate)")
-        plt.ylabel("Sum of Squared Residuals (SSR)")
-        plt.yscale('log')
-        plt.grid(True, which="both", ls="-", alpha=0.3)
-        plt.legend()
+        plt.figure(figsize=(12, 5))
+        plt.bar(np.arange(len(w_plot)), w_plot)
+        plt.title(f"Final IRLS Weights per Data Point ({model_type})")
+        plt.xlabel("Data point index" + (" (sorted by x)" if sort_by_x else " (original order)"))
+        plt.ylabel("Weight" + (" (normalized)" if normalize else ""))
+        plt.grid(True, axis='y', alpha=0.3)
         plt.tight_layout()
         plt.show()
