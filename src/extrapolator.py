@@ -64,6 +64,35 @@ class VarProIRLS:
             lb = [-np.inf, 0]       # [C,A]
             ub = [np.inf, np.inf]   # [C,A]
         return lb, ub
+    
+    def _get_b_bounds(self):
+        """
+        Compute meaningful B bounds based on model type and data range.
+        The key constraint: the basis function must not be numerically zero
+        at the smallest t value in the dataset.
+        """
+        t_min = self.t_scaled.min()
+        t_max = self.t_scaled.max()  # always 1.0 by construction
+        
+        # We want exp(-B * t_min) > epsilon, i.e. B < -log(eps)/t_min
+        # At B_max, the basis function at t_min should still be ~1e-6 (not zero)
+        eps_basis = 1e-4  # minimum meaningful basis function value
+        
+        if self.model_type == 'exponential':
+            # exp(-B * t_min) > eps  =>  B < -log(eps) / t_min
+            b_max = -np.log(eps_basis) / t_min  # ~13.8 / t_min
+        elif self.model_type == 'sqrt_exponential':
+            # exp(-B * sqrt(t_min)) > eps  =>  B < -log(eps) / sqrt(t_min)
+            b_max = -np.log(eps_basis) / np.sqrt(t_min)
+        elif self.model_type == 'power_law':
+            # t_min^(-B) < 1/eps  =>  B < log(1/eps) / log(1/t_min)
+            b_max = np.log(1.0 / eps_basis) / np.log(1.0 / t_min + 1e-12)
+        
+        # Also cap at a hard maximum to avoid insane extrapolation
+        b_max = min(b_max, 30.0)
+        b_max = max(b_max, 2.0)  # ensure b_max > b_min=1
+        
+        return 1.0, b_max
 
     def _grid_search_initialization(self):
         lb, ub = self._get_A_bounds()
@@ -86,8 +115,9 @@ class VarProIRLS:
                     local_best_b = b_val
             return local_best_ssr, local_best_b
 
+        b_lo, b_hi = self._get_b_bounds()
         # Logarithmic grid: dense at low B, sparse at high B
-        coarse_grid = np.geomspace(1, 100, 100)
+        coarse_grid = np.geomspace(b_lo, b_hi, 100) 
         best_ssr, best_B = evaluate_grid(coarse_grid, np.inf, 1.0)
         
         # Fine grid: also logarithmic around the best B
@@ -121,12 +151,12 @@ class VarProIRLS:
             log_w = B * np.log(t)
         
         # Inverse variance approximation (square the weights)
-        log_w = 2.0 * log_w
+        # log_w = 2.0 * log_w
         
         log_center = np.median(log_w)
         log_w_shifted = log_w - log_center
 
-        log_w_safe = np.clip(log_w_shifted, -50, 50)
+        log_w_safe = np.clip(log_w_shifted, -20, 20)
         weights = np.exp(log_w_safe)
         
         return weights
@@ -144,8 +174,10 @@ class VarProIRLS:
             res_lin = lsq_linear(phi_w, y_w, bounds=(lb, ub), method='bvls')
             y_model = np.dot(phi, res_lin.x)
             return (self.raw_y - y_model) * np.sqrt(weights)
+        
 
-        res_opt = least_squares(residual_func, x0=[start_b], bounds=(1, 100), 
+        b_lo, b_hi = self._get_b_bounds()
+        res_opt = least_squares(residual_func, x0=[start_b], bounds=(b_lo, b_hi), 
                                 method='trf', loss='linear')
         
         best_B = res_opt.x[0]
@@ -155,7 +187,7 @@ class VarProIRLS:
         
         return best_B, final_lin.x[0], final_lin.x[1]
 
-    def fit_irls(self, max_iter=110, tol=1e-9, damping=0.5, models=None, verbose=False, compute_uq=False):
+    def fit_irls(self, max_iter=110, tol=1e-9, damping=0.5, models=None, verbose=False, compute_uq=True):
         if models is None:
             models = ['exponential', 'sqrt_exponential', 'power_law']
 
@@ -267,7 +299,52 @@ class VarProIRLS:
 
 
     def compute_uncertainty(self):
-        pass
+            """
+            Occam's Razor Version: Uses Jackknife (Leave-One-Out) and 
+            Cross-Model Spread to ensure a reasonable uncertainty floor.
+            """
+            all_C_results = {}
+
+            for model_name, res in self.results.items():
+                self.model_type = model_name
+                t_scaled = res['t_scaled']
+                y_raw = self.raw_y
+                weights = res['final_weights']
+                
+                jackknife_Cs = []
+                
+                # 1. Jackknife: Leave one point out and re-fit
+                for i in range(len(y_raw)):
+                    # Mask out one point
+                    mask = np.ones(len(y_raw), dtype=bool)
+                    mask[i] = False
+                    
+                    # Simple re-fit (VarPro handles B automatically)
+                    try:
+                        # We reuse your existing fit logic on the subset
+                        # (Simplified here for brevity)
+                        c_val = self._quick_refit(y_raw[mask], t_scaled[mask], weights[mask])
+                        jackknife_Cs.append(c_val)
+                    except:
+                        continue
+
+                # 2. Calculate the Statistical Sigma from Jackknife
+                sigma_stat = np.std(jackknife_Cs) if jackknife_Cs else 0.0
+                all_C_results[model_name] = res['C']
+                res['sigma_jackknife'] = sigma_stat
+
+            # 3. The "Clever" Parameter-Free Floor:
+            # For each model, the uncertainty is the MAX of its own statistical 
+            # variation and the spread between DIFFERENT models.
+            model_values = list(all_C_results.values())
+            model_spread = np.max(model_values) - np.min(model_values)
+
+            for model_name, res in self.results.items():
+                # Uncertainty = Statistical Sensitivity + Model-Form Risk
+                # No tunable variables required.
+                res['sigma_mc'] = max(res['sigma_jackknife'], model_spread)
+                
+            return self.results
 
     def plot(self, truth_val=None):
         if not self.results:
@@ -416,18 +493,7 @@ class VarProIRLS:
         plt.show()
         
     def plot_final_weights(self, model_type='exponential', sort_by_x=True, normalize=False):
-        """
-        Bar chart of final IRLS weights for each data point.
 
-        Parameters
-        ----------
-        model_type : str
-            One of: 'exponential', 'sqrt_exponential', 'power_law'
-        sort_by_x : bool
-            If True, bars follow increasing x. If False, uses original row order.
-        normalize : bool
-            If True, scales weights to sum to 1 for easier comparison.
-        """
         if not self.results:
             raise RuntimeError("No results found. Run fit_irls() first.")
 
@@ -454,7 +520,7 @@ class VarProIRLS:
             w_plot = w
 
         plt.figure(figsize=(12, 5))
-        plt.bar(np.arange(len(w_plot)), w_plot)
+        plt.bar(np.arange(len(x_plot)), w_plot)
         plt.title(f"Final IRLS Weights per Data Point ({model_type})")
         plt.xlabel("Data point index" + (" (sorted by x)" if sort_by_x else " (original order)"))
         plt.ylabel("Weight" + (" (normalized)" if normalize else ""))
