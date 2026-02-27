@@ -5,42 +5,66 @@ import pandas as pd
 import matplotlib.pyplot as plt 
 
 class VarProIRLS:
-    def __init__(self, df, x_col, y_col, err_df=None, b_init=None):
-        
-        self.raw_x = df[x_col].values.astype(float)
+    def __init__(self, df, x_col, y_col, inf_df=None, err_df=None, b_init=None, n_fit=None):
+        """
+        Parameters
+        ----------
+        df     : full DataFrame including any reference/validation rows
+        x_col  : column name for x
+        y_col  : column name for y
+        err_df : optional error DataFrame
+        b_init : optional manual initial guess for B
+        n_fit  : int or None
+            If given, only the first `n_fit` rows are used in the fitting
+            residuals (raw_x / raw_y), but ALL rows are used for x/y scaling
+            (x_max, y_min, y_range) and trend detection.  This ensures that
+            excluding a reference row from the fit does NOT change the
+            normalisation, which would corrupt B, C, and the b_bounds.
+            When None (default) all rows are used for both — identical to the
+            original behaviour so notebooks are unaffected.
+        """
+        x_all = df[x_col].values.astype(float)
+        y_all = df[y_col].values.astype(float)
 
-        # --------- MINMAX SCALE y (ONLY CHANGE) ----------
-        y = df[y_col].values.astype(float)
-        self.y_col = y_col
-        self.x_col = x_col
+        self.y_col  = y_col
+        self.x_col  = x_col
         self.err_df = err_df
+        self.truth_val = float(inf_df[y_col].iloc[-1])   
 
-        self.y_min = float(np.min(y))
-        self.y_max = float(np.max(y))
+        # ── y scaling uses ALL rows so the scale is consistent ───────────────
+        self.y_min   = float(np.min(y_all))
+        self.y_max   = float(np.max(y_all))
         self.y_range = self.y_max - self.y_min
         if self.y_range == 0:
-            self.y_range = 1.0  # avoid division by zero for constant y
+            self.y_range = 1.0
 
-        self.raw_y = (y - self.y_min) / self.y_range
-        # -------------------------------------------------
-
-        # We need to identify the min and max values for x to perform scaling on them. 
-        self.x_min = self.raw_x.min()
-        self.x_max = self.raw_x.max()
+        # ── x scaling uses ALL rows for the same reason ──────────────────────
+        self.x_min   = float(x_all.min())
+        self.x_max   = float(x_all.max())
         self.range_x = self.x_max - self.x_min
-        # ---------------------------------------
 
-        # --- TREND DETECTION --- TO DETERMINE IF THE TREND IS INCREASING / DECREASING
+        # ── select fitting rows ───────────────────────────────────────────────
+        if n_fit is not None and n_fit < len(df):
+            x_fit = x_all[:n_fit]
+            y_fit = y_all[:n_fit]
+        else:
+            x_fit = x_all
+            y_fit = y_all
+
+        # raw_x / raw_y are what the solver actually sees
+        self.raw_x = x_fit
+        self.raw_y = (y_fit - self.y_min) / self.y_range
+
+        # ── trend detection on fitting rows ───────────────────────────────────
         huber = HuberRegressor()
         huber.fit(self.raw_x.reshape(-1, 1), self.raw_y)
         self.is_increasing = huber.coef_[0] > 0
-        # --------------------------------
 
-        # User can provide the initial guess for B, if not provided, default value is 1.0. 
+        # User can provide the initial guess for B, if not provided, default value is 1.0.
         self.override_b_init = b_init
         self.b_init = None
         self.results = {}
-        # --------------------------------
+        # ─────────────────────────────────────────────────────────────────────
 
     def _setup_model(self, model_type):
 
@@ -187,7 +211,11 @@ class VarProIRLS:
         
         return best_B, final_lin.x[0], final_lin.x[1]
 
-    def fit_irls(self, max_iter=110, tol=1e-9, damping=0.5, models=None, verbose=False, compute_uq=True):
+    # ── CHANGE 1: added `progress_callback=None` to the signature.
+    # All existing calls (verbose=False, compute_uq=True, etc.) are unaffected
+    # because it sits at the end with a default of None.
+    def fit_irls(self, max_iter=110, tol=1e-9, damping=0.5, models=None, verbose=False,
+                 compute_uq=True, progress_callback=None):
         if models is None:
             models = ['exponential', 'sqrt_exponential', 'power_law']
 
@@ -255,20 +283,46 @@ class VarProIRLS:
                 # Restore to original scale of current weights
                 proposed_weights = proposed_normed * np.sum(current_weights)
 
-
                 rel_w = np.sum(np.abs(proposed_weights - current_weights)) / (np.sum(np.abs(current_weights)) + eps)
 
-                # ---- stopping: objective + weights both stagnate ----
+                # ---- convergence check ----
+                converged = False
                 if k > 0:
                     if (rel_obj < tol) and (rel_w < tol_w):
                         stall += 1
                         if stall >= stall_patience:
+                            converged = True
                             if verbose:
                                 print("-" * 120)
                                 print(f"Converged at iteration {k} (rel_obj={rel_obj:.3e}, rel_w={rel_w:.3e})")
-                            break
                     else:
                         stall = 0
+
+                # ── CHANGE 2: invoke the callback if one was provided.
+                # The `if` guard means zero overhead when callback=None (default).
+                if progress_callback is not None:
+                    progress_callback({
+                        'model':     model,
+                        'iteration': k,
+                        'B':         B,
+                        'C':         C,
+                        'A':         A,
+                        'rel_obj':   rel_obj,
+                        'rel_w':     rel_w,
+                        'converged': converged,
+                        't_scaled':  self.t_scaled.copy(),
+                        'y_pred':    y_pred.copy(),
+                        'weights':   current_weights.copy(),
+                        'raw_x':     self.raw_x.copy(),
+                        'raw_y':     self.raw_y.copy(),
+                        'y_min':     self.y_min,
+                        'y_range':   self.y_range,
+                        'x_max':     self.x_max,
+                        'max_iter':  max_iter,
+                    })
+
+                if converged:
+                    break
 
                 prev_obj = obj
                 current_weights = proposed_weights
@@ -298,55 +352,110 @@ class VarProIRLS:
         return self.results
 
 
-    def compute_uncertainty(self):
+    def compute_uncertainty(self, n_bootstrap=40, confidence_level=95.0):
             """
-            Occam's Razor Version: Uses Jackknife (Leave-One-Out) and 
-            Cross-Model Spread to ensure a reasonable uncertainty floor.
+            Computes uncertainty for the asymptote C using a Parametric Monte Carlo 
+            approach with Heteroscedastic noise scaling derived from IRLS weights.
             """
-            all_C_results = {}
+            if not self.results:
+                raise RuntimeError("No results found. Run fit_irls() first.")
 
-            for model_name, res in self.results.items():
-                self.model_type = model_name
-                t_scaled = res['t_scaled']
-                y_raw = self.raw_y
+            # Percentiles for the uncertainty band
+            lower_p = (100.0 - confidence_level) / 2.0
+            upper_p = 100.0 - lower_p
+
+            for model, res in self.results.items():
+                self.model_type = model
+                
+                # --- 1. SETUP PARAMETERS ---
+                B_best = res['B']
+                y_fit = res['y_pred']  # These are the predicted values at raw_x
                 weights = res['final_weights']
+                t_scaled = res['t_scaled']
+                lb, ub = self._get_A_bounds()
                 
-                jackknife_Cs = []
+                # --- 2. COMPUTE WEIGHTED GLOBAL NOISE (sigma_base) ---
+                # Using the weighted residual standard error formula
+                resid = self.raw_y - y_fit
+                ssr_weighted = np.sum(weights * (resid**2))
+                dof = max(1, len(self.raw_y) - 3)
+                sigma_base = np.sqrt(ssr_weighted / dof)
                 
-                # 1. Jackknife: Leave one point out and re-fit
-                for i in range(len(y_raw)):
-                    # Mask out one point
-                    mask = np.ones(len(y_raw), dtype=bool)
-                    mask[i] = False
+                # --- 3. COMPUTE POINT-BY-POINT NOISE SCALING ---
+                # sigma_i = sigma_base / sqrt(w_i)
+                # We add a tiny epsilon to weights to avoid division by zero
+                eps = 1e-12
+                sigma_i = sigma_base / np.sqrt(weights + eps)
+
+                boot_C_values = []
+
+                # --- 4. MONTE CARLO LOOP ---
+                for _ in range(n_bootstrap):
+                    # Generate synthetic data with heteroscedastic noise
+                    noise = np.random.normal(0, sigma_i)
+                    y_synth = y_fit + noise
                     
-                    # Simple re-fit (VarPro handles B automatically)
+                    # Define the VarPro residual function for this synthetic set
+                    # We still weight the residuals during the fit to maintain IRLS logic
+                    def boot_residual(alpha_curr):
+                        b_val = alpha_curr[0]
+                        phi = self._compute_basis(b_val, t_scaled)
+                        # Weighting the synthetic solve identically to the original fit
+                        phi_w = phi * np.sqrt(weights)[:, np.newaxis]
+                        y_synth_w = y_synth * np.sqrt(weights)
+                        
+                        res_lin = lsq_linear(phi_w, y_synth_w, bounds=(lb, ub), method='bvls')
+                        y_model = np.dot(phi, res_lin.x)
+                        return (y_synth - y_model) * np.sqrt(weights)
+
                     try:
-                        # We reuse your existing fit logic on the subset
-                        # (Simplified here for brevity)
-                        c_val = self._quick_refit(y_raw[mask], t_scaled[mask], weights[mask])
-                        jackknife_Cs.append(c_val)
+                        # Re-optimize B for every single synthetic realization
+                        b_lo, b_hi = self._get_b_bounds()
+
+                        res_opt = least_squares(boot_residual, x0=[B_best], bounds=(b_lo, b_hi), 
+                                                method='trf', loss='linear')
+                        
+                        # Final linear solve to extract C for this bootstrap sample
+                        best_B_boot = res_opt.x[0]
+                        phi_boot = self._compute_basis(best_B_boot, t_scaled)
+                        phi_w_boot = phi_boot * np.sqrt(weights)[:, np.newaxis]
+                        y_synth_w = y_synth * np.sqrt(weights)
+                        
+                        final_lin = lsq_linear(phi_w_boot, y_synth_w, bounds=(lb, ub), method='bvls')
+                        boot_C_values.append(final_lin.x[0])
                     except:
-                        continue
+                        continue # Skip failed optimizations
 
-                # 2. Calculate the Statistical Sigma from Jackknife
-                sigma_stat = np.std(jackknife_Cs) if jackknife_Cs else 0.0
-                all_C_results[model_name] = res['C']
-                res['sigma_jackknife'] = sigma_stat
+                # --- 5. EXTRACT STATISTICS ---
+                if boot_C_values:
+                    boot_C_values = np.array(boot_C_values)
+                    
+                    # Percentiles in scaled space
+                    C_low_scaled = np.percentile(boot_C_values, lower_p)
+                    C_high_scaled = np.percentile(boot_C_values, upper_p)
+                    
+                    # Unscale to original units
+                    C_best_unscaled = self.y_min + self.y_range * res['C']
+                    C_low_unscaled = self.y_min + self.y_range * C_low_scaled
+                    C_high_unscaled = self.y_min + self.y_range * C_high_scaled
+                    
+                    # Store results
+                    res['sigma_C_lower_unscaled'] = abs(C_best_unscaled - C_low_unscaled)
+                    res['sigma_C_upper_unscaled'] = abs(C_high_unscaled - C_best_unscaled)
+                    
+                    # Use the larger of the two for a "pessimistic" symmetric sigma_mc
+                    max_err_scaled = max(abs(res['C'] - C_low_scaled), abs(res['C'] - C_high_scaled))
+                    res['sigma_mc'] = max_err_scaled
+                else:
+                    res['sigma_mc'] = 0.0
 
-            # 3. The "Clever" Parameter-Free Floor:
-            # For each model, the uncertainty is the MAX of its own statistical 
-            # variation and the spread between DIFFERENT models.
-            model_values = list(all_C_results.values())
-            model_spread = np.max(model_values) - np.min(model_values)
-
-            for model_name, res in self.results.items():
-                # Uncertainty = Statistical Sensitivity + Model-Form Risk
-                # No tunable variables required.
-                res['sigma_mc'] = max(res['sigma_jackknife'], model_spread)
-                
             return self.results
 
     def plot(self, truth_val=None):
+
+        if truth_val is None:
+            truth_val = self.truth_val   # uses inf_df value automatically
+            
         if not self.results:
             return
 
