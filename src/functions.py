@@ -3,6 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 from extrapolator import VarProIRLS
+from extrap import VarProLinearized
 
 def upload_df(file_path, start_basis_size = 900):
   df = pd.read_csv(file_path)
@@ -87,35 +88,74 @@ def graph(df: pd.DataFrame, n_cols: int = 4):
     plt.tight_layout(pad=3.0)
     plt.show()
 
-def fit_all(main_df, main_inf_df, main_df_err):
-    # pick x column
+def fit_all_irls(main_df, main_inf_df=None, main_df_err=None):
     x_col = "basis size" if "basis size" in main_df.columns else main_df.columns[0]
     y_cols = [c for c in main_df.columns if c != x_col]
 
     def truth_val_for(col):
+        if main_inf_df is None:
+            return None
         if col not in main_inf_df.columns:
             return None
         vals = np.asarray(main_inf_df[col], dtype=float)
         vals = vals[np.isfinite(vals)]
-        return float(vals[-1]) if vals.size else None  # last truth value
+        return float(vals[-1]) if vals.size else None
 
     def truth_err_for(col):
+        if main_df_err is None:
+            return None
         if col not in main_df_err.columns:
             return None
         vals = np.asarray(main_df_err[col], dtype=float)
         vals = vals[np.isfinite(vals)]
-        return float(vals[-1]) if vals.size else None  # last truth error
+        return float(vals[-1]) if vals.size else None
 
     for y_col in y_cols:
-        # pass truth errors via err_df so your plot() can shade the reference band
-        solver = VarProIRLS(main_df, x_col, y_col, err_df=main_df_err)
+        solver = VarProIRLS(main_df, x_col, y_col,
+                            err_df=main_df_err,
+                            inf_df=main_inf_df)
         solver.fit_irls(verbose=False)
 
         tv = truth_val_for(y_col)
         te = truth_err_for(y_col)
 
-        # Your plot() reads truth_err from self.err_df[self.y_col].values[-1]
-        # So we temporarily inject the correct per-column error into solver.err_df.
+        if te is not None:
+            solver.err_df = solver.err_df.copy()
+            solver.err_df[y_col] = te
+
+        solver.plot(truth_val=tv)
+
+def fit_all_log(main_df, main_inf_df=None, main_df_err=None):
+    x_col = "basis size" if "basis size" in main_df.columns else main_df.columns[0]
+    y_cols = [c for c in main_df.columns if c != x_col]
+
+    def truth_val_for(col):
+        if main_inf_df is None:
+            return None
+        if col not in main_inf_df.columns:
+            return None
+        vals = np.asarray(main_inf_df[col], dtype=float)
+        vals = vals[np.isfinite(vals)]
+        return float(vals[-1]) if vals.size else None
+
+    def truth_err_for(col):
+        if main_df_err is None:
+            return None
+        if col not in main_df_err.columns:
+            return None
+        vals = np.asarray(main_df_err[col], dtype=float)
+        vals = vals[np.isfinite(vals)]
+        return float(vals[-1]) if vals.size else None
+
+    for y_col in y_cols:
+        solver = VarProLinearized(main_df, x_col, y_col,
+                            err_df=main_df_err,
+                            inf_df=main_inf_df)
+        solver.fit_linearized(verbose=False)
+
+        tv = truth_val_for(y_col)
+        te = truth_err_for(y_col)
+
         if te is not None:
             solver.err_df = solver.err_df.copy()
             solver.err_df[y_col] = te
