@@ -451,102 +451,89 @@ class VarProIRLS:
 
         return self.results
 
-    def compute_uncertainty(self, n_bootstrap=80, confidence_level=80.0):
-            """
-            Computes uncertainty for the asymptote C using a Parametric Monte Carlo 
-            approach with Heteroscedastic noise scaling derived from IRLS weights.
-            """
+    def compute_uncertainty(self, confidence_level=99.9):
+            from sklearn.gaussian_process import GaussianProcessRegressor
+            from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel
+            from scipy.stats import norm
+            import warnings
+
             if not self.results:
                 raise RuntimeError("No results found. Run fit_irls() first.")
 
-            # Percentiles for the uncertainty band
-            lower_p = (100.0 - confidence_level) / 2.0
-            upper_p = 100.0 - lower_p
+            z_score = norm.ppf(1.0 - (100.0 - confidence_level) / 200.0)
 
             for model, res in self.results.items():
                 self.model_type = model
-                
-                # --- 1. SETUP PARAMETERS ---
-                B_best = res['B']
-                y_fit = res['y_pred']  # These are the predicted values at raw_x
-                weights = res['final_weights']
+
+                B_best   = res['B']
+                weights  = res['final_weights']
                 t_scaled = res['t_scaled']
-                lb, ub = self._get_A_bounds()
-                
-                # --- 2. COMPUTE WEIGHTED GLOBAL NOISE (sigma_base) ---
-                # Using the weighted residual standard error formula
-                resid = self.raw_y - y_fit
-                ssr_weighted = np.sum(weights * (resid**2))
-                dof = max(1, len(self.raw_y) - 3)
-                sigma_base = np.sqrt(ssr_weighted / dof)
-                
-                # --- 3. COMPUTE POINT-BY-POINT NOISE SCALING ---
-                # sigma_i = sigma_base / sqrt(w_i)
-                # We add a tiny epsilon to weights to avoid division by zero
-                eps = 1e-12
-                sigma_i = sigma_base / np.sqrt(weights + eps)
+                y_fit    = res['y_pred']
+                resid    = self.raw_y - y_fit
 
-                boot_C_values = []
+                phi   = self._compute_basis(B_best, t_scaled)
+                phi_w = phi * np.sqrt(weights)[:, np.newaxis]
 
-                # --- 4. MONTE CARLO LOOP ---
-                for _ in range(n_bootstrap):
-                    # Generate synthetic data with heteroscedastic noise
-                    noise = np.random.normal(0, sigma_i)
-                    y_synth = y_fit + noise
-                    
-                    # Define the VarPro residual function for this synthetic set
-                    # We still weight the residuals during the fit to maintain IRLS logic
-                    def boot_residual(alpha_curr):
-                        b_val = alpha_curr[0]
-                        phi = self._compute_basis(b_val, t_scaled)
-                        # Weighting the synthetic solve identically to the original fit
-                        phi_w = phi * np.sqrt(weights)[:, np.newaxis]
-                        y_synth_w = y_synth * np.sqrt(weights)
-                        
-                        res_lin = lsq_linear(phi_w, y_synth_w, bounds=(lb, ub), method='bvls')
-                        y_model = np.dot(phi, res_lin.x)
-                        return (y_synth - y_model) * np.sqrt(weights)
+                dof        = max(1, len(self.raw_y) - 3)
+                sigma_sq_w = np.sum(weights * (resid ** 2)) / dof
+
+                try:
+                    PhiTWPhi         = phi_w.T @ phi_w
+                    PhiTWPhi_inv     = np.linalg.inv(PhiTWPhi)
+                    cov_matrix       = PhiTWPhi_inv * sigma_sq_w
+                    variance_C_noise = max(0.0, float(cov_matrix[0, 0]))
+
+                    # h is the n-dimensional sensitivity vector: dC/dy_i
+                    # h^T = e1^T (Phi^T W Phi)^{-1} Phi^T W
+                    # shape: (n,)
+                    h = (PhiTWPhi_inv[0, :] @ phi_w.T)   # (2,) @ (2, n) -> (n,)
+
+                except np.linalg.LinAlgError:
+                    variance_C_noise = 0.0
+                    h = np.zeros(len(self.raw_y))
+
+                mad      = 1.4826 * np.median(np.abs(resid - np.median(resid)))
+                var_core = max(float(mad ** 2), 1e-15)
+
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+
+                    kernel = (
+                        ConstantKernel(var_core * 0.1, (1e-15, var_core))
+                        * RBF(length_scale=0.2, length_scale_bounds=(0.05, 2.0))
+                        + WhiteKernel(noise_level=var_core * 0.9,
+                                    noise_level_bounds=(1e-15, var_core * 5.0))
+                    )
+
+                    gp = GaussianProcessRegressor(
+                        kernel=kernel, n_restarts_optimizer=2, alpha=1e-9
+                    )
+                    gp.fit(t_scaled.reshape(-1, 1), resid)
 
                     try:
-                        # Re-optimize B for every single synthetic realization
-                        b_lo, b_hi = self._get_b_bounds()
+                        # GP posterior covariance at training points — shape (n, n)
+                        _, gp_cov = gp.predict(
+                            t_scaled.reshape(-1, 1), return_cov=True
+                        )
+                        # Project GP posterior covariance through the sensitivity vector:
+                        # Var(Delta_C) = h^T Sigma_GP h
+                        # This measures only the part of residual structure that
+                        # actually shifts the asymptote estimate.
+                        variance_C_incompatibility = max(0.0, float(h @ gp_cov @ h))
+                    except Exception:
+                        variance_C_incompatibility = 0.0
 
-                        res_opt = least_squares(boot_residual, x0=[B_best], bounds=(b_lo, b_hi), 
-                                                method='trf', loss='linear')
-                        
-                        # Final linear solve to extract C for this bootstrap sample
-                        best_B_boot = res_opt.x[0]
-                        phi_boot = self._compute_basis(best_B_boot, t_scaled)
-                        phi_w_boot = phi_boot * np.sqrt(weights)[:, np.newaxis]
-                        y_synth_w = y_synth * np.sqrt(weights)
-                        
-                        final_lin = lsq_linear(phi_w_boot, y_synth_w, bounds=(lb, ub), method='bvls')
-                        boot_C_values.append(final_lin.x[0])
-                    except:
-                        continue # Skip failed optimizations
+                total_variance     = variance_C_noise + variance_C_incompatibility
+                sigma_C_scaled     = np.sqrt(total_variance)
+                margin_error_scaled = sigma_C_scaled * z_score
 
-                # --- 5. EXTRACT STATISTICS ---
-                if boot_C_values:
-                    boot_C_values = np.array(boot_C_values)
-                    
-                    # Percentiles in scaled space
-                    C_low_scaled = np.percentile(boot_C_values, lower_p)
-                    C_high_scaled = np.percentile(boot_C_values, upper_p)
-                    
-                    # Unscale to original units
-                    C_best_unscaled = self.y_min + self.y_range * res['C']
-                    C_low_unscaled = self.y_min + self.y_range * C_low_scaled
-                    C_high_unscaled = self.y_min + self.y_range * C_high_scaled
-                    
-                    # Store results
-                    res['sigma_C_lower_unscaled'] = abs(C_best_unscaled - C_low_unscaled)
-                    res['sigma_C_upper_unscaled'] = abs(C_high_unscaled - C_best_unscaled)
-                    
-                    # Use the larger of the two for a "pessimistic" symmetric sigma_mc
-                    max_err_scaled = max(abs(res['C'] - C_low_scaled), abs(res['C'] - C_high_scaled))
-                    res['sigma_mc'] = max_err_scaled
-                else:
-                    res['sigma_mc'] = 0.0
+                res['sigma_mc'] = margin_error_scaled
+
+                res['uq_breakdown'] = {
+                    'std_noise':           np.sqrt(variance_C_noise)          * self.y_range,
+                    'std_incompatibility': np.sqrt(variance_C_incompatibility) * self.y_range,
+                    'total_std':           sigma_C_scaled                      * self.y_range,
+                }
 
             return self.results
 

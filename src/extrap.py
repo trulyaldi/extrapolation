@@ -6,27 +6,6 @@ import matplotlib.pyplot as plt
 
 
 class VarProLinearized:
-    """
-    Curve fitter for models of the form y = A * f(x, B) + C using a
-    linearization approach.
-
-    Strategy
-    --------
-    For a fixed candidate asymptote C the model collapses to a linear
-    relationship in log-space:
-
-        Exponential      : ln(y - C) = ln(A)  - B * (x / x_max)
-        Sqrt-Exponential : ln(y - C) = ln(A)  - B * sqrt(x / x_max)
-        Power-Law        : ln(y - C) = ln(A)  - B * ln(x / x_max)
-
-    The algorithm searches over a range of C values and picks the one that
-    maximises the R² of the resulting linear fit, then extracts A and B from
-    that best linear model.
-
-    The results dictionary format is identical to VarProIRLS so that the
-    `plot`, `plot_final_weights`, and `compute_uncertainty` methods are
-    directly reusable.
-    """
 
     # ------------------------------------------------------------------
     # Construction
@@ -34,36 +13,7 @@ class VarProLinearized:
 
     def __init__(self, df, x_col, y_col, err_df=None, inf_df=None,
                  b_init=None, n_fit=None, use_energy_b=False):
-        """
-        Parameters
-        ----------
-        df       : DataFrame with the data.
-        x_col    : Name of the independent-variable column.
-        y_col    : Name of the dependent-variable column.
-        err_df   : Optional DataFrame with per-column error estimates
-                   (used only for plotting the reference error band).
-        inf_df   : Optional DataFrame whose last row holds "truth" values
-                   (used only for plotting / printing the reference line).
-        b_init       : float or None.
-                       If provided, B is **fixed** to this value for every
-                       model and is never optimised.  The algorithm will only
-                       search for the best asymptote C (and the resulting
-                       amplitude A) given that fixed B.
-                       If None (default), B is determined freely from the
-                       best linear fit in log-space.
-                       Ignored when use_energy_b=True and y_col != 'Energy'.
-        n_fit        : Use only the first n_fit rows for fitting; scaling
-                       uses all rows so the result is directly comparable.
-        use_energy_b : bool, default False.
-                       When True **and** y_col is not 'Energy', the fitter
-                       first fits the 'Energy' column from the same df with a
-                       free B, then pins that per-model B value when fitting
-                       the current y_col.  This is useful when the decay rate
-                       is most reliably determined from the energy and should
-                       be shared across all other observables.
-                       When y_col == 'Energy', or when False, the behaviour
-                       is identical to the standard free/fixed-B logic.
-        """
+
         x_all = df[x_col].values.astype(float)
         y_all = df[y_col].values.astype(float)
 
@@ -118,6 +68,7 @@ class VarProLinearized:
         # ── state ────────────────────────────────────────────────────────
         self.model_type = None   # set before each call to _compute_basis
         self.results    = {}
+        print(f' this trend is: {self.is_increasing}')
 
     # ------------------------------------------------------------------
     # Linearized predictor variable (depends on model)
@@ -194,29 +145,8 @@ class VarProLinearized:
     # ------------------------------------------------------------------
 
     def _fit_for_C(self, C, tx, fixed_b=None):
-        """
-        Given a candidate asymptote C (in scaled y-space) and the
-        linearised predictor tx, fit
-
-            ln(|y - C|) = intercept + slope * tx
-
-        When *fixed_b* is supplied the slope is pinned to ``-fixed_b`` and
-        only the intercept is fitted (1-parameter OLS).
-
-        Returns
-        -------
-        r2        : float  – R² of the linear fit (-inf if infeasible)
-        intercept : float  – ln(A) or ln(-A)
-        slope     : float  – equals -B (or -fixed_b when B is fixed)
-        valid     : bool
-        """
         y = self.raw_y
-
-        # The sign convention depends on whether A is positive or negative.
-        if self.is_increasing:
-            diff = C - y          # C > y  →  A < 0
-        else:
-            diff = y - C          # y > C  →  A > 0
+        diff = (C - y) if self.is_increasing else (y - C)
 
         if np.any(diff <= 0.0):
             return -np.inf, 0.0, 0.0, False
@@ -224,14 +154,10 @@ class VarProLinearized:
         ln_diff = np.log(diff)
 
         if fixed_b is not None:
-            # ── fixed-slope OLS: only fit intercept ──────────────────────
-            # ln(y-C) - (-fixed_b)*tx = intercept  →  intercept = mean(...)
             slope     = -fixed_b
-            adjusted  = ln_diff - slope * tx
-            intercept = float(adjusted.mean())
+            intercept = float((ln_diff - slope * tx).mean())
             ln_pred   = intercept + slope * tx
         else:
-            # ── free OLS: fit both intercept and slope ───────────────────
             X = np.column_stack([np.ones(len(tx)), tx])
             try:
                 coeffs, *_ = np.linalg.lstsq(X, ln_diff, rcond=None)
@@ -244,35 +170,49 @@ class VarProLinearized:
         ss_tot = float(np.sum((ln_diff - ln_diff.mean()) ** 2))
         r2     = 1.0 - ss_res / ss_tot if ss_tot > 1e-15 else 0.0
 
+        if fixed_b is None and slope > -1e-3:
+            return -np.inf, 0.0, 0.0, False
+
         return r2, intercept, slope, True
 
-    # ------------------------------------------------------------------
-    # C search
-    # ------------------------------------------------------------------
 
-    def _search_C(self, tx, fixed_b=None, n_coarse=400, n_fine=400):
-        """
-        Two-stage grid search: coarse then fine around the best coarse point.
-
-        When *fixed_b* is not None it is forwarded to ``_fit_for_C`` so that
-        the slope is pinned and only the intercept (amplitude A) is fitted.
-
-        Returns best (r2, C, intercept, slope).
-        """
-        y      = self.raw_y
-        y_min  = float(y.min())
-        y_max  = float(y.max())
-        margin = max(y_max - y_min, 1e-6)
+    def _search_C(self, tx, fixed_b=None, n_coarse=1000, n_fine=500):
+        y = self.raw_y
 
         if self.is_increasing:
-            C_lo = y_max + 1e-5 * margin
-            C_hi = y_max + 0.25 * margin
+            y_bound = float(y.max())
         else:
-            C_lo = y_min - 0.25  * margin
-            C_hi = y_min - 1e-5 * margin
+            y_bound = float(y.min())
 
-        # ── coarse pass ──────────────────────────────────────────────────
-        C_grid  = np.linspace(C_lo, C_hi, n_coarse)
+        # ── Scale: distance from y_bound that C needs to cover ──────────────
+        # The true C could be anywhere from epsilon*y_range to ~y_range below
+        # y_bound. We search in log-distance space to give equal resolution
+        # near y_bound (where R² is most sensitive) and far from it.
+        y_range    = max(float(y.max() - y.min()), 1e-10)
+        # Minimum distance: small fraction of the tail noise level
+        n_tail     = max(5, int(0.4 * len(y)))
+        y_tail     = y[-n_tail:]
+        tail_noise = float(np.std(y_tail))
+        tail_noise = max(tail_noise, 1e-10)
+
+        dist_min = tail_noise * 1e-3   # very close to y_bound
+        dist_max = y_range * 2.0       # up to 2x full data range away
+
+        # ── Log-spaced distances from y_bound ───────────────────────────────
+        # This gives dense coverage near y_bound (where the peak is)
+        # and coarse coverage far away (where R² is flat and low).
+        log_dists = np.logspace(
+            np.log10(dist_min),
+            np.log10(dist_max),
+            n_coarse
+        )
+
+        if self.is_increasing:
+            C_grid = y_bound + log_dists   # C above y_max
+        else:
+            C_grid = y_bound - log_dists   # C below y_min
+
+        # ── Coarse pass ──────────────────────────────────────────────────────
         best    = (-np.inf, C_grid[0], 0.0, 0.0)
         r2_grid = np.full(n_coarse, -np.inf)
 
@@ -284,44 +224,36 @@ class VarProLinearized:
             if r2 > best[0]:
                 best = (r2, C_cand, intercept, slope)
 
-        # ── fine pass around best coarse point ───────────────────────────
-        best_idx = int(np.argmax(r2_grid))
-        lo_idx   = max(0, best_idx - 3)
-        hi_idx   = min(n_coarse - 1, best_idx + 3)
-        C_fine   = np.linspace(C_grid[lo_idx], C_grid[hi_idx], n_fine)
+        # ── Fine pass in log-distance around best coarse point ───────────────
+        if best[0] > -np.inf:
+            best_idx  = int(np.argmax(r2_grid))
+            # zoom into [dist_{best-3}, dist_{best+3}] in log-distance space
+            lo_idx    = max(0, best_idx - 3)
+            hi_idx    = min(n_coarse - 1, best_idx + 3)
+            dist_lo   = log_dists[lo_idx]
+            dist_hi   = log_dists[hi_idx]
+            fine_dists = np.logspace(
+                np.log10(dist_lo),
+                np.log10(dist_hi),
+                n_fine
+            )
+            if self.is_increasing:
+                C_fine = y_bound + fine_dists
+            else:
+                C_fine = y_bound - fine_dists
 
-        for C_cand in C_fine:
-            r2, intercept, slope, valid = self._fit_for_C(C_cand, tx, fixed_b)
-            if valid and r2 > best[0]:
-                best = (r2, C_cand, intercept, slope)
+            for C_cand in C_fine:
+                r2, intercept, slope, valid = self._fit_for_C(C_cand, tx, fixed_b)
+                if valid and r2 > best[0]:
+                    best = (r2, C_cand, intercept, slope)
 
-        return best   # (r2, C, intercept, slope)
-
+        return best
     # ------------------------------------------------------------------
     # Main fitting method
     # ------------------------------------------------------------------
 
     def fit_linearized(self, models=None, verbose=False, on_iteration=None):
-        """
-        Fit the specified models using the linearization approach.
 
-        For each model type the algorithm:
-          1. Searches over candidate C values.
-          2. Transforms y → ln(|y - C|) and fits a linear model.
-          3. Picks the C that maximises R² of the linear fit.
-          4. Extracts A and B from the best linear model.
-
-        Parameters
-        ----------
-        models       : list of str, default all three model types.
-        verbose      : bool – print per-model summary.
-        on_iteration : callable(dict) – called once per fitted model with a
-                       results dict (same keys as VarProIRLS's on_iteration).
-
-        Returns
-        -------
-        self.results : dict keyed by model name (same schema as VarProIRLS).
-        """
         if models is None:
             models = ['exponential', 'sqrt_exponential', 'power_law']
 
@@ -802,46 +734,5 @@ class VarProLinearized:
             f"{self.y_col} – Linearized Space  [Linearized Fitter]",
             fontsize=13, y=1.02
         )
-        plt.tight_layout()
-        plt.show()
-
-    def plot_final_weights(self, model_type='exponential', sort_by_x=True,
-                           normalize=False):
-        """
-        For the linearized fitter all weights are uniform (= 1), so this
-        plot primarily serves as a visual sanity check.
-        """
-        if not self.results:
-            raise RuntimeError("No results found. Run fit_linearized() first.")
-        if model_type not in self.results:
-            raise ValueError(
-                f"Model '{model_type}' not found. "
-                f"Available: {list(self.results.keys())}"
-            )
-
-        w = np.asarray(self.results[model_type]['final_weights'], dtype=float)
-        x = np.asarray(self.raw_x, dtype=float)
-
-        if normalize:
-            s = w.sum()
-            if s > 0:
-                w = w / s
-
-        idx    = np.argsort(x) if sort_by_x else np.arange(len(x))
-        x_plot = x[idx]
-        w_plot = w[idx]
-
-        plt.figure(figsize=(12, 5))
-        plt.bar(np.arange(len(x_plot)), w_plot)
-        plt.title(
-            f"Final Weights – {model_type}  "
-            f"[Linearized Fitter: uniform weights]"
-        )
-        plt.xlabel(
-            "Data point index"
-            + (" (sorted by x)" if sort_by_x else " (original order)")
-        )
-        plt.ylabel("Weight" + (" (normalized)" if normalize else ""))
-        plt.grid(True, axis='y', alpha=0.3)
         plt.tight_layout()
         plt.show()
