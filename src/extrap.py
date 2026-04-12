@@ -54,7 +54,7 @@ class VarProLinearized:
         denom  = self.raw_x.max() - self.raw_x.min()
         x_norm = (self.raw_x - self.raw_x.min()) / (denom if denom > 0 else 1.0)
         huber.fit(x_norm.reshape(-1, 1), self.raw_y)
-        self.is_increasing = huber.coef_[0] > 0
+        self.is_increasing = huber.coef_[0] > 0     # THINK IT THROUGH CAREFULLY 
 
         # ── fixed B (None = free optimisation) ───────────────────────────
         self.fixed_b      = float(b_init) if b_init is not None else None
@@ -104,6 +104,7 @@ class VarProLinearized:
         """Design matrix [1, f(t, B)] with t = raw_x / x_max."""
         phi = np.zeros((len(t), 2))
         phi[:, 0] = 1.0
+
         if self.model_type == 'exponential':
             phi[:, 1] = np.exp(-B * t)
         elif self.model_type == 'sqrt_exponential':
@@ -123,22 +124,44 @@ class VarProLinearized:
             return [-np.inf, 0.0],    [np.inf, np.inf]
 
     def _get_b_bounds(self):
-        t_scaled  = self.raw_x / self.x_max
-        t_min     = t_scaled.min()
-        eps_basis = 1e-3
+        y = self.raw_y
 
-        if self.model_type == 'exponential':
-            b_max = -np.log(eps_basis) / t_min
-        elif self.model_type == 'sqrt_exponential':
-            b_max = -np.log(eps_basis) / np.sqrt(max(t_min, 1e-12))
-        elif self.model_type == 'power_law':
-            b_max = np.log(1.0 / eps_basis) / np.log(1.0 / t_min + 1e-12)
-        else:
-            b_max = 20.0
+        y_range = float(np.max(y) - np.min(y))
+        n_tail  = max(3, len(y) // 5)
+        sigma   = max(float(np.std(y[-n_tail:])), np.finfo(float).eps * float(np.abs(y).max()))
+        snr     = y_range / sigma
 
-        b_max = min(b_max, 20.0)
-        b_max = max(b_max, 2.0)
-        return 1.0, b_max
+        if snr <= 1.0:
+            raise ValueError(f"Data is noise-dominated: SNR={snr:.3f} <= 1.0, cannot constrain b.")
+
+        eps_basis = 1.0 / snr
+
+        tx          = self._make_tx(self.model_type)
+        tx_min      = float(tx.min())
+        tx_max      = float(tx.max())
+        tx_span     = tx_max - tx_min
+
+        if tx_span <= 0:
+            raise ValueError("tx domain has zero span, cannot constrain b.")
+
+        tx_sorted   = np.sort(tx)
+        dtx         = np.diff(tx_sorted)
+        dtx_positive = dtx[dtx > tx_max * np.finfo(float).eps ** 0.5]
+        delta_tx    = float(dtx_positive.min()) if len(dtx_positive) > 0 else tx_span
+
+        b_max = min(
+            -np.log(eps_basis) / delta_tx,
+            -np.log(np.finfo(float).eps) / delta_tx
+        )
+        b_min = -np.log1p(-1.0 / snr) / tx_span
+
+        if b_max <= b_min:
+            raise ValueError(
+                f"b bounds degenerate: b_min={b_min:.3e} >= b_max={b_max:.3e}. "
+                f"SNR={snr:.1f}, delta_tx={delta_tx:.3e}"
+            )
+
+        return b_min, b_max
 
     # ------------------------------------------------------------------
     # Single-C linear fit
@@ -148,17 +171,29 @@ class VarProLinearized:
         y = self.raw_y
         diff = (C - y) if self.is_increasing else (y - C)
 
-        if np.any(diff <= 0.0):
+        # 1. GEOMETRIC FILTER: Drop points that physically cross the candidate asymptote
+        valid_mask = diff > 0
+        diff_v     = diff[valid_mask]
+        tx_v       = tx[valid_mask]
+
+        # 2. SPAN VALIDATION: Ensure surviving points still describe the curve
+        tx_full_span  = tx.max() - tx.min()
+        tx_valid_span = tx_v.max() - tx_v.min() if len(tx_v) > 1 else 0.0
+        
+        if tx_valid_span < 0.5 * tx_full_span:
             return -np.inf, 0.0, 0.0, False
 
-        ln_diff = np.log(diff)
+        # 3. LOG-SPACE REGRESSION 
+        # By doing this unweighted, we inherently force the optimizer to care about 
+        # the tail, because tiny absolute differences become massive log differences.
+        ln_diff = np.log(diff_v)
 
         if fixed_b is not None:
             slope     = -fixed_b
-            intercept = float((ln_diff - slope * tx).mean())
-            ln_pred   = intercept + slope * tx
+            intercept = float((ln_diff - slope * tx_v).mean())
+            ln_pred   = intercept + slope * tx_v
         else:
-            X = np.column_stack([np.ones(len(tx)), tx])
+            X = np.column_stack([np.ones(len(tx_v)), tx_v])
             try:
                 coeffs, *_ = np.linalg.lstsq(X, ln_diff, rcond=None)
             except np.linalg.LinAlgError:
@@ -166,77 +201,124 @@ class VarProLinearized:
             intercept, slope = float(coeffs[0]), float(coeffs[1])
             ln_pred = X @ coeffs
 
+        if fixed_b is None:
+            tx_range  = max(tx_v.max() - tx_v.min(), 1e-12) 
+            min_slope = -1e-3 / tx_range 
+            if slope > min_slope:
+                return -np.inf, 0.0, 0.0, False
+
+        # 4. LOG-SPACE R^2 EVALUATION
+        # We MUST evaluate candidates in log-space so the grid search ranks them 
+        # based on tail-convergence accuracy rather than just head-magnitude accuracy.
         ss_res = float(np.sum((ln_diff - ln_pred) ** 2))
         ss_tot = float(np.sum((ln_diff - ln_diff.mean()) ** 2))
-        r2     = 1.0 - ss_res / ss_tot if ss_tot > 1e-15 else 0.0
+        r2_log = 1.0 - ss_res / ss_tot if ss_tot > 1e-15 else 0.0
 
-        if fixed_b is None and slope > -1e-3:
-            return -np.inf, 0.0, 0.0, False
-
-        return r2, intercept, slope, True
+        return r2_log, intercept, slope, True
 
 
-    def _search_C(self, tx, fixed_b=None, n_coarse=1000, n_fine=500):
+    def _search_C(self, tx, fixed_b=None, n_coarse=1000, n_fine=500, window=3, r2_epsilon=0.01):
         y = self.raw_y
 
-        if self.is_increasing:
-            y_bound = float(y.max())
-        else:
-            y_bound = float(y.min())
+        # --- THE FIX: Robust Grid Anchoring ---
+        # Anchor to the chronological tail's median instead of the global min/max
+        n_tail    = max(3, len(y) // 5)
+        tail_vals = y[-n_tail:]
+        y_bound   = float(np.median(tail_vals))
 
-        # ── Scale: distance from y_bound that C needs to cover ──────────────
-        # The true C could be anywhere from epsilon*y_range to ~y_range below
-        # y_bound. We search in log-distance space to give equal resolution
-        # near y_bound (where R² is most sensitive) and far from it.
         y_range    = max(float(y.max() - y.min()), 1e-10)
-        # Minimum distance: small fraction of the tail noise level
-        n_tail     = max(5, int(0.4 * len(y)))
-        y_tail     = y[-n_tail:]
-        tail_noise = float(np.std(y_tail))
-        tail_noise = max(tail_noise, 1e-10)
+        tail_noise = max(float(np.std(tail_vals)), 1e-10)
 
-        dist_min = tail_noise * 1e-3   # very close to y_bound
-        dist_max = y_range * 2.0       # up to 2x full data range away
+        dist_min = tail_noise * 1e-3
+        # Expanded upper bound to 10x to avoid truncating slowly decaying curves
+        dist_max = y_range * 10.0
 
-        # ── Log-spaced distances from y_bound ───────────────────────────────
-        # This gives dense coverage near y_bound (where the peak is)
-        # and coarse coverage far away (where R² is flat and low).
-        log_dists = np.logspace(
-            np.log10(dist_min),
-            np.log10(dist_max),
-            n_coarse
-        )
+        # log_dists spans ~4 decades. n_coarse=1000 yields ~250 pts/decade.
+        log_dists = np.logspace(np.log10(dist_min), np.log10(dist_max), n_coarse)
 
         if self.is_increasing:
-            C_grid = y_bound + log_dists   # C above y_max
+            C_grid = y_bound + log_dists
         else:
-            C_grid = y_bound - log_dists   # C below y_min
+            C_grid = y_bound - log_dists
 
-        # ── Coarse pass ──────────────────────────────────────────────────────
-        best    = (-np.inf, C_grid[0], 0.0, 0.0)
         r2_grid = np.full(n_coarse, -np.inf)
 
+        # ── 1. Coarse Pass ──────────────────────────────────────────────
         for i, C_cand in enumerate(C_grid):
             r2, intercept, slope, valid = self._fit_for_C(C_cand, tx, fixed_b)
-            if not valid:
-                continue
-            r2_grid[i] = r2
-            if r2 > best[0]:
-                best = (r2, C_cand, intercept, slope)
+            if valid:
+                r2_grid[i] = r2
 
-        # ── Fine pass in log-distance around best coarse point ───────────────
-        if best[0] > -np.inf:
-            best_idx  = int(np.argmax(r2_grid))
-            # zoom into [dist_{best-3}, dist_{best+3}] in log-distance space
-            lo_idx    = max(0, best_idx - 3)
-            hi_idx    = min(n_coarse - 1, best_idx + 3)
-            dist_lo   = log_dists[lo_idx]
-            dist_hi   = log_dists[hi_idx]
+        # ── 2. Find and Filter Local Maxima ─────────────────────────��───
+        local_maxima = [
+            i for i in range(1, n_coarse - 1)
+            if r2_grid[i] > r2_grid[i - 1]
+            and r2_grid[i] > r2_grid[i + 1]
+            and r2_grid[i] > -np.inf
+        ]
+
+        if local_maxima:
+            local_maxima = sorted(local_maxima, key=lambda idx: r2_grid[idx], reverse=True)[:3]
+        elif np.any(r2_grid > -np.inf):
+            local_maxima = [int(np.argmax(r2_grid))]
+        else:
+            return (-np.inf, C_grid[0], 0.0, 0.0)
+
+        best = (-np.inf, C_grid[0], 0.0, 0.0)
+        evaluated_intervals = []
+
+        # ── 3. Fine Pass ────────────────────────────────────────────────
+        for idx in local_maxima:
+            peak_r2 = r2_grid[idx]
+            
+            lo_idx = idx
+            last_good = idx
+            patience = 2
+            while lo_idx > 0:
+                lo_idx -= 1
+                val = r2_grid[lo_idx]
+                if val >= peak_r2 - r2_epsilon:
+                    last_good = lo_idx
+                    patience = 2
+                elif val == -np.inf and patience > 0:
+                    patience -= 1
+                else:
+                    lo_idx = last_good
+                    break
+            else:
+                lo_idx = last_good
+                    
+            hi_idx = idx
+            last_good = idx
+            patience = 2
+            while hi_idx < n_coarse - 1:
+                hi_idx += 1
+                val = r2_grid[hi_idx]
+                if val >= peak_r2 - r2_epsilon:
+                    last_good = hi_idx
+                    patience = 2
+                elif val == -np.inf and patience > 0:
+                    patience -= 1
+                else:
+                    hi_idx = last_good
+                    break
+            else:
+                hi_idx = last_good
+
+            lo_idx = min(lo_idx, max(0, idx - window))
+            hi_idx = max(hi_idx, min(n_coarse - 1, idx + window))
+
+            if any(lo <= hi_idx and lo_idx <= hi for lo, hi in evaluated_intervals):
+                continue
+                
+            evaluated_intervals.append((lo_idx, hi_idx))
+
             fine_dists = np.logspace(
-                np.log10(dist_lo),
-                np.log10(dist_hi),
+                np.log10(log_dists[lo_idx]),
+                np.log10(log_dists[hi_idx]),
                 n_fine
             )
+            
             if self.is_increasing:
                 C_fine = y_bound + fine_dists
             else:
@@ -252,7 +334,7 @@ class VarProLinearized:
     # Main fitting method
     # ------------------------------------------------------------------
 
-    def fit_linearized(self, models=None, verbose=False, on_iteration=None):
+    def fit_linearized(self, models=None, verbose=False, compute_uq=False, on_iteration=None):
 
         if models is None:
             models = ['exponential', 'sqrt_exponential', 'power_law']
@@ -391,89 +473,69 @@ class VarProLinearized:
                     't_scaled':  t_scaled.copy(),
                 })
 
+        if compute_uq and self.results:
+            self.compute_uncertainty()
         return self.results
 
     # ------------------------------------------------------------------
     # Uncertainty quantification (parametric Monte Carlo – same as VarProIRLS)
     # ------------------------------------------------------------------
 
-    def compute_uncertainty(self, n_bootstrap=80, confidence_level=80.0):
-        """
-        Parametric Monte Carlo uncertainty for the asymptote C.
-
-        Adds 'sigma_mc', 'sigma_C_lower_unscaled', 'sigma_C_upper_unscaled'
-        to each model's results dict.  Because the linearized fitter produces
-        uniform IRLS weights, noise is assumed homoscedastic.
-        """
+    def compute_uncertainty(self):
         if not self.results:
             raise RuntimeError("No results found. Run fit_linearized() first.")
 
-        lower_p = (100.0 - confidence_level) / 2.0
-        upper_p = 100.0 - lower_p
+        eps = np.finfo(float).eps
 
         for model, res in self.results.items():
             self.model_type = model
 
-            B_best   = res['B']
-            y_fit    = res['y_pred']
-            weights  = res['final_weights']
+            B        = res['B']
+            A        = res['A']
+            C        = res['C']
             t_scaled = res['t_scaled']
 
-            lb, ub = self._get_A_bounds()
+            tx = self._make_tx(model)
 
-            # homoscedastic noise estimate (weights are all 1 here)
-            resid     = self.raw_y - y_fit
-            ssr_w     = float(np.sum(weights * resid ** 2))
-            dof       = max(1, len(self.raw_y) - 3)
-            sigma_base = np.sqrt(ssr_w / dof)
-            eps        = 1e-12
-            sigma_i    = sigma_base / np.sqrt(weights + eps)
-
-            boot_C_values = []
-
-            for _ in range(n_bootstrap):
-                noise   = np.random.normal(0.0, sigma_i)
-                y_synth = y_fit + noise
-
-                def boot_residual(alpha_curr):
-                    b_val  = alpha_curr[0]
-                    phi    = self._compute_basis(b_val, t_scaled)
-                    phi_w  = phi * np.sqrt(weights)[:, np.newaxis]
-                    y_sw   = y_synth * np.sqrt(weights)
-                    res_lin = lsq_linear(phi_w, y_sw, bounds=(lb, ub),
-                                         method='bvls')
-                    y_model = np.dot(phi, res_lin.x)
-                    return (y_synth - y_model) * np.sqrt(weights)
-
-                try:
-                    b_lo, b_hi = self._get_b_bounds()
-                    res_opt    = least_squares(boot_residual, x0=[B_best],
-                                               bounds=(b_lo, b_hi),
-                                               method='trf', loss='linear')
-                    B_boot   = res_opt.x[0]
-                    phi_b    = self._compute_basis(B_boot, t_scaled)
-                    phi_bw   = phi_b * np.sqrt(weights)[:, np.newaxis]
-                    y_sw     = y_synth * np.sqrt(weights)
-                    final_lin = lsq_linear(phi_bw, y_sw, bounds=(lb, ub),
-                                           method='bvls')
-                    boot_C_values.append(float(final_lin.x[0]))
-                except Exception:
-                    continue
-
-            if boot_C_values:
-                arr          = np.array(boot_C_values)
-                C_low_s      = np.percentile(arr, lower_p)
-                C_high_s     = np.percentile(arr, upper_p)
-                C_best_u     = self.y_min + self.y_range * res['C']
-                C_low_u      = self.y_min + self.y_range * C_low_s
-                C_high_u     = self.y_min + self.y_range * C_high_s
-                res['sigma_C_lower_unscaled'] = abs(C_best_u - C_low_u)
-                res['sigma_C_upper_unscaled'] = abs(C_high_u - C_best_u)
-                max_err_s    = max(abs(res['C'] - C_low_s),
-                                   abs(res['C'] - C_high_s))
-                res['sigma_mc'] = max_err_s
+            if self.is_increasing:
+                diff = C - self.raw_y
             else:
-                res['sigma_mc'] = 0.0
+                diff = self.raw_y - C
+
+            valid = diff > 0
+            tx_v  = tx[valid]
+            z_v   = np.log(diff[valid])
+            n     = len(tx_v)
+
+            if n < 3:
+                res['sigma_mc'] = float(np.max(np.abs(np.diff(self.raw_y))))
+                continue
+
+            X = np.column_stack([np.ones(n), tx_v])
+
+            ln_A      = np.log(abs(A) + eps)
+            z_pred    = ln_A - B * tx_v
+            log_resid = z_v - z_pred
+            dof       = max(1, n - 2)
+            sigma_log_sq = float(np.sum(log_resid ** 2) / dof)
+
+            try:
+                XTX_inv = np.linalg.inv(X.T @ X)
+            except np.linalg.LinAlgError:
+                res['sigma_mc'] = float(np.max(np.abs(np.diff(self.raw_y))))
+                continue
+
+            sigma_lnA = np.sqrt(sigma_log_sq * XTX_inv[0, 0])
+            sigma_B   = np.sqrt(sigma_log_sq * XTX_inv[1, 1])
+
+            phi_vals = self._compute_basis(B, t_scaled)[:, 1]
+            dC_dlnA  = abs(A) * abs(phi_vals[0])
+            dC_dB    = abs(A) * abs(phi_vals[0]) * abs(tx[0])
+
+            sigma_C_scaled = np.sqrt((dC_dlnA * sigma_lnA)**2 + (dC_dB * sigma_B)**2)
+
+            # convert to unscaled units so plot()'s  y_range * sig_sc  is correct
+            res['sigma_mc'] = sigma_C_scaled   # plot multiplies by y_range → correct
 
         return self.results
 
@@ -505,7 +567,7 @@ class VarProLinearized:
 
         print("\n" + "=" * 85)
         print(f"{'Model':<22} | {'C (Asymptote)':<17} | "
-              f"{'MC Uncertainty':<20} | {'Diff from Reference'}")
+              f"{'Uncertainty':<20} | {'Diff from Reference'}")
         print("=" * 85)
 
         for model, res in self.results.items():

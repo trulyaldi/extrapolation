@@ -86,19 +86,17 @@ class VarProIRLS:
         """
         t_min = self.t_scaled.min()
         t_max = self.t_scaled.max()  # always 1.0 by construction
-        
-        # We want exp(-B * t_min) > epsilon, i.e. B < -log(eps)/t_min
-        # At B_max, the basis function at t_min should still be ~1e-6 (not zero)
-        eps_basis = 1e-3  # minimum meaningful basis function value
+
+        eps_basis = 1e-3  
         
         if self.model_type == 'exponential':
-            # exp(-B * t_min) > eps  =>  B < -log(eps) / t_min
+
             b_max = -np.log(eps_basis) / t_min  # ~13.8 / t_min
         elif self.model_type == 'sqrt_exponential':
-            # exp(-B * sqrt(t_min)) > eps  =>  B < -log(eps) / sqrt(t_min)
+
             b_max = -np.log(eps_basis) / np.sqrt(t_min)
         elif self.model_type == 'power_law':
-            # t_min^(-B) < 1/eps  =>  B < log(1/eps) / log(1/t_min)
+
             b_max = np.log(1.0 / eps_basis) / np.log(1.0 / t_min + 1e-12)
         
         # Also cap at a hard maximum to avoid insane extrapolation
@@ -144,8 +142,7 @@ class VarProIRLS:
         return best_B
 
     def _compute_basis(self, B, t):
-        phi = np.zeros((len(t), 2))
-        phi[:, 0] = 1.0
+        phi = np.ones((len(t), 2))
         if self.model_type == 'exponential':
             phi[:, 1] = np.exp(-B * t)
         elif self.model_type == 'sqrt_exponential':
@@ -154,27 +151,22 @@ class VarProIRLS:
             phi[:, 1] = np.power(t, -B)
         return phi
 
-    def _compute_model_weights(self, B, t):
+    def _compute_leverage_weights(self, B, current_weights):
+        phi   = self._compute_basis(B, self.t_scaled)
+        phi_w = phi * np.sqrt(current_weights)[:, np.newaxis]
 
-        n = len(t)
-
-        if self.model_type == 'exponential':
-            log_w = B * t
-        elif self.model_type == 'sqrt_exponential':
-            log_w = B * np.sqrt(t)
-        elif self.model_type == 'power_law':
-            log_w = B * np.log(np.maximum(t, 1e-12))
-
-        # Center (ratio-preserving normalisation)
-        log_w -= np.median(log_w)
+        try:
+            PhiTWPhi     = phi_w.T @ phi_w
+            PhiTWPhi_inv = np.linalg.inv(PhiTWPhi)
+            h            = PhiTWPhi_inv[0, :] @ phi_w.T   # shape (n,)
+            
+            h_sq         = h ** 2
+        except np.linalg.LinAlgError:
+            h_sq = np.ones(len(self.raw_y))
         
-
-        # n-adaptive cap: ratio ≤ n²  (for n=4: ratio ≤ 16; n=100: ratio ≤ 10000)
-        # log of max ratio divided by 2 gives the symmetric half-width of the clip
-        max_log_half = 0.5 * np.log(max(float(n * n), 4.0))
-        log_w = np.clip(log_w, -max_log_half, max_log_half)
-
-        return np.exp(log_w)
+        
+        h_sq = np.maximum(h_sq, 1e-30)
+        return h_sq / h_sq.sum() * len(self.raw_y)
 
     def _solve_varpro_step(self, weights, start_b=None):
         y_w = self.raw_y * np.sqrt(weights)
@@ -202,11 +194,9 @@ class VarProIRLS:
         
         return best_B, final_lin.x[0], final_lin.x[1]
 
-    # ── CHANGE 1: added `progress_callback=None` to the signature.
-    # All existing calls (verbose=False, compute_uq=True, etc.) are unaffected
-    # because it sits at the end with a default of None.
-    def fit_irls(self, max_iter=110, tol=1e-9, damping=0.5, models=None,
-                verbose=False, compute_uq=True, on_iteration=None):
+
+    def fit_irls(self, max_iter=200, tol=1e-9, damping=0.5, models=None,
+                verbose=False, compute_uq=False):
 
         if models is None:
             models = ['exponential', 'sqrt_exponential', 'power_law']
@@ -232,42 +222,30 @@ class VarProIRLS:
             final_B, final_C, final_A = 0.0, 0.0, 0.0
             prev_obj        = np.inf
             stall           = 0
-            C_history: list[float] = []
 
-            # Weight floor derived from n² ratio cap (no tunable parameter)
-            weight_floor = 1.0 / (n_pts ** 3)
+            # Weight floor derived from n² ratio cap (tunable parameter)
+            weight_floor = 1.0 / (n_pts ** 5)
 
-            # ── FIX 1: initialise prev_B/C to None, not np.inf ───────────────
-            # np.inf caused abs(B - inf)/(inf + eps) = inf/inf = nan on iter 0,
-            # triggering RuntimeWarning at the call site in __init__ (misleading
-            # traceback). None forces an explicit k > 0 guard.
-            prev_B: float | None = None
-            prev_C: float | None = None
-            param_stall          = 0
-
-            # ── Geometric tail extrapolation state ────────────────────────────
-            # Tracks the last three C-deltas to detect a geometric series and
-            # extrapolate to convergence without running out the full decay.
-            # delta_history stores (C_{k} - C_{k-1}) for the last 3 iters.
-            delta_history: list[float] = []
+            prev_B = None
+            prev_C = None
 
             for k in range(max_iter):
-                B, C, A   = self._solve_varpro_step(current_weights,
-                                                    start_b=current_B_guess)
-                current_B_guess       = B
+                B, C, A = self._solve_varpro_step(current_weights,
+                                                start_b=current_B_guess)
+                current_B_guess        = B
                 final_B, final_C, final_A = B, C, A
-                C_history.append(float(C))
 
-                # Weighted objective
                 phi    = self._compute_basis(B, self.t_scaled)
                 y_pred = C + A * phi[:, 1]
                 resid  = self.raw_y - y_pred
                 obj    = float(np.sum(current_weights * resid ** 2))
                 rel_obj = abs(obj - prev_obj) / (abs(prev_obj) + eps)
 
-                # New model weights + MAD reliability
-                new_weights  = self._compute_model_weights(B, self.t_scaled)
-                sigma_resid  = 1.4826 * np.median(np.abs(resid - np.median(resid)))
+                # ── leverage weights — replace _compute_model_weights ────────
+                new_weights = self._compute_leverage_weights(B, current_weights)
+
+                # MAD reliability on top (handles outlier points)
+                sigma_resid = 1.4826 * np.median(np.abs(resid - np.median(resid)))
                 if sigma_resid > 0:
                     z           = np.abs(resid) / sigma_resid
                     reliability = np.where(z <= 2.0, 1.0, (2.0 / z) ** 2)
@@ -287,18 +265,16 @@ class VarProIRLS:
                 # Apply weight floor (prevents geometric drift to zero)
                 proposed_normed = np.maximum(proposed_normed, weight_floor)
                 proposed_normed /= proposed_normed.sum()
-                proposed = proposed_normed * current_weights.sum()
+                proposed = proposed_normed * len(self.raw_y)
 
                 rel_w   = (np.sum(np.abs(proposed - current_weights))
                         / (np.sum(np.abs(current_weights)) + eps))
-                w_ratio = float(current_weights.max()
-                                / (current_weights.min() + eps))
+                w_ratio = float(proposed.max() / (proposed.min() + eps))
 
                 # ── Stopping criterion 1: objective + weight stagnation ───────
                 converged_ow = (k > 0 and rel_obj < tol and rel_w < tol_w)
 
                 # ── Stopping criterion 2: parameter stability ─────────────────
-                # FIX 1 applied: guard on k > 0 AND prev_B is not None
                 if k > 0 and prev_B is not None and prev_C is not None:
                     rel_B = abs(B - prev_B) / (abs(prev_B) + eps)
                     rel_C = abs(C - prev_C) / (abs(prev_C) + eps)
@@ -307,99 +283,15 @@ class VarProIRLS:
                     rel_B = rel_C = float('nan')
                     param_stable  = False
 
-                if param_stable:
-                    param_stall += 1
-                else:
-                    param_stall = 0
-
-                converged_params = (param_stall >= stall_patience)
-
-                # ── Stopping criterion 3: geometric tail extrapolation ────────
-                #
-                # When C changes form a geometric series, we can compute the
-                # exact limit analytically instead of iterating to convergence.
-                #
-                # Detection: if the last 3 deltas satisfy d_{k}/d_{k-1} ≈ r
-                # with |r| < 1 consistently, the series converges to:
-                #   C* = C_k + d_k / (1 - r)
-                #
-                # We accept extrapolation when:
-                #   (a) B is already frozen  (parameter stability reached for B)
-                #   (b) The geometric ratio r is consistent over 3 steps: |r₁ - r₂| < 0.05
-                #   (c) |r| < 0.7  (the series is actually contracting quickly)
-                #   (d) The extrapolated correction is small: |d_k/(1-r)| < 1e-4
-                #
-                # Condition (d) ensures we only extrapolate when near convergence,
-                # not during the transient phase where the geometric approximation
-                # may not hold.
-                converged_extrap = False
-                if (k >= 3 and prev_C is not None
-                        and param_stall >= 1):   # B must be frozen first
-
-                    delta = C - prev_C
-                    delta_history.append(float(delta))
-                    if len(delta_history) > 3:
-                        delta_history.pop(0)   # keep only the last 3
-
-                    if len(delta_history) == 3:
-                        d1, d2, d3 = delta_history
-
-                        # Compute decay ratios (guard division by zero)
-                        r1 = d2 / (d1 + eps * np.sign(d1 + eps))
-                        r2 = d3 / (d2 + eps * np.sign(d2 + eps))
-
-                        ratio_consistent = abs(r1 - r2) < 0.05
-                        contracting      = abs(r2) < 0.70
-                        correction       = abs(d3 / (1.0 - r2 + eps))
-
-                        if ratio_consistent and contracting and correction < 1e-4:
-                            # Extrapolate to series limit and override C
-                            C_extrap      = C + d3 / (1.0 - r2)
-                            final_C       = C_extrap
-                            C_history[-1] = float(C_extrap)   # replace last entry
-                            converged_extrap = True
-
-                            if verbose:
-                                print("-" * 120)
-                                print(f"Geometric extrapolation at iter {k}: "
-                                    f"C {C:.10f} → {C_extrap:.10f} "
-                                    f"(r={r2:.4f}, correction={correction:.2e})")
-                else:
-                    if prev_C is not None:
-                        delta_history.append(float(C - prev_C))
-                        if len(delta_history) > 3:
-                            delta_history.pop(0)
-
                 # ── Convergence decision ──────────────────────────────────────
-                any_converged = converged_ow or converged_params or converged_extrap
-
-                if any_converged:
+                if converged_ow or param_stable:
                     stall += 1
-                    if stall >= stall_patience or converged_extrap:
+                    if stall >= stall_patience:
                         if verbose:
-                            if converged_extrap:
-                                reason = "geometric extrapolation"
-                            elif converged_ow:
-                                reason = "obj+weight"
-                            else:
-                                reason = "parameter stability"
+                            reason = "obj+weight" if converged_ow else "parameter stability"
                             print("-" * 120)
                             print(f"Converged at iter {k} via {reason} "
-                                f"(rel_obj={rel_obj:.2e}, "
-                                f"rel_B={rel_B:.2e}, rel_C={rel_C:.2e})")
-
-                        if on_iteration is not None:
-                            info = dict(
-                                model=model, iteration=k, converged=True,
-                                B=B, C=final_C, A=A,
-                                rel_obj=rel_obj, rel_w=rel_w, w_ratio=w_ratio,
-                                weights=current_weights.copy(),
-                                y_pred=y_pred.copy(),
-                                raw_x=self.raw_x.copy(),
-                                raw_y=self.raw_y.copy(),
-                                t_scaled=self.t_scaled.copy(),
-                            )
-                            on_iteration(info)
+                                f"(rel_obj={rel_obj:.2e}, rel_B={rel_B:.2e}, rel_C={rel_C:.2e})")
                         break
                 else:
                     stall = 0
@@ -414,20 +306,7 @@ class VarProIRLS:
                         f"{A:<15.10f} | {w_ratio:<25.3f} | "
                         f"{rel_obj:<12.3e} | {rel_w:<12.3e}")
 
-                if on_iteration is not None:
-                    info = dict(
-                        model=model, iteration=k, converged=False,
-                        B=B, C=C, A=A, rel_obj=rel_obj, rel_w=rel_w,
-                        w_ratio=w_ratio, weights=current_weights.copy(),
-                        y_pred=y_pred.copy(),
-                        raw_x=self.raw_x.copy(),
-                        raw_y=self.raw_y.copy(),
-                        t_scaled=self.t_scaled.copy(),
-                    )
-                    if on_iteration(info) is False:
-                        break
-
-            # Final metrics using final_C (may be extrapolated)
+            # Final metrics using final_C
             phi    = self._compute_basis(final_B, self.t_scaled)
             y_pred = final_C + final_A * phi[:, 1]
             ssr    = float(np.sum((self.raw_y - y_pred) ** 2))
@@ -442,8 +321,7 @@ class VarProIRLS:
                 'sigma_noise':   float(np.sqrt(ssr / dof)),
                 'y_pred':        y_pred.copy(),
                 'final_weights': current_weights.copy(),
-                '_C_history':    C_history,
-                '_n_iters':      len(C_history),
+                '_n_iters':      k + 1,
             }
 
         if compute_uq and self.results:
@@ -451,91 +329,52 @@ class VarProIRLS:
 
         return self.results
 
-    def compute_uncertainty(self, confidence_level=99.9):
-            from sklearn.gaussian_process import GaussianProcessRegressor
-            from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel
-            from scipy.stats import norm
-            import warnings
+    def compute_uncertainty(self):
+        eps = np.finfo(float).eps
 
-            if not self.results:
-                raise RuntimeError("No results found. Run fit_irls() first.")
+        for model, res in self.results.items():
+            self.model_type = model
 
-            z_score = norm.ppf(1.0 - (100.0 - confidence_level) / 200.0)
+            B = res['B']
+            A = res['A']
+            C = res['C']
+            w = res['final_weights']
+            y_pred = res['y_pred']
+            r = self.raw_y - y_pred
+            y = self.raw_y
+            x = self.raw_x
 
-            for model, res in self.results.items():
-                self.model_type = model
+            # Step 1: robust noise scale
+            w_sqrt = np.sqrt(w)
+            sigma_noise = np.median(np.abs(r) / w_sqrt) / np.median(w_sqrt)
 
-                B_best   = res['B']
-                weights  = res['final_weights']
-                t_scaled = res['t_scaled']
-                y_fit    = res['y_pred']
-                resid    = self.raw_y - y_fit
+            # Step 2: extrapolation gap
+            phi = self._compute_basis(B, self.t_scaled)
+            phi_vals = np.abs(phi[:, 1])
+            delta_inf = abs(A) * phi_vals[-1]
 
-                phi   = self._compute_basis(B_best, t_scaled)
-                phi_w = phi * np.sqrt(weights)[:, np.newaxis]
+            # Step 3a: extrapolation leverage ratio
+            lam = phi_vals[0] / (phi_vals[-1] + eps)
 
-                dof        = max(1, len(self.raw_y) - 3)
-                sigma_sq_w = np.sum(weights * (resid ** 2)) / dof
+            # Step 3b: effective sample size
+            n_eff = (np.sum(w_sqrt) ** 2) / (np.sum(w) + eps)
 
-                try:
-                    PhiTWPhi         = phi_w.T @ phi_w
-                    PhiTWPhi_inv     = np.linalg.inv(PhiTWPhi)
-                    cov_matrix       = PhiTWPhi_inv * sigma_sq_w
-                    variance_C_noise = max(0.0, float(cov_matrix[0, 0]))
+            sigma_fit = sigma_noise * lam / np.sqrt(n_eff)
 
-                    # h is the n-dimensional sensitivity vector: dC/dy_i
-                    # h^T = e1^T (Phi^T W Phi)^{-1} Phi^T W
-                    # shape: (n,)
-                    h = (PhiTWPhi_inv[0, :] @ phi_w.T)   # (2,) @ (2, n) -> (n,)
+            # Step 3c: gap uncertainty
+            mad_y = np.median(np.abs(y - np.median(y))) + eps
+            sigma_gap = delta_inf * (sigma_noise / mad_y)
 
-                except np.linalg.LinAlgError:
-                    variance_C_noise = 0.0
-                    h = np.zeros(len(self.raw_y))
+            sigma_fit_total = np.sqrt(sigma_fit**2 + sigma_gap**2)
 
-                mad      = 1.4826 * np.median(np.abs(resid - np.median(resid)))
-                var_core = max(float(mad ** 2), 1e-15)
+            # Step 4: reference floor
+            sigma_ref = np.max(np.abs(np.diff(y)))
 
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
+            sigma_C = max(sigma_fit_total, sigma_ref)
 
-                    kernel = (
-                        ConstantKernel(var_core * 0.1, (1e-15, var_core))
-                        * RBF(length_scale=0.2, length_scale_bounds=(0.05, 2.0))
-                        + WhiteKernel(noise_level=var_core * 0.9,
-                                    noise_level_bounds=(1e-15, var_core * 5.0))
-                    )
+            res['sigma_mc'] = sigma_C
 
-                    gp = GaussianProcessRegressor(
-                        kernel=kernel, n_restarts_optimizer=2, alpha=1e-9
-                    )
-                    gp.fit(t_scaled.reshape(-1, 1), resid)
-
-                    try:
-                        # GP posterior covariance at training points — shape (n, n)
-                        _, gp_cov = gp.predict(
-                            t_scaled.reshape(-1, 1), return_cov=True
-                        )
-                        # Project GP posterior covariance through the sensitivity vector:
-                        # Var(Delta_C) = h^T Sigma_GP h
-                        # This measures only the part of residual structure that
-                        # actually shifts the asymptote estimate.
-                        variance_C_incompatibility = max(0.0, float(h @ gp_cov @ h))
-                    except Exception:
-                        variance_C_incompatibility = 0.0
-
-                total_variance     = variance_C_noise + variance_C_incompatibility
-                sigma_C_scaled     = np.sqrt(total_variance)
-                margin_error_scaled = sigma_C_scaled * z_score
-
-                res['sigma_mc'] = margin_error_scaled
-
-                res['uq_breakdown'] = {
-                    'std_noise':           np.sqrt(variance_C_noise)          * self.y_range,
-                    'std_incompatibility': np.sqrt(variance_C_incompatibility) * self.y_range,
-                    'total_std':           sigma_C_scaled                      * self.y_range,
-                }
-
-            return self.results
+        return self.results
 
     def plot(self, truth_val=None):
         # Use stored truth_val from inf_df if caller did not pass one explicitly
@@ -555,7 +394,7 @@ class VarProIRLS:
         y_data = unscale(self.raw_y)
 
         print("\n" + "="*80)
-        print(f"{'Model':<20} | {'C (Asymptote)':<15} | {'MC Uncertainty':<20} | {'Diff from Reference'}")
+        print(f"{'Model':<20} | {'C (Asymptote)':<20} | {'Uncertainty':<20} | {'Diff from Reference'}")
         print("="*80)
 
         for model, res in self.results.items():
