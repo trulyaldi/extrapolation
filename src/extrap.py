@@ -49,24 +49,23 @@ class VarProLinearized:
         self.raw_x = x_fit
         self.raw_y = (y_fit - self.y_min) / self.y_range
 
-        # ── trend detection (Huber regression on scaled data) ───────────
+       
         huber  = HuberRegressor()
         denom  = self.raw_x.max() - self.raw_x.min()
         x_norm = (self.raw_x - self.raw_x.min()) / (denom if denom > 0 else 1.0)
-        huber.fit(x_norm.reshape(-1, 1), self.raw_y)
+        huber.fit(x_norm.reshape(-1, 1), self.raw_y) # DEFINITELY FIX IT LATER
         self.is_increasing = huber.coef_[0] > 0     # THINK IT THROUGH CAREFULLY 
 
         # ── fixed B (None = free optimisation) ───────────────────────────
         self.fixed_b      = float(b_init) if b_init is not None else None
         self.use_energy_b = bool(use_energy_b)
 
-        # ── keep a reference to raw inputs so Energy can be re-fitted ────
-        # (only used when use_energy_b=True and y_col != 'Energy')
+     
         self._df    = df
         self._n_fit = n_fit
 
         # ── state ────────────────────────────────────────────────────────
-        self.model_type = None   # set before each call to _compute_basis
+        self.model_type = None   
         self.results    = {}
         print(f' this trend is: {self.is_increasing}')
 
@@ -334,6 +333,10 @@ class VarProLinearized:
     # Main fitting method
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Main fitting method
+    # ------------------------------------------------------------------
+
     def fit_linearized(self, models=None, verbose=False, compute_uq=False, on_iteration=None):
 
         if models is None:
@@ -341,7 +344,6 @@ class VarProLinearized:
 
         # ── Resolve per-model B from Energy fit if requested ─────────────
         # energy_b_map: dict[model_type -> float | None]
-        # None means "use the normal free/fixed_b logic for this model".
         energy_b_map: dict = {m: None for m in models}
 
         should_use_energy_b = (
@@ -355,17 +357,15 @@ class VarProLinearized:
                 print(f"[use_energy_b] Fitting 'Energy' first to derive B "
                       f"for '{self.y_col}' ...")
 
-            # Fit Energy with a free B (b_init=None, use_energy_b=False to
-            # avoid infinite recursion) using the same x_col and n_fit.
             _energy_fitter = VarProLinearized(
                 df          = self._df,
                 x_col       = self.x_col,
                 y_col       = 'Energy',
                 err_df      = None,
                 inf_df      = None,
-                b_init      = None,        # always free for Energy anchor
+                b_init      = None,        
                 n_fit       = self._n_fit,
-                use_energy_b= False,       # prevent recursion
+                use_energy_b= False,       
             )
             _energy_results = _energy_fitter.fit_linearized(
                 models  = models,
@@ -379,7 +379,6 @@ class VarProLinearized:
                         print(f"[use_energy_b]   {m:<22} B from Energy = "
                               f"{energy_b_map[m]:.6f}")
 
-        # ── mode label for verbose output ────────────────────────────────
         if verbose:
             if should_use_energy_b:
                 print(f"  [B anchored to Energy fit]")
@@ -388,95 +387,121 @@ class VarProLinearized:
             else:
                 print(f"  [B free]")
 
-        for model_type in models:
-            self.model_type = model_type
-            tx = self._make_tx(model_type)
+        # ── Retry Loop for Trend Flipping ────────────────────────────────
+        # We allow a maximum of 2 attempts. If the first attempt yields 
+        # >= 10 invalid points, we flip the trend and try again.
+        max_attempts = 2
+        
+        for attempt in range(max_attempts):
+            self.results = {}
+            need_retry = False
 
-            # ── Determine which B source applies for this model ──────────
-            # Priority: energy_b_map > fixed_b > free
-            if energy_b_map.get(model_type) is not None:
-                effective_fixed_b = energy_b_map[model_type]
-            else:
-                effective_fixed_b = self.fixed_b
+            for model_type in models:
+                self.model_type = model_type
+                tx = self._make_tx(model_type)
 
-            # ── 1. Find best C (pass effective_fixed_b so slope may be pinned)
-            best_r2, best_C, intercept, slope = self._search_C(
-                tx, fixed_b=effective_fixed_b
-            )
-
-            # ── 2. Extract parameters ────────────────────────────────────
-            if effective_fixed_b is not None:
-                B = effective_fixed_b
-            else:
-                B = max(-slope, 1e-6)
-
-            # intercept = ln(A) for decreasing, ln(-A) for increasing
-            if self.is_increasing:
-                A = -np.exp(intercept)   # A < 0
-            else:
-                A = np.exp(intercept)    # A > 0
-
-            C = best_C
-
-            # ── 3. Compute predictions and goodness-of-fit in y-space ────
-            t_scaled = self.raw_x / self.x_max
-            phi      = self._compute_basis(B, t_scaled)
-            y_pred   = C + A * phi[:, 1]
-
-            resid  = self.raw_y - y_pred
-            ssr    = float(np.sum(resid ** 2))
-            dof    = max(1, len(self.raw_y) - 3)
-
-            # ── 4. Store results (compatible with VarProIRLS schema) ─────
-            self.results[model_type] = {
-                'B':              B,
-                'C':              C,
-                'A':              A,
-                'ssr':            ssr,
-                'r2_linearized':  best_r2,
-                't_scaled':       t_scaled.copy(),
-                'sigma_noise':    float(np.sqrt(ssr / dof)),
-                'y_pred':         y_pred.copy(),
-                # Uniform weights (linearization does not produce IRLS weights)
-                'final_weights':  np.ones(len(self.raw_x)),
-            }
-
-            if verbose:
-                C_unscaled = self.y_min + self.y_range * C
-                A_unscaled = self.y_range * A
                 if energy_b_map.get(model_type) is not None:
-                    b_tag = "from Energy"
-                elif self.fixed_b is not None:
-                    b_tag = "fixed"
+                    effective_fixed_b = energy_b_map[model_type]
                 else:
-                    b_tag = "free"
-                print(
-                    f"[{model_type:<20}] "
-                    f"B={B:12.6f} ({b_tag})  "
-                    f"C_scaled={C:12.8f}  C={C_unscaled:12.8f}  "
-                    f"A={A_unscaled:12.6f}  "
-                    f"R²(log)={best_r2:.6f}  "
-                    f"SSR={ssr:.4e}"
+                    effective_fixed_b = self.fixed_b
+
+                # ── 1. Find best C ───────────────────────────────────────
+                best_r2, best_C, intercept, slope = self._search_C(
+                    tx, fixed_b=effective_fixed_b
                 )
 
-            if on_iteration is not None:
-                on_iteration({
-                    'model':     model_type,
-                    'B':         B,
-                    'C':         C,
-                    'A':         A,
-                    'r2':        best_r2,
-                    'ssr':       ssr,
-                    'y_pred':    y_pred.copy(),
-                    'raw_x':     self.raw_x.copy(),
-                    'raw_y':     self.raw_y.copy(),
-                    't_scaled':  t_scaled.copy(),
-                })
+                # ── Trend Check: Count Invalid Points ────────────────────
+                if self.is_increasing:
+                    diff = best_C - self.raw_y
+                else:
+                    diff = self.raw_y - best_C
+                    
+                invalid_count = int(np.sum(diff <= 0))
+
+                # If 10 or more points crossed the asymptote, the trend is backwards!
+                if invalid_count >= 10 and attempt == 0:
+                    if verbose:
+                        print(f"  -> [Retry] Model '{model_type}' caused {invalid_count} invalid points. "
+                              f"Flipping trend to {not self.is_increasing} and restarting fit...")
+                    
+                    self.is_increasing = not self.is_increasing
+                    need_retry = True
+                    break # Break out of the inner model loop to restart the attempt loop
+
+                # ── 2. Extract parameters ────────────────────────────────
+                if effective_fixed_b is not None:
+                    B = effective_fixed_b
+                else:
+                    B = max(-slope, 1e-6)
+
+                if self.is_increasing:
+                    A = -np.exp(intercept)   # A < 0
+                else:
+                    A = np.exp(intercept)    # A > 0
+
+                C = best_C
+
+                # ── 3. Compute predictions and goodness-of-fit ───────────
+                t_scaled = self.raw_x / self.x_max
+                phi      = self._compute_basis(B, t_scaled)
+                y_pred   = C + A * phi[:, 1]
+
+                resid  = self.raw_y - y_pred
+                ssr    = float(np.sum(resid ** 2))
+                dof    = max(1, len(self.raw_y) - 3)
+
+                # ── 4. Store results ─────────────────────────────────────
+                self.results[model_type] = {
+                    'B':              B,
+                    'C':              C,
+                    'A':              A,
+                    'ssr':            ssr,
+                    'r2_linearized':  best_r2,
+                    't_scaled':       t_scaled.copy(),
+                    'sigma_noise':    float(np.sqrt(ssr / dof)),
+                    'y_pred':         y_pred.copy(),
+                    'final_weights':  np.ones(len(self.raw_x)),
+                }
+
+                if verbose:
+                    C_unscaled = self.y_min + self.y_range * C
+                    A_unscaled = self.y_range * A
+                    if energy_b_map.get(model_type) is not None:
+                        b_tag = "from Energy"
+                    elif self.fixed_b is not None:
+                        b_tag = "fixed"
+                    else:
+                        b_tag = "free"
+                    print(
+                        f"[{model_type:<20}] "
+                        f"B={B:12.6f} ({b_tag})  "
+                        f"C_scaled={C:12.8f}  C={C_unscaled:12.8f}  "
+                        f"A={A_unscaled:12.6f}  "
+                        f"R²(log)={best_r2:.6f}  "
+                        f"SSR={ssr:.4e}"
+                    )
+
+                if on_iteration is not None:
+                    on_iteration({
+                        'model':     model_type,
+                        'B':         B,
+                        'C':         C,
+                        'A':         A,
+                        'r2':        best_r2,
+                        'ssr':       ssr,
+                        'y_pred':    y_pred.copy(),
+                        'raw_x':     self.raw_x.copy(),
+                        'raw_y':     self.raw_y.copy(),
+                        't_scaled':  t_scaled.copy(),
+                    })
+                    
+            # If all models completed without triggering a retry, exit the attempt loop
+            if not need_retry:
+                break
 
         if compute_uq and self.results:
             self.compute_uncertainty()
         return self.results
-
     # ------------------------------------------------------------------
     # Uncertainty quantification (parametric Monte Carlo – same as VarProIRLS)
     # ------------------------------------------------------------------
