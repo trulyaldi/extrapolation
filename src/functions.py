@@ -150,7 +150,8 @@ def fit_all_log(main_df, main_inf_df=None, main_df_err=None):
     for y_col in y_cols:
         solver = VarProLinearized(main_df, x_col, y_col,
                             err_df=main_df_err,
-                            inf_df=main_inf_df)
+                            inf_df=main_inf_df,
+                            use_energy_b=True)
         solver.fit_linearized(verbose=False)
 
         tv = truth_val_for(y_col)
@@ -163,26 +164,20 @@ def fit_all_log(main_df, main_inf_df=None, main_df_err=None):
         solver.plot(truth_val=tv)
 
 
-
-def fit_and_plot_system(df, system_name, x_col='basis', err_df=None, inf_df=None, skip_cols=None, n_fit=None):
+def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df=None, skip_cols=None, n_fit=None, save_pdf=None):
     """
     Fits all expectation value columns in a dataframe using VarProLinearized 
-    and plots an N x 2 grid.
+    and plots an N x 5 grid (Full View, Zoomed Tail, and 3 Linearized Space plots).
     
     Parameters:
     -----------
-    df          : pd.DataFrame containing the data.
-    system_name : str, name of the system (e.g., 'be_1de', 'li_2po').
-    x_col       : str, the name of the basis size column.
-    err_df      : pd.DataFrame, optional error dataframe.
-    inf_df      : pd.DataFrame, optional truth value dataframe.
-    skip_cols   : list, optional list of columns to ignore (e.g. ['Energy']).
-    n_fit       : int, optional number of points to fit.
+    ... [other parameters] ...
+    save_pdf    : bool or str, optional. If True, saves as '{system_name}_fits.pdf'. 
+                  If a string is provided, saves to that specific file path.
     """
     if skip_cols is None:
         skip_cols = []
         
-    # Find all expectation value columns (exclude the x_axis and any skipped columns)
     y_cols = [col for col in df.columns if col != x_col and col not in skip_cols]
     N = len(y_cols)
     
@@ -190,18 +185,12 @@ def fit_and_plot_system(df, system_name, x_col='basis', err_df=None, inf_df=None
         print("No columns found to fit!")
         return
 
-    # -----------------------------------------------------------
-    # 1. Formatting the Title
-    # -----------------------------------------------------------
     def format_system_name(name):
-        """Converts 'be_1de' to 'Be($^1D^e$)'"""
         parts = name.split('_')
         if len(parts) != 2:
             return name
-        
         element = parts[0].capitalize()
         term = parts[1]
-        
         if len(term) >= 2:
             multiplicity = term[0]
             L = term[1].upper()
@@ -211,23 +200,19 @@ def fit_and_plot_system(df, system_name, x_col='basis', err_df=None, inf_df=None
 
     formatted_name = format_system_name(system_name)
 
-    # -----------------------------------------------------------
-    # 2. Fit all columns
-    # -----------------------------------------------------------
     fitters = []
     print(f"Fitting {N} columns for {formatted_name}...")
     for y_col in y_cols:
-        # EXPLICITLY USING VarProLinearized
         fitter = VarProLinearized(
             df=df, x_col=x_col, y_col=y_col, 
-            err_df=err_df, inf_df=inf_df, n_fit=n_fit
+            err_df=err_df, inf_df=inf_df, n_fit=n_fit,
+            use_energy_b=True  # Ensure B and B/2 logic is applied
         )
-        # compute_uq=False as requested
         fitter.fit_linearized(compute_uq=False, verbose=False)
         fitters.append(fitter)
 
     # -----------------------------------------------------------
-    # 3. Setup the N x 2 Plot
+    # Setup the N x 5 Plot
     # -----------------------------------------------------------
     colors = {
         'exponential':      'blue',
@@ -239,16 +224,32 @@ def fit_and_plot_system(df, system_name, x_col='basis', err_df=None, inf_df=None
         'sqrt_exponential': r'SqrtExp($e^{-B\sqrt{x}}$)',
         'power_law':        r'Power($x^{-B}$)',
     }
-
-    fig, axes = plt.subplots(nrows=N, ncols=2, figsize=(14, 5 * N), squeeze=False)
     
-    # Set the bold overarching title exactly as requested
-    fig.suptitle(formatted_name, fontsize=22, fontweight='bold')
+    x_labels_log = {
+        'exponential':      r'$x \;/\; x_{\max}$',
+        'sqrt_exponential': r'$\sqrt{x \;/\; x_{\max}}$',
+        'power_law':        r'$\ln(x \;/\; x_{\max})$',
+    }
+    titles_log = {
+        'exponential':      r'Exponential: $\ln(y-C)$ vs $x/x_{max}$',
+        'sqrt_exponential': r'Sqrt-Exp: $\ln(y-C)$ vs $\sqrt{x/x_{max}}$',
+        'power_law':        r'Power-Law: $\ln(y-C)$ vs $\ln(x/x_{max})$',
+    }
+
+    fig, axes = plt.subplots(nrows=N, ncols=5, figsize=(28, 5 * N), squeeze=False)
+    fig.suptitle(formatted_name, fontsize=24, fontweight='bold')
 
     for idx, fitter in enumerate(fitters):
         y_col = fitter.y_col
         ax_full = axes[idx, 0]
         ax_zoom = axes[idx, 1]
+        
+        # The 3 axes for the linearized plots
+        ax_log_axes = {
+            'exponential': axes[idx, 2],
+            'sqrt_exponential': axes[idx, 3],
+            'power_law': axes[idx, 4]
+        }
         
         if not fitter.results:
             ax_full.text(0.5, 0.5, f"Fit failed for {y_col}", ha='center', va='center')
@@ -262,50 +263,32 @@ def fit_and_plot_system(df, system_name, x_col='basis', err_df=None, inf_df=None
         y_data = unscale(fitter.raw_y)
         
         # =======================================================
-        # Left Panel: Full View
+        # Left Panel (Col 0): Full View
         # =======================================================
         ax_full.plot(fitter.raw_x, y_data, 'ko', label='Data', zorder=5, markersize=6)
-
         for model, res in fitter.results.items():
             fitter.model_type = model
             C_sc   = res['C']
-            sig_sc = res.get('sigma_mc', 0.0)
             C      = float(unscale(C_sc))
-            sigma  = float(fitter.y_range * sig_sc)
-
             x_plot  = np.linspace(fitter.x_min, fitter.x_max * 1.5, 200)
             t_plot  = x_plot / fitter.x_max
             phi_p   = fitter._compute_basis(res['B'], t_plot)
             y_plot  = unscale(C_sc + res['A'] * phi_p[:, 1])
 
-            ax_full.plot(x_plot, y_plot, '-', color=colors[model], linewidth=2,
-                         alpha=0.8, label=labels[model])
-            if sigma > 0:
-                ax_full.fill_between([fitter.x_min, fitter.x_max * 1.5],
-                                     C - sigma, C + sigma,
-                                     color=colors[model], alpha=0.1)
+            ax_full.plot(x_plot, y_plot, '-', color=colors[model], linewidth=2, alpha=0.8, label=labels[model])
             ax_full.axhline(C, color=colors[model], linestyle='--', alpha=0.3)
 
         if truth_val is not None:
-            ax_full.axhline(truth_val, color='r', linestyle=':', linewidth=2,
-                            label=f'Truth ({truth_val:.8f})')
-            if fitter.err_df is not None and y_col in fitter.err_df.columns:
-                try:
-                    te = fitter.err_df[y_col].values[-1]
-                    ax_full.fill_between([fitter.x_min, fitter.x_max * 1.5],
-                                         truth_val - te, truth_val + te,
-                                         color='r', alpha=0.15, zorder=0,
-                                         label=f'Ref Error (±{te:.1e})')
-                except IndexError:
-                    pass
+            ax_full.axhline(truth_val, color='r', linestyle=':', linewidth=2, label=f'Truth')
 
-        ax_full.set_xlabel("Basis Size", fontsize=12)
-        ax_full.set_ylabel(y_col, fontsize=12)
+        ax_full.set_title(f"{y_col} - Full View")
+        ax_full.set_xlabel("Basis Size")
+        ax_full.set_ylabel(y_col)
         ax_full.grid(True, alpha=0.3)
-        ax_full.legend()
+        ax_full.legend(fontsize=9)
         
         # =======================================================
-        # Right Panel: Zoomed Tail
+        # Middle Panel (Col 1): Zoomed Tail
         # =======================================================
         ax_zoom.plot(fitter.raw_x, y_data, 'ko', label='Data', zorder=5, markersize=6)
 
@@ -321,25 +304,17 @@ def fit_and_plot_system(df, system_name, x_col='basis', err_df=None, inf_df=None
         for model, res in fitter.results.items():
             fitter.model_type = model
             C_sc   = res['C']
-            sig_sc = res.get('sigma_mc', 0.0)
             C      = float(unscale(C_sc))
-            sigma  = float(fitter.y_range * sig_sc)
-
             x_plot = np.linspace(fitter.x_min, fitter.x_max * 1.5, 200)
             t_plot = x_plot / fitter.x_max
             phi_p  = fitter._compute_basis(res['B'], t_plot)
             y_plot = unscale(C_sc + res['A'] * phi_p[:, 1])
 
-            ax_zoom.plot(x_plot, y_plot, '-', color=colors[model], linewidth=2,
-                         alpha=0.8, label=labels[model])
-            if sigma > 0:
-                ax_zoom.fill_between([fitter.x_min, fitter.x_max * 1.5],
-                                     C - sigma, C + sigma,
-                                     color=colors[model], alpha=0.1)
+            ax_zoom.plot(x_plot, y_plot, '-', color=colors[model], linewidth=2, alpha=0.8, label=labels[model])
             ax_zoom.axhline(C, color=colors[model], linestyle='--', alpha=0.3)
 
-            y_min_z = min(y_min_z, C - sigma)
-            y_max_z = max(y_max_z, C + sigma)
+            y_min_z = min(y_min_z, C)
+            y_max_z = max(y_max_z, C)
 
             mask_p = (x_plot >= zoom_start) & (x_plot <= zoom_end)
             if np.any(mask_p):
@@ -347,35 +322,89 @@ def fit_and_plot_system(df, system_name, x_col='basis', err_df=None, inf_df=None
                 y_max_z = max(y_max_z, np.max(y_plot[mask_p]))
 
         if truth_val is not None:
-            ax_zoom.axhline(truth_val, color='r', linestyle=':', linewidth=2,
-                            label=f'Truth ({truth_val:.8f})')
+            ax_zoom.axhline(truth_val, color='r', linestyle=':', linewidth=2, label=f'Truth')
             y_min_z = min(y_min_z, truth_val)
             y_max_z = max(y_max_z, truth_val)
-            if fitter.err_df is not None and y_col in fitter.err_df.columns:
-                try:
-                    te = fitter.err_df[y_col].values[-1]
-                    ax_zoom.fill_between([fitter.x_min, fitter.x_max * 1.5],
-                                         truth_val - te, truth_val + te,
-                                         color='r', alpha=0.15, zorder=0,
-                                         label=f'Ref Error (±{te:.1e})')
-                    y_min_z = min(y_min_z, truth_val - te)
-                    y_max_z = max(y_max_z, truth_val + te)
-                except IndexError:
-                    pass
 
         ax_zoom.set_xlim(zoom_start, zoom_end)
         if not (np.isinf(y_min_z) or np.isinf(y_max_z)):
             span = y_max_z - y_min_z
-            if span == 0:
-                span = abs(y_min_z) * 0.01 + 1e-10
+            if span == 0: span = abs(y_min_z) * 0.01 + 1e-10
             ax_zoom.set_ylim(y_min_z - 0.1 * span, y_max_z + 0.1 * span)
 
-        ax_zoom.set_xlabel("Basis Size", fontsize=12)
-        ax_zoom.set_ylabel(y_col, fontsize=12)
+        ax_zoom.set_title(f"{y_col} - Zoomed Tail")
+        ax_zoom.set_xlabel("Basis Size")
         ax_zoom.grid(True, alpha=0.3)
-        ax_zoom.legend()
 
-    # Fixed whitespace issue here: Use a stable top margin that doesn't collapse on large N
+        # =======================================================
+        # Right Panels (Cols 2, 3, 4): Linearized Space (Like image)
+        # =======================================================
+        for model in ['exponential', 'sqrt_exponential', 'power_law']:
+            ax_log = ax_log_axes[model]
+            if model not in fitter.results:
+                continue
+                
+            res = fitter.results[model]
+            fitter.model_type = model
+            color = colors[model]
+            
+            B, C, A = res['B'], res['C'], res['A']
+            tx = fitter._make_tx(model)
+            
+            if fitter.is_increasing:
+                diff = C - fitter.raw_y
+            else:
+                diff = fitter.raw_y - C
+
+            valid = diff > 0
+            tx_v = tx[valid]
+            ln_diff_v = np.log(diff[valid])
+            
+            # Scatter Data
+            n_pts = len(tx_v)
+            ax_log.scatter(tx_v, ln_diff_v, color=color, s=40, zorder=4, label=f'Data ({n_pts} pts)')
+            
+            n_invalid = int(np.sum(~valid))
+            if n_invalid:
+                ax_log.scatter(tx[~valid], np.full(n_invalid, ln_diff_v.min() if len(ln_diff_v) else 0),
+                               color='red', marker='x', s=50, zorder=5, label=f'Invalid (y≤C): {n_invalid}')
+            
+            # Fitted Line
+            ln_A = np.log(abs(A)) if abs(A) > 1e-15 else 0.0
+            slope = -B
+            tx_line = np.linspace(tx_v.min() if n_pts else 0, tx_v.max() if n_pts else 1, 200)
+            ln_line = ln_A + slope * tx_line
+            
+            r2 = res.get('r2_linearized', float('nan'))
+            ax_log.plot(tx_line, ln_line, '-', color=color, linewidth=2, 
+                        label=f'Fit (R²={r2:.5f})\nB={B:.4f}')
+            
+            # Shaded Std Dev band
+            if len(ln_diff_v) > 3:
+                resid_log = ln_diff_v - (ln_A + slope * tx_v)
+                sigma_log = float(np.std(resid_log))
+                ax_log.fill_between(tx_line, ln_line - sigma_log, ln_line + sigma_log,
+                                    color=color, alpha=0.12, label=f'±1σ (log) = {sigma_log:.3f}')
+
+            ax_log.set_title(titles_log[model], fontsize=11)
+            ax_log.set_xlabel(x_labels_log[model], fontsize=10)
+            ax_log.set_ylabel(r'$\ln(y - C)$', fontsize=10)
+            ax_log.legend(fontsize=8)
+            ax_log.grid(True, alpha=0.3)
+
     fig.tight_layout(rect=[0, 0, 1, 0.98])
     fig.subplots_adjust(top=0.95, hspace=0.3)
+    
+    # =======================================================
+    # Save PDF if requested
+    # =======================================================
+    if save_pdf:
+        if isinstance(save_pdf, str):
+            filename = save_pdf
+        else:
+            filename = f"{system_name}_fits.pdf"
+            
+        plt.savefig(filename, format='pdf', bbox_inches='tight')
+        print(f"Saved plot to {filename}")
+
     plt.show()
