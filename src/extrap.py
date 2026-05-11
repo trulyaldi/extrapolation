@@ -370,7 +370,7 @@ class VarProLinearized:
     # Main fitting method
     # ------------------------------------------------------------------
 
-    def fit_linearized(self, models=None, verbose=False, compute_uq=False, on_iteration=None):
+    def fit_linearized(self, models=None, verbose=False, compute_uq=True, on_iteration=None):
 
         if models is None:
             models = ['exponential', 'sqrt_exponential', 'power_law']
@@ -519,8 +519,9 @@ class VarProLinearized:
             self.compute_uncertainty()
             
         return self.results
+
     # ------------------------------------------------------------------
-    # Uncertainty quantification (parametric Monte Carlo – same as VarProIRLS)
+    # Uncertainty quantification (B-Boundary Error Propagation)
     # ------------------------------------------------------------------
 
     def compute_uncertainty(self):
@@ -532,10 +533,9 @@ class VarProLinearized:
         for model, res in self.results.items():
             self.model_type = model
 
-            B        = res['B']
-            A        = res['A']
-            C        = res['C']
-            t_scaled = res['t_scaled']
+            B = res['B']
+            A = res['A']
+            C = res['C']
 
             tx = self._make_tx(model)
 
@@ -546,38 +546,56 @@ class VarProLinearized:
 
             valid = diff > 0
             tx_v  = tx[valid]
-            z_v   = np.log(diff[valid])
+            diff_v = diff[valid]
+            z_v   = np.log(diff_v)
             n     = len(tx_v)
 
             if n < 3:
                 res['sigma_mc'] = float(np.max(np.abs(np.diff(self.raw_y))))
                 continue
 
-            X = np.column_stack([np.ones(n), tx_v])
-
+            # ── Log-space residuals and noise variance ──────────────────────
             ln_A      = np.log(abs(A) + eps)
             z_pred    = ln_A - B * tx_v
             log_resid = z_v - z_pred
-            dof       = max(1, n - 2)
+            dof       = max(1, n - 3)   # 3 parameters: C, ln|A|, B
             sigma_log_sq = float(np.sum(log_resid ** 2) / dof)
 
+            # ── NLS Jacobian of r_i = ln(y_i - C) - ln|A| + B*t_i ─────────
+            # dr/dC     = -1 / (y_i - C)    [sign: increasing flips diff]
+            # dr/dln|A| = -1
+            # dr/dB     =  t_i
+            #
+            # Shape: (n, 3) with columns [C, ln|A|, B]
+            sign = -1.0 if self.is_increasing else 1.0
+            J = np.column_stack([
+                sign / diff_v,          # dr/dC  (= -1/(y_i - C) with correct sign)
+                -np.ones(n),            # dr/dln|A|
+                tx_v                    # dr/dB
+            ])
+
+            # ── Joint covariance: Cov(θ) = σ² (JᵀJ)⁻¹ ─────────────────────
+            JTJ = J.T @ J
             try:
-                XTX_inv = np.linalg.inv(X.T @ X)
+                JTJ_inv = np.linalg.inv(JTJ)
             except np.linalg.LinAlgError:
                 res['sigma_mc'] = float(np.max(np.abs(np.diff(self.raw_y))))
                 continue
 
-            sigma_lnA = np.sqrt(sigma_log_sq * XTX_inv[0, 0])
-            sigma_B   = np.sqrt(sigma_log_sq * XTX_inv[1, 1])
+            # σ_C is the square root of the (0,0) entry → variance of C
+            var_C = sigma_log_sq * JTJ_inv[0, 0]
 
-            phi_vals = self._compute_basis(B, t_scaled)[:, 1]
-            dC_dlnA  = abs(A) * abs(phi_vals[0])
-            dC_dB    = abs(A) * abs(phi_vals[0]) * abs(tx[0])
+            if var_C <= 0.0 or np.isnan(var_C):
+                res['sigma_mc'] = float(np.max(np.abs(np.diff(self.raw_y))))
+                continue
 
-            sigma_C_scaled = np.sqrt((dC_dlnA * sigma_lnA)**2 + (dC_dB * sigma_B)**2)
+            sigma_C_scaled = float(np.sqrt(var_C))
+            res['sigma_mc'] = sigma_C_scaled
 
-            # convert to unscaled units so plot()'s  y_range * sig_sc  is correct
-            res['sigma_mc'] = sigma_C_scaled   # plot multiplies by y_range → correct
+            # Store auxiliary diagnostics if useful
+            res['sigma_B']   = float(np.sqrt(sigma_log_sq * JTJ_inv[2, 2]))
+            res['corr_CB']   = (JTJ_inv[0, 2]
+                                / (np.sqrt(JTJ_inv[0, 0]) * np.sqrt(JTJ_inv[2, 2]) + eps))
 
         return self.results
 

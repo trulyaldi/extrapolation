@@ -168,12 +168,6 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
     """
     Fits all expectation value columns in a dataframe using VarProLinearized 
     and plots an N x 5 grid (Full View, Zoomed Tail, and 3 Linearized Space plots).
-    
-    Parameters:
-    -----------
-    ... [other parameters] ...
-    save_pdf    : bool or str, optional. If True, saves as '{system_name}_fits.pdf'. 
-                  If a string is provided, saves to that specific file path.
     """
     if skip_cols is None:
         skip_cols = []
@@ -208,7 +202,8 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
             err_df=err_df, inf_df=inf_df, n_fit=n_fit,
             use_energy_b=True  # Ensure B and B/2 logic is applied
         )
-        fitter.fit_linearized(compute_uq=False, verbose=False)
+        # ENABLE compute_uq=True
+        fitter.fit_linearized(compute_uq=True, verbose=False)
         fitters.append(fitter)
 
     # -----------------------------------------------------------
@@ -244,7 +239,6 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
         ax_full = axes[idx, 0]
         ax_zoom = axes[idx, 1]
         
-        # The 3 axes for the linearized plots
         ax_log_axes = {
             'exponential': axes[idx, 2],
             'sqrt_exponential': axes[idx, 3],
@@ -269,7 +263,10 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
         for model, res in fitter.results.items():
             fitter.model_type = model
             C_sc   = res['C']
+            sig_sc = res.get('sigma_mc', 0.0)
             C      = float(unscale(C_sc))
+            sigma  = float(fitter.y_range * sig_sc)  # Unscale uncertainty
+            
             x_plot  = np.linspace(fitter.x_min, fitter.x_max * 1.5, 200)
             t_plot  = x_plot / fitter.x_max
             phi_p   = fitter._compute_basis(res['B'], t_plot)
@@ -277,6 +274,11 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
 
             ax_full.plot(x_plot, y_plot, '-', color=colors[model], linewidth=2, alpha=0.8, label=labels[model])
             ax_full.axhline(C, color=colors[model], linestyle='--', alpha=0.3)
+            
+            # Draw Uncertainty Band
+            ax_full.fill_between([fitter.x_min, fitter.x_max * 1.5], 
+                                 C - sigma, C + sigma, 
+                                 color=colors[model], alpha=0.1)
 
         if truth_val is not None:
             ax_full.axhline(truth_val, color='r', linestyle=':', linewidth=2, label=f'Truth')
@@ -304,7 +306,10 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
         for model, res in fitter.results.items():
             fitter.model_type = model
             C_sc   = res['C']
+            sig_sc = res.get('sigma_mc', 0.0)
             C      = float(unscale(C_sc))
+            sigma  = float(fitter.y_range * sig_sc)  # Unscale uncertainty
+            
             x_plot = np.linspace(fitter.x_min, fitter.x_max * 1.5, 200)
             t_plot = x_plot / fitter.x_max
             phi_p  = fitter._compute_basis(res['B'], t_plot)
@@ -312,9 +317,15 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
 
             ax_zoom.plot(x_plot, y_plot, '-', color=colors[model], linewidth=2, alpha=0.8, label=labels[model])
             ax_zoom.axhline(C, color=colors[model], linestyle='--', alpha=0.3)
+            
+            # Draw Uncertainty Band
+            ax_zoom.fill_between([fitter.x_min, fitter.x_max * 1.5], 
+                                 C - sigma, C + sigma, 
+                                 color=colors[model], alpha=0.1)
 
-            y_min_z = min(y_min_z, C)
-            y_max_z = max(y_max_z, C)
+            # Update zoomed bounds to fit uncertainty limits
+            y_min_z = min(y_min_z, C - sigma)
+            y_max_z = max(y_max_z, C + sigma)
 
             mask_p = (x_plot >= zoom_start) & (x_plot <= zoom_end)
             if np.any(mask_p):
@@ -337,7 +348,7 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
         ax_zoom.grid(True, alpha=0.3)
 
         # =======================================================
-        # Right Panels (Cols 2, 3, 4): Linearized Space (Like image)
+        # Right Panels (Cols 2, 3, 4): Linearized Space
         # =======================================================
         for model in ['exponential', 'sqrt_exponential', 'power_law']:
             ax_log = ax_log_axes[model]
@@ -360,7 +371,6 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
             tx_v = tx[valid]
             ln_diff_v = np.log(diff[valid])
             
-            # Scatter Data
             n_pts = len(tx_v)
             ax_log.scatter(tx_v, ln_diff_v, color=color, s=40, zorder=4, label=f'Data ({n_pts} pts)')
             
@@ -369,7 +379,6 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
                 ax_log.scatter(tx[~valid], np.full(n_invalid, ln_diff_v.min() if len(ln_diff_v) else 0),
                                color='red', marker='x', s=50, zorder=5, label=f'Invalid (y≤C): {n_invalid}')
             
-            # Fitted Line
             ln_A = np.log(abs(A)) if abs(A) > 1e-15 else 0.0
             slope = -B
             tx_line = np.linspace(tx_v.min() if n_pts else 0, tx_v.max() if n_pts else 1, 200)
@@ -379,7 +388,6 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
             ax_log.plot(tx_line, ln_line, '-', color=color, linewidth=2, 
                         label=f'Fit (R²={r2:.5f})\nB={B:.4f}')
             
-            # Shaded Std Dev band
             if len(ln_diff_v) > 3:
                 resid_log = ln_diff_v - (ln_A + slope * tx_v)
                 sigma_log = float(np.std(resid_log))
@@ -395,9 +403,6 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
     fig.tight_layout(rect=[0, 0, 1, 0.98])
     fig.subplots_adjust(top=0.95, hspace=0.3)
     
-    # =======================================================
-    # Save PDF if requested
-    # =======================================================
     if save_pdf:
         if isinstance(save_pdf, str):
             filename = save_pdf
