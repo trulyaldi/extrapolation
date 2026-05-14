@@ -528,80 +528,46 @@ class VarProLinearized:
         if not self.results:
             raise RuntimeError("No results found. Run fit_linearized() first.")
 
-        eps = np.finfo(float).eps
-
         for model, res in self.results.items():
             self.model_type = model
 
             B = res['B']
             A = res['A']
             C = res['C']
-
             tx = self._make_tx(model)
 
-            if self.is_increasing:
-                diff = C - self.raw_y
-            else:
-                diff = self.raw_y - C
-
-            valid = diff > 0
-            tx_v  = tx[valid]
-            diff_v = diff[valid]
-            z_v   = np.log(diff_v)
-            n     = len(tx_v)
-
-            if n < 3:
+            if len(tx) < 3:
                 res['sigma_mc'] = float(np.max(np.abs(np.diff(self.raw_y))))
                 continue
 
-            # ── Log-space residuals and noise variance ──────────────────────
-            ln_A      = np.log(abs(A) + eps)
-            z_pred    = ln_A - B * tx_v
-            log_resid = z_v - z_pred
-            dof       = max(1, n - 3)   # 3 parameters: C, ln|A|, B
-            sigma_log_sq = float(np.sum(log_resid ** 2) / dof)
-
-            # ── NLS Jacobian of r_i = ln(y_i - C) - ln|A| + B*t_i ─────────
-            # dr/dC     = -1 / (y_i - C)    [sign: increasing flips diff]
-            # dr/dln|A| = -1
-            # dr/dB     =  t_i
-            #
-            # Shape: (n, 3) with columns [C, ln|A|, B]
+            # ── 1. Reconstruct normal space curve ─────────────────────────
             sign = -1.0 if self.is_increasing else 1.0
-            J = np.column_stack([
-                sign / diff_v,          # dr/dC  (= -1/(y_i - C) with correct sign)
-                -np.ones(n),            # dr/dln|A|
-                tx_v                    # dr/dB
-            ])
+            y_pred = C + sign * (np.abs(A) * np.exp(-B * tx))
 
-            # ── Joint covariance: Cov(θ) = σ² (JᵀJ)⁻¹ ─────────────────────
-            JTJ = J.T @ J
-            try:
-                JTJ_inv = np.linalg.inv(JTJ)
-            except np.linalg.LinAlgError:
-                res['sigma_mc'] = float(np.max(np.abs(np.diff(self.raw_y))))
-                continue
+            # ── 2. Calculate linear residuals ─────────────────────────────
+            residuals = self.raw_y - y_pred
 
-            # Standard parameter variance (shrinks with n)
-            var_C_estimate = sigma_log_sq * JTJ_inv[0, 0]
+            # ── 3. Robust Noise Estimator (Median Absolute Deviation) ─────
+            # MAD fundamentally relies ONLY on the distribution of the noise.
+            # It completely ignores N, and it ignores the massive structural 
+            # residuals at small x, locking onto the true noise band of the tail.
+            med_res = np.median(residuals)
+            mad = np.median(np.abs(residuals - med_res))
 
-            if var_C_estimate <= 0.0 or np.isnan(var_C_estimate):
-                res['sigma_mc'] = float(np.max(np.abs(np.diff(self.raw_y))))
-                continue
+            # Scale factor 1.4826 converts MAD to standard deviation equivalent 
+            # for normally distributed noise.
+            if mad == 0.0 or np.isnan(mad):
+                # Fallback for perfectly exact, noiseless fits
+                robust_sigma = float(np.max(np.abs(np.diff(self.raw_y))))
+            else:
+                robust_sigma = float(1.4826 * mad)
 
-            # ── NEW: Remove the sample-size dependency ────────────────────
-            # Multiply by 'dof' (or n) to get the intrinsic variance of the 
-            # data distribution projected onto the parameter C, independent of sample size.
-            var_C_distribution = var_C_estimate * dof
-            
-            # This is now the physical spread, not the statistical standard error
-            sigma_C_scaled = float(np.sqrt(var_C_distribution))
-            res['sigma_mc'] = sigma_C_scaled
+            # Assign directly to C. No Jacobians, no N-scaling.
+            res['sigma_mc'] = robust_sigma
 
-            # Store auxiliary diagnostics if useful
-            res['sigma_B']   = float(np.sqrt(sigma_log_sq * JTJ_inv[2, 2] * dof)) # Also scaled
-            res['corr_CB']   = (JTJ_inv[0, 2]
-                                / (np.sqrt(JTJ_inv[0, 0]) * np.sqrt(JTJ_inv[2, 2]) + eps))
+            # Not applicable when bypassing the information matrix
+            res['sigma_B'] = 0.0
+            res['corr_CB'] = 0.0
 
         return self.results
 
