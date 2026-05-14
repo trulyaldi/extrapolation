@@ -582,18 +582,24 @@ class VarProLinearized:
                 res['sigma_mc'] = float(np.max(np.abs(np.diff(self.raw_y))))
                 continue
 
-            # σ_C is the square root of the (0,0) entry → variance of C
-            var_C = sigma_log_sq * JTJ_inv[0, 0]
+            # Standard parameter variance (shrinks with n)
+            var_C_estimate = sigma_log_sq * JTJ_inv[0, 0]
 
-            if var_C <= 0.0 or np.isnan(var_C):
+            if var_C_estimate <= 0.0 or np.isnan(var_C_estimate):
                 res['sigma_mc'] = float(np.max(np.abs(np.diff(self.raw_y))))
                 continue
 
-            sigma_C_scaled = float(np.sqrt(var_C))
+            # ── NEW: Remove the sample-size dependency ────────────────────
+            # Multiply by 'dof' (or n) to get the intrinsic variance of the 
+            # data distribution projected onto the parameter C, independent of sample size.
+            var_C_distribution = var_C_estimate * dof
+            
+            # This is now the physical spread, not the statistical standard error
+            sigma_C_scaled = float(np.sqrt(var_C_distribution))
             res['sigma_mc'] = sigma_C_scaled
 
             # Store auxiliary diagnostics if useful
-            res['sigma_B']   = float(np.sqrt(sigma_log_sq * JTJ_inv[2, 2]))
+            res['sigma_B']   = float(np.sqrt(sigma_log_sq * JTJ_inv[2, 2] * dof)) # Also scaled
             res['corr_CB']   = (JTJ_inv[0, 2]
                                 / (np.sqrt(JTJ_inv[0, 0]) * np.sqrt(JTJ_inv[2, 2]) + eps))
 
@@ -726,7 +732,7 @@ class VarProLinearized:
 
         if truth_val is not None:
             plt.axhline(truth_val, color='r', linestyle=':', linewidth=2,
-                        label=f'Truth ({truth_val:.8f})')
+                        label=f'Exact ({truth_val:.8f})')
             y_min_z = min(y_min_z, truth_val)
             y_max_z = max(y_max_z, truth_val)
             if self.err_df is not None and self.y_col in self.err_df.columns:
