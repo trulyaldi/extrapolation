@@ -281,7 +281,7 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
                                  color=colors[model], alpha=0.1)
 
         if truth_val is not None:
-            ax_full.axhline(truth_val, color='r', linestyle=':', linewidth=2, label=f'Truth')
+            ax_full.axhline(truth_val, color='r', linestyle=':', linewidth=2, label=f'Exact')
 
         ax_full.set_title(f"{y_col} - Full View")
         ax_full.set_xlabel("Basis Size")
@@ -333,7 +333,7 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
                 y_max_z = max(y_max_z, np.max(y_plot[mask_p]))
 
         if truth_val is not None:
-            ax_zoom.axhline(truth_val, color='r', linestyle=':', linewidth=2, label=f'Truth')
+            ax_zoom.axhline(truth_val, color='r', linestyle=':', linewidth=2, label=f'Exact')
             y_min_z = min(y_min_z, truth_val)
             y_max_z = max(y_max_z, truth_val)
 

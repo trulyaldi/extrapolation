@@ -222,7 +222,7 @@ class VarProLinearized:
         return r2_log, intercept, slope, True
 
 
-    def _search_C(self, tx, fixed_b=None, n_coarse=1000, n_fine=500, window=3, r2_epsilon=0.01):
+    def _search_C(self, tx, fixed_b=None, n_coarse=1250, n_fine=1000, window=5, r2_epsilon=0.01):
         y = self.raw_y
 
         # --- THE FIX: Tail-Extreme Anchoring ---
@@ -523,7 +523,6 @@ class VarProLinearized:
     # ------------------------------------------------------------------
     # Uncertainty quantification (B-Boundary Error Propagation)
     # ------------------------------------------------------------------
-
     def compute_uncertainty(self):
         if not self.results:
             raise RuntimeError("No results found. Run fit_linearized() first.")
@@ -531,46 +530,69 @@ class VarProLinearized:
         for model, res in self.results.items():
             self.model_type = model
 
+            # ── 1. Load Parameters ──────────────────────────────────────────
             B = res['B']
             A = res['A']
             C = res['C']
             tx = self._make_tx(model)
+            N = len(tx)
 
-            if len(tx) < 3:
-                res['sigma_mc'] = float(np.max(np.abs(np.diff(self.raw_y))))
+            # Fallback safeguard for insufficient data points
+            if N < 3:
+                res['sigma_C'] = float(np.max(np.abs(np.diff(self.raw_y))))
+                res['sigma_mc'] = res['sigma_C'] # Preserved for backward compatibility
+                res['sigma_B'] = 0.0
                 continue
 
-            # ── 1. Reconstruct normal space curve ─────────────────────────
-            sign = -1.0 if self.is_increasing else 1.0
-            y_pred = C + sign * (np.abs(A) * np.exp(-B * tx))
+            # ── 2. Standard OLS Log-Space Residuals ─────────────────────────
+            log_y_pred = np.log(np.abs(A)) - B * tx
+            eps = 1e-15
+            log_y_actual = np.log(np.maximum(np.abs(self.raw_y - C), eps))
+            residuals_log = log_y_actual - log_y_pred
 
-            # ── 2. Calculate linear residuals ─────────────────────────────
-            residuals = self.raw_y - y_pred
+            # ── 3. Covariance Matrix of Linear Parameters ───────────────────
+            # Calculate standard residual variance (Degrees of Freedom = N - 2)
+            sigma2_res = np.sum(residuals_log**2) / (N - 2)
 
-            # ── 3. Robust Noise Estimator (Median Absolute Deviation) ─────
-            # MAD fundamentally relies ONLY on the distribution of the noise.
-            # It completely ignores N, and it ignores the massive structural 
-            # residuals at small x, locking onto the true noise band of the tail.
-            med_res = np.median(residuals)
-            mad = np.median(np.abs(residuals - med_res))
+            # Construct Design Matrix X for the linear model: ln(y-C) = ln(A) - B*tx
+            X = np.column_stack((np.ones(N), -tx))
+            
+            # Calculate full covariance matrix: Cov(beta) = sigma^2 * (X^T X)^-1
+            # Index [0,0] is Var(ln A), [1,1] is Var(B), [0,1] is Cov(ln A, B)
+            cov_beta = sigma2_res * np.linalg.inv(X.T @ X)
 
-            # Scale factor 1.4826 converts MAD to standard deviation equivalent 
-            # for normally distributed noise.
-            if mad == 0.0 or np.isnan(mad):
-                # Fallback for perfectly exact, noiseless fits
-                robust_sigma = float(np.max(np.abs(np.diff(self.raw_y))))
-            else:
-                robust_sigma = float(1.4826 * mad)
+            # ── 4. First-Order Error Propagation (Delta Method) ─────────────
+            # Evaluate the Jacobian of C with respect to parameters [ln(A), B].
+            # Averaged across the dataset to reflect the global parameter sensitivity.
+            exp_terms = np.exp(-B * tx)
+            
+            # dC/dln(A) = -A * exp(-Bx)
+            J_ln_A = np.mean(-A * exp_terms)
+            
+            # dC/dB = x * A * exp(-Bx)
+            J_B = np.mean(tx * A * exp_terms)
+            
+            # Jacobian vector
+            J_C = np.array([J_ln_A, J_B])
 
-            # Assign directly to C. No Jacobians, no N-scaling.
-            res['sigma_mc'] = robust_sigma
+            # Propagate variance: Var(C) = J_C^T * Cov(beta) * J_C
+            var_C = J_C.T @ cov_beta @ J_C
 
-            # Not applicable when bypassing the information matrix
-            res['sigma_B'] = 0.0
-            res['corr_CB'] = 0.0
+            # ── 5. Assign to Results ────────────────────────────────────────
+            # Explicit standard errors mapped directly from the statistical variance
+            res['sigma_C'] = float(np.sqrt(var_C))
+            res['sigma_mc'] = float(np.sqrt(var_C))  # Preserved if your downstream plots rely on this key
+            
+            res['sigma_B'] = float(np.sqrt(cov_beta[1, 1]))
+            res['sigma_ln_A'] = float(np.sqrt(cov_beta[0, 0]))
+            
+            # Store standard OLS residual standard deviation replacing the old MAD metric
+            res['sigma_log'] = float(np.sqrt(sigma2_res))
+            
+            # You now have access to the true correlation if you need it later
+            res['corr_CB'] = float(cov_beta[0, 1] / (np.sqrt(cov_beta[0, 0]) * np.sqrt(cov_beta[1, 1])))
 
         return self.results
-
     # ------------------------------------------------------------------
     # Plotting (identical to VarProIRLS)
     # ------------------------------------------------------------------
@@ -636,7 +658,7 @@ class VarProLinearized:
 
         if truth_val is not None:
             plt.axhline(truth_val, color='r', linestyle=':', linewidth=2,
-                        label=f'Truth ({truth_val:.8f})')
+                        label=f'Exact ({truth_val:.8f})')
             if self.err_df is not None and self.y_col in self.err_df.columns:
                 try:
                     te = self.err_df[self.y_col].values[-1]
