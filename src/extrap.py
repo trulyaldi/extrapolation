@@ -524,78 +524,76 @@ class VarProLinearized:
     # Uncertainty quantification (B-Boundary Error Propagation)
     # ------------------------------------------------------------------
     def compute_uncertainty(self):
-        if not self.results:
-            raise RuntimeError("No results found. Run fit_linearized() first.")
+            if not self.results:
+                raise RuntimeError("No results found. Run fit_linearized() first.")
 
-        for model, res in self.results.items():
-            self.model_type = model
+            for model, res in self.results.items():
+                self.model_type = model
 
-            # ── 1. Load Parameters ──────────────────────────────────────────
-            B = res['B']
-            A = res['A']
-            C = res['C']
-            tx = self._make_tx(model)
-            N = len(tx)
+                # ── 1. Load Parameters ──────────────────────────────────────────
+                B = res['B']
+                A = res['A']
+                C = res['C']
+                tx = self._make_tx(model)
+                N = len(tx)
 
-            # Fallback safeguard for insufficient data points
-            if N < 3:
-                res['sigma_C'] = float(np.max(np.abs(np.diff(self.raw_y))))
-                res['sigma_mc'] = res['sigma_C'] # Preserved for backward compatibility
-                res['sigma_B'] = 0.0
-                continue
+                # Fallback safeguard for insufficient data points
+                if N < 3:
+                    res['sigma_C'] = float(np.max(np.abs(np.diff(self.raw_y))))
+                    res['sigma_mc'] = res['sigma_C']
+                    res['sigma_C_plus'] = res['sigma_C']
+                    res['sigma_C_minus'] = res['sigma_C']
+                    res['sigma_B'] = 0.0
+                    continue
 
-            # ── 2. Standard OLS Log-Space Residuals ─────────────────────────
-            log_y_pred = np.log(np.abs(A)) - B * tx
-            eps = 1e-15
-            log_y_actual = np.log(np.maximum(np.abs(self.raw_y - C), eps))
-            residuals_log = log_y_actual - log_y_pred
+                # ── 2. Standard OLS Log-Space Residuals ─────────────────────────
+                log_y_pred = np.log(np.abs(A)) - B * tx
+                eps = 1e-15
+                log_y_actual = np.log(np.maximum(np.abs(self.raw_y - C), eps))
+                residuals_log = log_y_actual - log_y_pred
 
-            # ── 3. Covariance Matrix of Linear Parameters ───────────────────
-            # Calculate standard residual variance (Degrees of Freedom = N - 2)
-            sigma2_res = np.sum(residuals_log**2) / (N - 2)
+                # ── 3. Covariance Matrix of Linear Parameters ───────────────────
+                sigma2_res = np.sum(residuals_log**2) / (N - 2)
+                X = np.column_stack((np.ones(N), -tx))
+                cov_beta = sigma2_res * np.linalg.inv(X.T @ X)
 
-            # Construct Design Matrix X for the linear model: ln(y-C) = ln(A) - B*tx
-            X = np.column_stack((np.ones(N), -tx))
-            
-            # Calculate full covariance matrix: Cov(beta) = sigma^2 * (X^T X)^-1
-            # Index [0,0] is Var(ln A), [1,1] is Var(B), [0,1] is Cov(ln A, B)
-            cov_beta = sigma2_res * np.linalg.inv(X.T @ X)
+                # ── 4. Log-Space Asymmetric Error Propagation ─────────────────────
+                var_ln_A = cov_beta[0, 0]
+                var_B = cov_beta[1, 1]
+                cov_lnA_B = cov_beta[0, 1]
 
-            # ── 4. First-Order Error Propagation (Delta Method) ─────────────
-            # Evaluate the Jacobian of C with respect to parameters [ln(A), B].
-            # Averaged across the dataset to reflect the global parameter sensitivity.
-            exp_terms = np.exp(-B * tx)
-            
-            # dC/dln(A) = -A * exp(-Bx)
-            J_ln_A = np.mean(-A * exp_terms)
-            
-            # dC/dB = x * A * exp(-Bx)
-            J_B = np.mean(tx * A * exp_terms)
-            
-            # Jacobian vector
-            J_C = np.array([J_ln_A, J_B])
+                # Calculate the standard error of the log-prediction at each point x
+                # Var(z) = Var(ln A) + x^2 * Var(B) - 2*x*Cov(ln A, B)
+                var_z = var_ln_A + (tx**2) * var_B - 2 * tx * cov_lnA_B
+                se_z = np.sqrt(var_z)
 
-            # Propagate variance: Var(C) = J_C^T * Cov(beta) * J_C
-            var_C = J_C.T @ cov_beta @ J_C
+                # Calculate nominal, upper, and lower exponential components ( P = A * exp(-Bx) )
+                P_nom = np.exp(np.log(np.abs(A)) - B * tx)
+                P_upper = P_nom * np.exp(se_z)  # Upper bound of the curve
+                P_lower = P_nom * np.exp(-se_z) # Lower bound of the curve
 
-            # ── 5. Assign to Results ────────────────────────────────────────
-            # Explicit standard errors mapped directly from the statistical variance
-            res['sigma_C'] = float(np.sqrt(var_C))
-            res['sigma_mc'] = float(np.sqrt(var_C))  # Preserved if your downstream plots rely on this key
-            
-            res['sigma_B'] = float(np.sqrt(cov_beta[1, 1]))
-            res['sigma_ln_A'] = float(np.sqrt(cov_beta[0, 0]))
-            
-            # Store standard OLS residual standard deviation replacing the old MAD metric
-            res['sigma_log'] = float(np.sqrt(sigma2_res))
-            
-            # You now have access to the true correlation if you need it later
-            res['corr_CB'] = float(cov_beta[0, 1] / (np.sqrt(cov_beta[0, 0]) * np.sqrt(cov_beta[1, 1])))
+                # Map the exponential errors back to the asymptote C
+                # Because y = P + C, it follows that C = y - P. 
+                # Therefore, an upper bound error in P forces a lower bound error in C, and vice versa.
+                # We average across the dataset to collapse the x-dependency into a global metric.
+                sigma_C_minus = np.mean(P_upper - P_nom)  # How much C drops when the curve shifts up
+                sigma_C_plus = np.mean(P_nom - P_lower)   # How much C rises when the curve shifts down
 
-        return self.results
-    # ------------------------------------------------------------------
-    # Plotting (identical to VarProIRLS)
-    # ------------------------------------------------------------------
+                # ── 5. Assign to Results ────────────────────────────────────────
+                # Store the new asymmetric bounds
+                res['sigma_C_plus'] = float(sigma_C_plus)
+                res['sigma_C_minus'] = float(sigma_C_minus)
+
+                # Preserve a symmetric proxy for backward compatibility (mean of the asymmetric errors)
+                res['sigma_C'] = float(np.mean([sigma_C_plus, sigma_C_minus]))
+                res['sigma_mc'] = res['sigma_C'] 
+                
+                res['sigma_B'] = float(np.sqrt(var_B))
+                res['sigma_ln_A'] = float(np.sqrt(var_ln_A))
+                res['sigma_log'] = float(np.sqrt(sigma2_res))
+                res['corr_CB'] = float(cov_lnA_B / (np.sqrt(var_ln_A) * np.sqrt(var_B)))
+
+            return self.results
 
     def plot(self, truth_val=None):
         if truth_val is None:
