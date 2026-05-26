@@ -524,76 +524,81 @@ class VarProLinearized:
     # Uncertainty quantification (B-Boundary Error Propagation)
     # ------------------------------------------------------------------
     def compute_uncertainty(self):
-            if not self.results:
-                raise RuntimeError("No results found. Run fit_linearized() first.")
+        if not self.results:
+            raise RuntimeError("No results found. Run fit_linearized() first.")
 
-            for model, res in self.results.items():
-                self.model_type = model
+        for model, res in self.results.items():
+            self.model_type = model
 
-                # ── 1. Load Parameters ──────────────────────────────────────────
-                B = res['B']
-                A = res['A']
-                C = res['C']
-                tx = self._make_tx(model)
-                N = len(tx)
+            # ── 1. Load parameters ───────────────────────────────────────────
+            B  = res['B']
+            A  = res['A']
+            C  = res['C']
+            tx = self._make_tx(model)
 
-                # Fallback safeguard for insufficient data points
-                if N < 3:
-                    res['sigma_C'] = float(np.max(np.abs(np.diff(self.raw_y))))
-                    res['sigma_mc'] = res['sigma_C']
-                    res['sigma_C_plus'] = res['sigma_C']
-                    res['sigma_C_minus'] = res['sigma_C']
-                    res['sigma_B'] = 0.0
-                    continue
+            # ── 2. Filter to valid log-space points (direction-aware) ────────
+            # Mirrors _fit_for_C and plot_log: only points where (y - C) is
+            # on the correct side of the asymptote have a defined log value.
+            diff  = (C - self.raw_y) if self.is_increasing else (self.raw_y - C)
+            valid = diff > 0
 
-                # ── 2. Standard OLS Log-Space Residuals ─────────────────────────
-                log_y_pred = np.log(np.abs(A)) - B * tx
-                eps = 1e-15
-                log_y_actual = np.log(np.maximum(np.abs(self.raw_y - C), eps))
-                residuals_log = log_y_actual - log_y_pred
+            tx_v   = tx[valid]
+            diff_v = diff[valid]
+            N_v    = len(tx_v)
 
-                # ── 3. Covariance Matrix of Linear Parameters ───────────────────
-                sigma2_res = np.sum(residuals_log**2) / (N - 2)
-                X = np.column_stack((np.ones(N), -tx))
-                cov_beta = sigma2_res * np.linalg.inv(X.T @ X)
+            if N_v < 3:
+                fallback = float(np.max(np.abs(np.diff(self.raw_y))))
+                res.update({
+                    'sigma_C':       fallback,
+                    'sigma_mc':      fallback,
+                    'sigma_C_plus':  fallback,
+                    'sigma_C_minus': fallback,
+                    'sigma_B':       0.0,
+                })
+                continue
 
-                # ── 4. Log-Space Asymmetric Error Propagation ─────────────────────
-                var_ln_A = cov_beta[0, 0]
-                var_B = cov_beta[1, 1]
-                cov_lnA_B = cov_beta[0, 1]
+            # ── 3. Log-space residuals using only valid points ───────────────
+            ln_diff_v    = np.log(diff_v)                       # log(|y - C|), valid only
+            ln_pred_v    = np.log(np.abs(A)) - B * tx_v        # fitted log curve at tx_v
+            residuals_v  = ln_diff_v - ln_pred_v
 
-                # Calculate the standard error of the log-prediction at each point x
-                # Var(z) = Var(ln A) + x^2 * Var(B) - 2*x*Cov(ln A, B)
-                var_z = var_ln_A + (tx**2) * var_B - 2 * tx * cov_lnA_B
-                se_z = np.sqrt(var_z)
+            # ── 4. Covariance matrix of [ln A, B] over valid DOF ────────────
+            sigma2_res = np.sum(residuals_v ** 2) / (N_v - 2)
+            X_v        = np.column_stack((np.ones(N_v), -tx_v))
+            cov_beta   = sigma2_res * np.linalg.inv(X_v.T @ X_v)
 
-                # Calculate nominal, upper, and lower exponential components ( P = A * exp(-Bx) )
-                P_nom = np.exp(np.log(np.abs(A)) - B * tx)
-                P_upper = P_nom * np.exp(se_z)  # Upper bound of the curve
-                P_lower = P_nom * np.exp(-se_z) # Lower bound of the curve
+            var_ln_A   = cov_beta[0, 0]
+            var_B      = cov_beta[1, 1]
+            cov_lnA_B  = cov_beta[0, 1]
 
-                # Map the exponential errors back to the asymptote C
-                # Because y = P + C, it follows that C = y - P. 
-                # Therefore, an upper bound error in P forces a lower bound error in C, and vice versa.
-                # We average across the dataset to collapse the x-dependency into a global metric.
-                sigma_C_minus = np.mean(P_upper - P_nom)  # How much C drops when the curve shifts up
-                sigma_C_plus = np.mean(P_nom - P_lower)   # How much C rises when the curve shifts down
+            # ── 5. Log-space error propagation over valid points only ────────
+            # Var(ln pred) = Var(ln A) + tx² · Var(B) - 2·tx·Cov(ln A, B)
+            var_z = var_ln_A + (tx_v ** 2) * var_B - 2.0 * tx_v * cov_lnA_B
+            se_z  = np.sqrt(np.maximum(var_z, 0.0))   # guard against tiny negatives
 
-                # ── 5. Assign to Results ────────────────────────────────────────
-                # Store the new asymmetric bounds
-                res['sigma_C_plus'] = float(sigma_C_plus)
-                res['sigma_C_minus'] = float(sigma_C_minus)
+            P_nom   = np.exp(np.log(np.abs(A)) - B * tx_v)
+            P_upper = P_nom * np.exp( se_z)
+            P_lower = P_nom * np.exp(-se_z)
 
-                # Preserve a symmetric proxy for backward compatibility (mean of the asymmetric errors)
-                res['sigma_C'] = float(np.mean([sigma_C_plus, sigma_C_minus]))
-                res['sigma_mc'] = res['sigma_C'] 
-                
-                res['sigma_B'] = float(np.sqrt(var_B))
-                res['sigma_ln_A'] = float(np.sqrt(var_ln_A))
-                res['sigma_log'] = float(np.sqrt(sigma2_res))
-                res['corr_CB'] = float(cov_lnA_B / (np.sqrt(var_ln_A) * np.sqrt(var_B)))
+            # Upper curve ↑  →  C pulled down  →  sigma_C_minus
+            # Lower curve ↓  →  C pulled up    →  sigma_C_plus
+            sigma_C_minus = float(np.mean(P_upper - P_nom))
+            sigma_C_plus  = float(np.mean(P_nom   - P_lower))
 
-            return self.results
+            # ── 6. Store results ─────────────────────────────────────────────
+            res['sigma_C_plus']  = sigma_C_plus
+            res['sigma_C_minus'] = sigma_C_minus
+            res['sigma_C']       = float(np.mean([sigma_C_plus, sigma_C_minus]))
+            res['sigma_mc']      = res['sigma_C']
+            res['sigma_B']       = float(np.sqrt(var_B))
+            res['sigma_ln_A']    = float(np.sqrt(var_ln_A))
+            res['sigma_log']     = float(np.sqrt(sigma2_res))
+            res['corr_CB']       = float(
+                cov_lnA_B / (np.sqrt(var_ln_A) * np.sqrt(var_B))
+                if var_ln_A > 0 and var_B > 0 else 0.0
+            )
+
+        return self.results
 
     def plot(self, truth_val=None):
         if truth_val is None:
@@ -749,104 +754,146 @@ class VarProLinearized:
         plt.show()
 
     def plot_log(self):
-        """
-        Plot the linearized (log-transformed) space for each fitted model.
+            """
+            Plot the linearized (log-transformed) space for each fitted model.
 
-        For each model type the data are transformed as:
-            Exponential      : ln(y - C)  vs  (x / x_max)
-            Sqrt-Exponential : ln(y - C)  vs  sqrt(x / x_max)
-            Power-Law        : ln(y - C)  vs  ln(x / x_max)
+            For each model type the data are transformed as:
+                Exponential      : ln(y - C)  vs  (x / x_max)
+                Sqrt-Exponential : ln(y - C)  vs  sqrt(x / x_max)
+                Power-Law        : ln(y - C)  vs  ln(x / x_max)
 
-        The fitted line  intercept + slope * tx  is overlaid.  In a perfect
-        fit all points fall exactly on the line; deviations reveal where the
-        model struggles.
-        """
-        if not self.results:
-            raise RuntimeError("No results found. Run fit_linearized() first.")
+            The fitted line  intercept + slope * tx  is overlaid.  In a perfect
+            fit all points fall exactly on the line; deviations reveal where the
+            model struggles.
+            """
+            if not self.results:
+                raise RuntimeError("No results found. Run fit_linearized() first.")
 
-        colors = {
-            'exponential':      'blue',
-            'sqrt_exponential': 'orange',
-            'power_law':        'green',
-        }
-        x_labels = {
-            'exponential':      r'$x \;/\; x_{\max}$',
-            'sqrt_exponential': r'$\sqrt{x \;/\; x_{\max}}$',
-            'power_law':        r'$\ln(x \;/\; x_{\max})$',
-        }
-        y_label_template = r'$\ln(y - C)$'
-        titles = {
-            'exponential':      r'Exponential: $\ln(y-C)$ vs $x/x_{max}$',
-            'sqrt_exponential': r'Sqrt-Exp: $\ln(y-C)$ vs $\sqrt{x/x_{max}}$',
-            'power_law':        r'Power-Law: $\ln(y-C)$ vs $\ln(x/x_{max})$',
-        }
+            colors = {
+                'exponential':      'blue',
+                'sqrt_exponential': 'orange',
+                'power_law':        'green',
+            }
+            x_labels = {
+                'exponential':      r'$x \;/\; x_{\max}$',
+                'sqrt_exponential': r'$\sqrt{x \;/\; x_{\max}}$',
+                'power_law':        r'$\ln(x \;/\; x_{\max})$',
+            }
+            y_label_template = r'$\ln(y - C)$'
+            titles = {
+                'exponential':      r'Exponential: $\ln(y-C)$ vs $x/x_{max}$',
+                'sqrt_exponential': r'Sqrt-Exp: $\ln(y-C)$ vs $\sqrt{x/x_{max}}$',
+                'power_law':        r'Power-Law: $\ln(y-C)$ vs $\ln(x/x_{max})$',
+            }
 
-        n_models = len(self.results)
-        fig, axes = plt.subplots(1, n_models,
-                                 figsize=(6 * n_models, 5),
-                                 squeeze=False)
+            n_models = len(self.results)
+            fig, axes = plt.subplots(1, n_models,
+                                    figsize=(6 * n_models, 5),
+                                    squeeze=False)
 
-        for ax, (model, res) in zip(axes[0], self.results.items()):
-            self.model_type = model
-            color = colors[model]
+            for ax, (model, res) in zip(axes[0], self.results.items()):
+                self.model_type = model
+                color = colors[model]
 
-            B = res['B']
-            C = res['C']
-            A = res['A']
+                B = res['B']
+                C = res['C']
+                A = res['A']
 
-            tx = self._make_tx(model)
+                tx = self._make_tx(model)
 
-            # ── transform data ───────────────────────────────────────────
-            if self.is_increasing:
-                diff = C - self.raw_y
-            else:
-                diff = self.raw_y - C
+                # ── transform data ───────────────────────────────────────────
+                if self.is_increasing:
+                    diff = C - self.raw_y
+                else:
+                    diff = self.raw_y - C
 
-            valid = diff > 0
-            tx_v      = tx[valid]
-            ln_diff_v = np.log(diff[valid])
+                valid = diff > 0
+                tx_v      = tx[valid]
+                ln_diff_v = np.log(diff[valid])
 
-            # ── fitted line parameters ───────────────────────────────────
-            # ln(y - C) = ln(|A|) - B * tx
-            ln_A     = np.log(abs(A)) if abs(A) > 1e-15 else 0.0
-            slope    = -B
-            tx_line  = np.linspace(tx_v.min(), tx_v.max(), 200)
-            ln_line  = ln_A + slope * tx_line
+                # ── fitted line parameters ───────────────────────────────────
+                # ln(y - C) = ln(|A|) - B * tx
+                ln_A     = np.log(abs(A)) if abs(A) > 1e-15 else 0.0
+                slope    = -B
+                tx_line  = np.linspace(tx_v.min(), tx_v.max(), 200)
+                ln_line  = ln_A + slope * tx_line
 
-            # ── scatter: colour valid vs clipped points ──────────────────
-            n_invalid = int(np.sum(~valid))
-            ax.scatter(tx_v, ln_diff_v, color=color, s=40, zorder=4,
-                       label=f'Data ({len(tx_v)} pts)')
-            if n_invalid:
-                ax.scatter(tx[~valid],
-                           np.full(n_invalid, ln_diff_v.min() if len(ln_diff_v) else 0),
-                           color='red', marker='x', s=50, zorder=5,
-                           label=f'Invalid (y≤C): {n_invalid}')
+                # ── scatter: colour valid vs clipped points ──────────────────
+                n_invalid = int(np.sum(~valid))
+                ax.scatter(tx_v, ln_diff_v, color=color, s=40, zorder=4,
+                        label=f'Data ({len(tx_v)} pts)')
+                if n_invalid:
+                    ax.scatter(tx[~valid],
+                            np.full(n_invalid, ln_diff_v.min() if len(ln_diff_v) else 0),
+                            color='red', marker='x', s=50, zorder=5,
+                            label=f'Invalid (y≤C): {n_invalid}')
 
-            # ── fitted line ──────────────────────────────────────────────
-            r2 = res.get('r2_linearized', float('nan'))
-            ax.plot(tx_line, ln_line, '-', color=color, linewidth=2,
-                    label=f'Fit  (R²={r2:.5f})\nB={B:.4f}')
+                # ── fitted line ──────────────────────────────────────────────
+                r2 = res.get('r2_linearized', float('nan'))
+                ax.plot(tx_line, ln_line, '-', color=color, linewidth=2,
+                        label=f'Fit  (R²={r2:.5f})\nB={B:.4f}')
 
-            # ── residual band (±1 σ in log-space) ────────────────────────
-            if len(ln_diff_v) > 3:
-                resid_log = ln_diff_v - (ln_A + slope * tx_v)
-                sigma_log = float(np.std(resid_log))
-                ax.fill_between(tx_line,
-                                ln_line - sigma_log,
-                                ln_line + sigma_log,
-                                color=color, alpha=0.12,
-                                label=f'±1σ (log) = {sigma_log:.3f}')
+                # ── residual band (95% CI and 95% PI) ────────────────────────
+                if len(ln_diff_v) > 3:
+                    from scipy import stats
+                    
+                    N_pts = len(tx_v)
+                    df = N_pts - 2
+                    
+                    # Critical t-value for 95% interval (two-tailed)
+                    t_crit = stats.t.ppf(0.975, df)
+                    
+                    # Calculate residual variance (sigma^2)
+                    resid_log = ln_diff_v - (ln_A + slope * tx_v)
+                    sigma2_res = np.sum(resid_log ** 2) / df
+                    
+                    # Calculate mean and sum of squared differences for x
+                    mean_tx = np.mean(tx_v)
+                    ss_tx = np.sum((tx_v - mean_tx) ** 2)
+                    
+                    # Prevent division by zero if all x values are identical
+                    if ss_tx == 0:
+                        ss_tx = 1e-15
+                        
+                    # 1. Confidence Interval Variance (Uncertainty of the Mean Line)
+                    var_line = sigma2_res * (1.0 / N_pts + (tx_line - mean_tx) ** 2 / ss_tx)
+                    se_line = np.sqrt(var_line)
+                    
+                    # 2. Prediction Interval Variance (Uncertainty of Future Points)
+                    # Adds +1.0 to account for the inherent variance of individual points
+                    var_pred = sigma2_res * (1.0 + 1.0 / N_pts + (tx_line - mean_tx) ** 2 / ss_tx)
+                    se_pred = np.sqrt(var_pred)
+                    
+                    # Calculate upper and lower bounds
+                    ci_upper = ln_line + t_crit * se_line
+                    ci_lower = ln_line - t_crit * se_line
+                    
+                    pi_upper = ln_line + t_crit * se_pred
+                    pi_lower = ln_line - t_crit * se_pred
 
-            ax.set_title(titles[model], fontsize=11)
-            ax.set_xlabel(x_labels[model], fontsize=10)
-            ax.set_ylabel(y_label_template, fontsize=10)
-            ax.legend(fontsize=8)
-            ax.grid(True, alpha=0.3)
+                    # Plot PI Band first (Wider, more transparent)
+                    ax.fill_between(tx_line,
+                                    pi_lower,
+                                    pi_upper,
+                                    color=color, alpha=0.08,
+                                    label='95% PI Band')
 
-        fig.suptitle(
-            f"{self.y_col} – Linearized Space  [Linearized Fitter]",
-            fontsize=13, y=1.02
-        )
-        plt.tight_layout()
-        plt.show()
+                    # Plot CI Band on top (Narrower, slightly darker)
+                    ax.fill_between(tx_line,
+                                    ci_lower,
+                                    ci_upper,
+                                    color=color, alpha=0.2,
+                                    label='95% CI Band')
+
+                ax.set_title(titles[model], fontsize=11)
+                ax.set_xlabel(x_labels[model], fontsize=10)
+                ax.set_ylabel(y_label_template, fontsize=10)
+                ax.legend(fontsize=8)
+                ax.grid(True, alpha=0.3)
+
+            fig.suptitle(
+                f"{self.y_col} – Linearized Space  [Linearized Fitter]",
+                fontsize=13, y=1.02
+            )
+            plt.tight_layout()
+            plt.show()
