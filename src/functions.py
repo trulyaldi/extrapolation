@@ -275,7 +275,7 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
             ax_full.plot(x_plot, y_plot, '-', color=colors[model], linewidth=2, alpha=0.8, label=labels[model])
             ax_full.axhline(C, color=colors[model], linestyle='--', alpha=0.3)
             
-            # Draw Uncertainty Band
+            # Draw Uncertainty Band for C
             ax_full.fill_between([fitter.x_min, fitter.x_max * 1.5], 
                                  C - sigma, C + sigma, 
                                  color=colors[model], alpha=0.1)
@@ -318,7 +318,7 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
             ax_zoom.plot(x_plot, y_plot, '-', color=colors[model], linewidth=2, alpha=0.8, label=labels[model])
             ax_zoom.axhline(C, color=colors[model], linestyle='--', alpha=0.3)
             
-            # Draw Uncertainty Band
+            # Draw Uncertainty Band for C
             ax_zoom.fill_between([fitter.x_min, fitter.x_max * 1.5], 
                                  C - sigma, C + sigma, 
                                  color=colors[model], alpha=0.1)
@@ -348,7 +348,7 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
         ax_zoom.grid(True, alpha=0.3)
 
         # =======================================================
-        # Right Panels (Cols 2, 3, 4): Linearized Space
+        # Right Panels (Cols 2, 3, 4): Linearized Space (with 95% CI & PI)
         # =======================================================
         for model in ['exponential', 'sqrt_exponential', 'power_law']:
             ax_log = ax_log_axes[model]
@@ -388,11 +388,49 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
             ax_log.plot(tx_line, ln_line, '-', color=color, linewidth=2, 
                         label=f'Fit (R²={r2:.5f})\nB={B:.4f}')
             
+            # ── 95% Confidence and Prediction Interval Bands ──────────
             if len(ln_diff_v) > 3:
+                from scipy import stats
+                
+                df_log = n_pts - 2
+                
+                # Critical t-value for 95% interval
+                t_crit = stats.t.ppf(0.975, df_log)
+                
+                # Calculate residual variance
                 resid_log = ln_diff_v - (ln_A + slope * tx_v)
-                sigma_log = float(np.std(resid_log))
-                ax_log.fill_between(tx_line, ln_line - sigma_log, ln_line + sigma_log,
-                                    color=color, alpha=0.12, label=f'±1σ (log) = {sigma_log:.3f}')
+                sigma2_res = np.sum(resid_log ** 2) / df_log
+                
+                # Calculate mean and sum of squared differences for x
+                mean_tx = np.mean(tx_v)
+                ss_tx = np.sum((tx_v - mean_tx) ** 2)
+                
+                if ss_tx == 0:
+                    ss_tx = 1e-15
+                    
+                # 1. Confidence Interval Variance (Uncertainty of the Mean Line)
+                var_line = sigma2_res * (1.0 / n_pts + (tx_line - mean_tx) ** 2 / ss_tx)
+                se_line = np.sqrt(var_line)
+                
+                # 2. Prediction Interval Variance (Uncertainty of Future Points)
+                var_pred = sigma2_res * (1.0 + 1.0 / n_pts + (tx_line - mean_tx) ** 2 / ss_tx)
+                se_pred = np.sqrt(var_pred)
+                
+                # 95% CI Bounds
+                ci_upper = ln_line + t_crit * se_line
+                ci_lower = ln_line - t_crit * se_line
+
+                # 95% PI Bounds
+                pi_upper = ln_line + t_crit * se_pred
+                pi_lower = ln_line - t_crit * se_pred
+
+                # Plot PI Band first (Wider, more transparent)
+                ax_log.fill_between(tx_line, pi_lower, pi_upper,
+                                    color=color, alpha=0.08, label='95% PI Band')
+
+                # Plot CI Band on top (Narrower, slightly darker)
+                ax_log.fill_between(tx_line, ci_lower, ci_upper,
+                                    color=color, alpha=0.2, label='95% CI Band')
 
             ax_log.set_title(titles_log[model], fontsize=11)
             ax_log.set_xlabel(x_labels_log[model], fontsize=10)
