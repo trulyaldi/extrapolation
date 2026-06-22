@@ -1,15 +1,26 @@
 from scipy.optimize import least_squares, lsq_linear
-from sklearn.linear_model import HuberRegressor
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.stats import kendalltau
 
 
 class VarProLinearized:
 
-    # ------------------------------------------------------------------
-    # Construction
-    # ------------------------------------------------------------------
+    def _determine_direction(self):
+        """
+        A < 0  ⇔  sequence increases toward its limit  ⇔  positive trend.
+        From the model y = C + A·φ(x), φ>0 decreasing: sign(slope) = −sign(A),
+        so a positive rank correlation between x and y means A < 0.
+
+        Kendall's tau reads trend from concordant-vs-discordant pair counts:
+        it uses only the ordering of points, not magnitudes, so noise cannot
+        flip it and no weight, threshold, or tuned loss is required.
+
+        Returns True if increasing (A < 0), matching self.is_increasing.
+        """
+        tau, _ = kendalltau(self.raw_x, self.raw_y)
+        return tau > 0
 
     def __init__(self, df, x_col, y_col, err_df=None, inf_df=None,
                  b_init=None, n_fit=None, use_energy_b=False):
@@ -49,18 +60,8 @@ class VarProLinearized:
         self.raw_x = x_fit
         self.raw_y = (y_fit - self.y_min) / self.y_range
 
-       
-        huber = HuberRegressor()
-        denom = self.raw_x.max() - self.raw_x.min()
-        x_norm = (self.raw_x - self.raw_x.min()) / (denom if denom > 0 else 1.0)
-        
-        # Create weights based on basis size (x^2 strongly prefers the asymptote)
-        weights = self.raw_x ** 3
-        weights = weights / weights.max()  # Normalize weights to avoid numerical overflow
-        
-        # Fit using all points, but with physical weighting
-        huber.fit(x_norm.reshape(-1, 1), self.raw_y, sample_weight=weights)
-        self.is_increasing = huber.coef_[0] > 0
+
+        self.is_increasing = self._determine_direction()
 
         # ── fixed B (None = free optimisation) ───────────────────────────
         self.fixed_b      = float(b_init) if b_init is not None else None
@@ -575,6 +576,7 @@ class VarProLinearized:
             # Var(ln pred) = Var(ln A) + tx² · Var(B) - 2·tx·Cov(ln A, B)
             var_z = var_ln_A + (tx_v ** 2) * var_B - 2.0 * tx_v * cov_lnA_B
             se_z  = np.sqrt(np.maximum(var_z, 0.0))   # guard against tiny negatives
+            # print(f'SE_Z: {se_z}')
 
             P_nom   = np.exp(np.log(np.abs(A)) - B * tx_v)
             P_upper = P_nom * np.exp( se_z)
@@ -588,7 +590,7 @@ class VarProLinearized:
             # ── 6. Store results ─────────────────────────────────────────────
             res['sigma_C_plus']  = sigma_C_plus
             res['sigma_C_minus'] = sigma_C_minus
-            res['sigma_C']       = float(np.mean([sigma_C_plus, sigma_C_minus]))
+            res['sigma_C']       = float(np.min([sigma_C_plus, sigma_C_minus]))
             res['sigma_mc']      = res['sigma_C']
             res['sigma_B']       = float(np.sqrt(var_B))
             res['sigma_ln_A']    = float(np.sqrt(var_ln_A))
