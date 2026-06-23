@@ -3,27 +3,18 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.stats import kendalltau
+from scipy.optimize import minimize_scalar, brentq
 
 
 class VarProLinearized:
 
     def _determine_direction(self):
-        """
-        A < 0  ⇔  sequence increases toward its limit  ⇔  positive trend.
-        From the model y = C + A·φ(x), φ>0 decreasing: sign(slope) = −sign(A),
-        so a positive rank correlation between x and y means A < 0.
 
-        Kendall's tau reads trend from concordant-vs-discordant pair counts:
-        it uses only the ordering of points, not magnitudes, so noise cannot
-        flip it and no weight, threshold, or tuned loss is required.
-
-        Returns True if increasing (A < 0), matching self.is_increasing.
-        """
         tau, _ = kendalltau(self.raw_x, self.raw_y)
         return tau > 0
 
     def __init__(self, df, x_col, y_col, err_df=None, inf_df=None,
-                 b_init=None, n_fit=None, use_energy_b=False):
+                 b_init=None, n_fit=None, use_energy_b=True):
 
         x_all = df[x_col].values.astype(float)
         y_all = df[y_col].values.astype(float)
@@ -81,17 +72,7 @@ class VarProLinearized:
     # ------------------------------------------------------------------
 
     def _make_tx(self, model_type):
-        """
-        Return the predictor variable used in the linearized regression.
 
-        For basis phi(t) = f(t, B) with t = x / x_max:
-
-            exponential      : f = exp(-B * t)          → tx = t
-            sqrt_exponential : f = exp(-B * sqrt(t))    → tx = sqrt(t)
-            power_law        : f = t^(-B)               → tx = ln(t)
-
-        In each case  ln(y - C) = ln(A) + slope * tx  with slope = -B.
-        """
         t = self.raw_x / self.x_max
         if model_type == 'exponential':
             return t
@@ -223,128 +204,179 @@ class VarProLinearized:
         return r2_log, intercept, slope, True
 
 
-    def _search_C(self, tx, fixed_b=None, n_coarse=1250, n_fine=1000, window=5, r2_epsilon=0.01):
-        y = self.raw_y
+    def _search_C(self, tx, fixed_b=None, n_coarse=1250, xtol=1e-15, polish=True):
 
-        # --- THE FIX: Tail-Extreme Anchoring ---
-        # Anchor to the extreme (max/min) of the chronological tail instead of the median.
-        # This guarantees the candidate asymptote C starts strictly OUTSIDE the final 
-        # data points, meaning C - y > 0 for all tail points and none are dropped.
+        y = self.raw_y
+    
+        # --- anchor on the chronological-tail extreme (unchanged) --------------
         n_tail    = max(3, len(y) // 5)
         tail_vals = y[-n_tail:]
-        
-        if self.is_increasing:
-            y_bound = float(np.max(tail_vals))
-        else:
-            y_bound = float(np.min(tail_vals))
-
+        y_bound   = (float(np.max(tail_vals)) if self.is_increasing
+                    else float(np.min(tail_vals)))
+    
         y_range    = max(float(y.max() - y.min()), 1e-10)
         tail_noise = max(float(np.std(tail_vals)), 1e-10)
-
-        # Added a 1e-12 floor to dist_min to prevent log(0) domain errors 
-        # on perfectly smooth synthetic data where tail_noise might approach 0.
-        dist_min = max(tail_noise * 1e-3, 1e-12)
-        
-        # Expanded upper bound to 10x to avoid truncating slowly decaying curves
-        dist_max = y_range * 10.0
-
-        # log_dists spans ~4 decades. n_coarse=1000 yields ~250 pts/decade.
-        log_dists = np.logspace(np.log10(dist_min), np.log10(dist_max), n_coarse)
-
-        if self.is_increasing:
-            C_grid = y_bound + log_dists
-        else:
-            C_grid = y_bound - log_dists
-
-        r2_grid = np.full(n_coarse, -np.inf)
-
-        # ── 1. Coarse Pass ──────────────────────────────────────────────
-        for i, C_cand in enumerate(C_grid):
-            r2, intercept, slope, valid = self._fit_for_C(C_cand, tx, fixed_b)
-            if valid:
-                r2_grid[i] = r2
-
-        # ── 2. Find and Filter Local Maxima ────────────────────────────
+        dist_min   = max(tail_noise * 1e-3, 1e-12)
+        dist_max   = y_range
+    
+        dists  = np.logspace(np.log10(dist_min), np.log10(dist_max), n_coarse)
+        s_grid = np.log(dists)                        # natural-log distance coord.
+    
+        def C_of_s(s):
+            d = np.exp(s)
+            return (y_bound + d) if self.is_increasing else (y_bound - d)
+    
+        # live "best ever" tracker: (r2, C, intercept, slope) -- the safety net
+        self._best_C_track = (-np.inf, C_of_s(s_grid[0]), 0.0, 0.0)
+        PENALTY = 1e30
+    
+        def neg_r2(s):                                # scalar objective for Brent
+            r2, intercept, slope, valid = self._fit_for_C(C_of_s(s), tx, fixed_b)
+            if not valid:
+                return PENALTY
+            if r2 > self._best_C_track[0]:
+                self._best_C_track = (r2, C_of_s(s), intercept, slope)
+            return -r2
+    
+        # --- 1. coarse pass: ONE vectorised evaluation over the whole grid -----
+        C_grid       = C_of_s(s_grid)
+        tx_full_span = float(tx.max() - tx.min())
+        r2_grid      = self._coarse_scan(C_grid, tx, fixed_b, tx_full_span)
+    
+        # seed the tracker with the coarse-best point (exact lstsq coeffs)
+        if np.any(np.isfinite(r2_grid)):
+            bi = int(np.argmax(np.where(np.isfinite(r2_grid), r2_grid, -np.inf)))
+            r2b, icb, slb, vb = self._fit_for_C(C_grid[bi], tx, fixed_b)
+            if vb:
+                self._best_C_track = (r2b, C_grid[bi], icb, slb)
+    
+        # --- 2. rank up to 3 strongest local maxima ----------------------------
         local_maxima = [
             i for i in range(1, n_coarse - 1)
             if r2_grid[i] > r2_grid[i - 1]
             and r2_grid[i] > r2_grid[i + 1]
-            and r2_grid[i] > -np.inf
+            and np.isfinite(r2_grid[i])
         ]
-
         if local_maxima:
-            local_maxima = sorted(local_maxima, key=lambda idx: r2_grid[idx], reverse=True)[:3]
-        elif np.any(r2_grid > -np.inf):
-            local_maxima = [int(np.argmax(r2_grid))]
+            local_maxima = sorted(local_maxima, key=lambda j: r2_grid[j],
+                                reverse=True)[:3]
+        elif np.any(np.isfinite(r2_grid)):
+            finite = np.where(np.isfinite(r2_grid), r2_grid, -np.inf)
+            local_maxima = [int(np.argmax(finite))]
         else:
-            return (-np.inf, C_grid[0], 0.0, 0.0)
-
-        best = (-np.inf, C_grid[0], 0.0, 0.0)
-        evaluated_intervals = []
-
-        # ── 3. Fine Pass ────────────────────────────────────────────────
+            return self._best_C_track            # nothing valid anywhere
+    
+        # --- 3. Brent refinement (+ optional derivative polish) per peak --------
         for idx in local_maxima:
-            peak_r2 = r2_grid[idx]
-            
-            lo_idx = idx
-            last_good = idx
-            patience = 2
-            while lo_idx > 0:
-                lo_idx -= 1
-                val = r2_grid[lo_idx]
-                if val >= peak_r2 - r2_epsilon:
-                    last_good = lo_idx
-                    patience = 2
-                elif val == -np.inf and patience > 0:
-                    patience -= 1
-                else:
-                    lo_idx = last_good
-                    break
-            else:
-                lo_idx = last_good
-                    
-            hi_idx = idx
-            last_good = idx
-            patience = 2
-            while hi_idx < n_coarse - 1:
-                hi_idx += 1
-                val = r2_grid[hi_idx]
-                if val >= peak_r2 - r2_epsilon:
-                    last_good = hi_idx
-                    patience = 2
-                elif val == -np.inf and patience > 0:
-                    patience -= 1
-                else:
-                    hi_idx = last_good
-                    break
-            else:
-                hi_idx = last_good
-
-            lo_idx = min(lo_idx, max(0, idx - window))
-            hi_idx = max(hi_idx, min(n_coarse - 1, idx + window))
-
-            if any(lo <= hi_idx and lo_idx <= hi for lo, hi in evaluated_intervals):
+            lo = max(idx - 1, 0)
+            hi = min(idx + 1, n_coarse - 1)
+            s_lo, s_mid, s_hi = s_grid[lo], s_grid[idx], s_grid[hi]
+    
+            if not (s_lo < s_mid < s_hi):        # boundary/degenerate bracket
+                neg_r2(s_mid)
                 continue
-                
-            evaluated_intervals.append((lo_idx, hi_idx))
+    
+            try:
+                res = minimize_scalar(
+                    neg_r2,
+                    bracket=(s_lo, s_mid, s_hi),
+                    method='brent',
+                    options={'xtol': xtol, 'maxiter': 500},
+                )
+                s_star = float(res.x)
+            except Exception:
+                s_star = s_mid
+    
+            if polish:
+                s_star = self._polish_s(neg_r2, s_star, s_lo, s_hi)
+    
+            neg_r2(s_star)
+    
+        return self._best_C_track
+    
+    
+    def _polish_s(self, neg_r2, s0, s_lo, s_hi):
 
-            fine_dists = np.logspace(
-                np.log10(log_dists[lo_idx]),
-                np.log10(log_dists[hi_idx]),
-                n_fine
-            )
-            
-            if self.is_increasing:
-                C_fine = y_bound + fine_dists
-            else:
-                C_fine = y_bound - fine_dists
+        f = lambda s: -neg_r2(s)                 # = +r2 (the quantity to maximise)
+        h = max(abs(s0), 1.0) * (np.finfo(float).eps ** (1.0 / 3.0))
+    
+        def g(s):                                # dr2/ds via central difference
+            fp, fm = f(s + h), f(s - h)
+            if fp <= -1e29 or fm <= -1e29:       # stepped into an invalid region
+                return np.nan
+            return (fp - fm) / (2.0 * h)
+    
+        a = max(s0 - 4.0 * h, s_lo)
+        b = min(s0 + 4.0 * h, s_hi)
+        if not (a < b):
+            return s0
+        try:
+            ga, gb = g(a), g(b)
+            if np.isfinite(ga) and np.isfinite(gb) and ga * gb < 0.0:
+                return float(brentq(g, a, b, xtol=1e-15, maxiter=200))
+        except Exception:
+            pass
+        return s0
+    
+    def _coarse_scan(self, C_grid, tx, fixed_b, tx_full_span):
 
-            for C_cand in C_fine:
-                r2, intercept, slope, valid = self._fit_for_C(C_cand, tx, fixed_b)
-                if valid and r2 > best[0]:
-                    best = (r2, C_cand, intercept, slope)
-
-        return best
+        y = self.raw_y                                       # (N,)
+        M = C_grid.shape[0]
+    
+        if self.is_increasing:
+            diff = C_grid[:, None] - y[None, :]              # (M, N)
+        else:
+            diff = y[None, :] - C_grid[:, None]
+    
+        valid = diff > 0.0
+        w     = valid.astype(np.float64)
+        n     = w.sum(axis=1)                                # valid count per row
+        txb   = np.broadcast_to(tx, diff.shape)              # (M, N) view
+    
+        # per-row valid tx-span (span guard + min-slope range)
+        tx_hi = np.where(valid, txb, -np.inf).max(axis=1)
+        tx_lo = np.where(valid, txb,  np.inf).min(axis=1)
+        tx_valid_span = np.where(n > 1, tx_hi - tx_lo, 0.0)
+    
+        # ln(diff) on valid entries only; 0 elsewhere (weight removes them)
+        ld = np.log(np.where(valid, diff, 1.0))
+        ld = np.where(valid, ld, 0.0)
+    
+        # masked regression sums
+        Sx  = (txb * w).sum(axis=1)
+        Sxx = (txb * txb * w).sum(axis=1)
+        Sy  = ld.sum(axis=1)
+        Sxy = (txb * ld).sum(axis=1)
+        Syy = (ld * ld).sum(axis=1)
+    
+        nsafe = np.where(n > 0, n, 1.0)
+        Sxx_c = Sxx - Sx * Sx / nsafe                        # Σ(tx-mean)^2 (valid)
+        Syy_c = Syy - Sy * Sy / nsafe                        # Σ(ld-mean)^2 (valid)
+        Sxy_c = Sxy - Sx * Sy / nsafe
+    
+        ok = (n >= 2) & (tx_valid_span >= 0.5 * tx_full_span) & (Sxx_c > 0.0)
+    
+        if fixed_b is None:
+            slope     = np.divide(Sxy_c, Sxx_c, out=np.zeros(M), where=ok)
+            tx_range  = np.maximum(tx_hi - tx_lo, 1e-12)
+            min_slope = -1e-3 / tx_range
+            ok        = ok & (slope <= min_slope)            # free-b slope guard
+            good      = ok & (Syy_c > 1e-15)
+            r2_vals   = np.divide(Sxy_c * Sxy_c, Sxx_c * Syy_c,
+                                out=np.zeros(M), where=good)
+            r2 = np.where(ok, np.where(Syy_c > 1e-15, r2_vals, 0.0), -np.inf)
+        else:
+            slope     = -float(fixed_b)
+            intercept = np.divide(Sy - slope * Sx, nsafe, out=np.zeros(M), where=ok)
+            # SS_res = Σ(ld - intercept - slope*tx)^2  expanded via the masked sums
+            ss_res = (Syy + n * intercept * intercept + slope * slope * Sxx
+                    - 2.0 * intercept * Sy - 2.0 * slope * Sxy
+                    + 2.0 * intercept * slope * Sx)
+            good    = ok & (Syy_c > 1e-15)
+            r2_vals = 1.0 - np.divide(ss_res, Syy_c, out=np.ones(M), where=good)
+            r2 = np.where(ok, np.where(Syy_c > 1e-15, r2_vals, 0.0), -np.inf)
+    
+        return r2
     # ------------------------------------------------------------------
     # Helper to classify property types for B vs B/2 scaling
     # ------------------------------------------------------------------
@@ -403,7 +435,7 @@ class VarProLinearized:
                 inf_df      = None,
                 b_init      = None,        
                 n_fit       = self._n_fit,
-                use_energy_b= False,       
+                use_energy_b= True,       
             )
             _energy_results = _energy_fitter.fit_linearized(
                 models  = models,
@@ -524,83 +556,89 @@ class VarProLinearized:
     # ------------------------------------------------------------------
     # Uncertainty quantification (B-Boundary Error Propagation)
     # ------------------------------------------------------------------
-    def compute_uncertainty(self):
-        if not self.results:
-            raise RuntimeError("No results found. Run fit_linearized() first.")
+    def compute_uncertainty(self, tail_frac=0.5, k_cov=1.0,
+                                q=0.84, floor_frac=0.3,
+                                use_PI=True, robust_scale=True):
+            if not self.results:
+                raise RuntimeError("No results found. Run fit_linearized() first.")
 
-        for model, res in self.results.items():
-            self.model_type = model
+            for model, res in self.results.items():
+                self.model_type = model
+                B, A, C = res['B'], res['A'], res['C']
+                tx = self._make_tx(model)
 
-            # ── 1. Load parameters ───────────────────────────────────────────
-            B  = res['B']
-            A  = res['A']
-            C  = res['C']
-            tx = self._make_tx(model)
+                diff  = (C - self.raw_y) if self.is_increasing else (self.raw_y - C)
+                valid = diff > 0
+                tx_v, diff_v = tx[valid], diff[valid]
+                Nv = len(tx_v)
 
-            # ── 2. Filter to valid log-space points (direction-aware) ────────
-            # Mirrors _fit_for_C and plot_log: only points where (y - C) is
-            # on the correct side of the asymptote have a defined log value.
-            diff  = (C - self.raw_y) if self.is_increasing else (self.raw_y - C)
-            valid = diff > 0
+                if Nv < 3:
+                    fb = float(np.max(np.abs(np.diff(self.raw_y))))
+                    # FIXED: Added missing keys to prevent downstream KeyErrors
+                    res.update(dict(sigma_C=fb, sigma_mc=fb,
+                                    sigma_C_plus=fb, sigma_C_minus=fb, 
+                                    sigma_B=0.0, sigma_ln_A=0.0, 
+                                    sigma_log=0.0, corr_CB=0.0))
+                    continue
 
-            tx_v   = tx[valid]
-            diff_v = diff[valid]
-            N_v    = len(tx_v)
+                ln_diff_v   = np.log(diff_v)
+                ln_pred_v   = np.log(np.abs(A)) - B * tx_v
+                residuals_v = ln_diff_v - ln_pred_v
 
-            if N_v < 3:
-                fallback = float(np.max(np.abs(np.diff(self.raw_y))))
-                res.update({
-                    'sigma_C':       fallback,
-                    'sigma_mc':      fallback,
-                    'sigma_C_plus':  fallback,
-                    'sigma_C_minus': fallback,
-                    'sigma_B':       0.0,
-                })
-                continue
+                # (Channel 2) robust log-residual scale: pre-asymptotic bias -> not noise
+                if robust_scale:
+                    mad = np.median(np.abs(residuals_v - np.median(residuals_v)))
+                    sigma2_res = (1.4826 * mad) ** 2
+                else:
+                    sigma2_res = np.sum(residuals_v ** 2) / (Nv - 2)
 
-            # ── 3. Log-space residuals using only valid points ───────────────
-            ln_diff_v    = np.log(diff_v)                       # log(|y - C|), valid only
-            ln_pred_v    = np.log(np.abs(A)) - B * tx_v        # fitted log curve at tx_v
-            residuals_v  = ln_diff_v - ln_pred_v
+                X_v      = np.column_stack((np.ones(Nv), -tx_v))
+                # FIXED: Using pinv adds protection against near-singular matrix errors
+                cov_beta = sigma2_res * np.linalg.pinv(X_v.T @ X_v)
+                var_ln_A, var_B, cov_lnA_B = cov_beta[0,0], cov_beta[1,1], cov_beta[0,1]
 
-            # ── 4. Covariance matrix of [ln A, B] over valid DOF ────────────
-            sigma2_res = np.sum(residuals_v ** 2) / (N_v - 2)
-            X_v        = np.column_stack((np.ones(N_v), -tx_v))
-            cov_beta   = sigma2_res * np.linalg.inv(X_v.T @ X_v)
+                # confidence (mean) variance + (use_PI) prediction term
+                var_fit = var_ln_A + (tx_v**2)*var_B - 2.0*tx_v*cov_lnA_B
+                var_z   = var_fit + (sigma2_res if use_PI else 0.0)
+                se_z    = np.sqrt(np.maximum(var_z, 0.0))
 
-            var_ln_A   = cov_beta[0, 0]
-            var_B      = cov_beta[1, 1]
-            cov_lnA_B  = cov_beta[0, 1]
+                P_nom   = np.exp(np.log(np.abs(A)) - B * tx_v)
+                d_plus  = P_nom * (1.0 - np.exp(-k_cov * se_z))   # Lower curve error boundary delta
+                d_minus = P_nom * (np.exp( k_cov * se_z) - 1.0)   # Upper curve error boundary delta
 
-            # ── 5. Log-space error propagation over valid points only ────────
-            # Var(ln pred) = Var(ln A) + tx² · Var(B) - 2·tx·Cov(ln A, B)
-            var_z = var_ln_A + (tx_v ** 2) * var_B - 2.0 * tx_v * cov_lnA_B
-            se_z  = np.sqrt(np.maximum(var_z, 0.0))   # guard against tiny negatives
-            # print(f'SE_Z: {se_z}')
+                # (Channel 1) aggregate over the ASYMPTOTIC region only (largest tx)
+                order  = np.argsort(tx_v)
+                n_tail = max(3, int(np.ceil(tail_frac * Nv)))
+                tail   = order[-n_tail:]
+                
+                # FIXED: Added direction-aware mapping logic
+                if self.is_increasing:
+                    # y = C - P => C = y + P. Upper fluctuation (d_minus) pushes C upwards.
+                    sigma_C_plus  = float(np.quantile(d_minus[tail], q))
+                    sigma_C_minus = float(np.quantile(d_plus[tail],  q))
+                else:
+                    # y = C + P => C = y - P. Upper fluctuation (d_minus) pulls C downwards.
+                    sigma_C_plus  = float(np.quantile(d_plus[tail],  q))
+                    sigma_C_minus = float(np.quantile(d_minus[tail], q))
 
-            P_nom   = np.exp(np.log(np.abs(A)) - B * tx_v)
-            P_upper = P_nom * np.exp( se_z)
-            P_lower = P_nom * np.exp(-se_z)
+                # conservative side
+                sigma_C = max(sigma_C_plus, sigma_C_minus)
 
-            # Upper curve ↑  →  C pulled down  →  sigma_C_minus
-            # Lower curve ↓  →  C pulled up    →  sigma_C_plus
-            sigma_C_minus = float(np.mean(P_upper - P_nom))
-            sigma_C_plus  = float(np.mean(P_nom   - P_lower))
+                # floor at a fraction of the remaining extrapolation correction
+                i_conv    = int(np.argmax(tx))                # most-converged data point
+                remaining = abs(C - self.raw_y[i_conv])
+                sigma_C   = max(sigma_C, floor_frac * remaining)
 
-            # ── 6. Store results ─────────────────────────────────────────────
-            res['sigma_C_plus']  = sigma_C_plus
-            res['sigma_C_minus'] = sigma_C_minus
-            res['sigma_C']       = float(np.min([sigma_C_plus, sigma_C_minus]))
-            res['sigma_mc']      = res['sigma_C']
-            res['sigma_B']       = float(np.sqrt(var_B))
-            res['sigma_ln_A']    = float(np.sqrt(var_ln_A))
-            res['sigma_log']     = float(np.sqrt(sigma2_res))
-            res['corr_CB']       = float(
-                cov_lnA_B / (np.sqrt(var_ln_A) * np.sqrt(var_B))
-                if var_ln_A > 0 and var_B > 0 else 0.0
-            )
-
-        return self.results
+                res.update(dict(
+                    sigma_C_plus=sigma_C_plus, sigma_C_minus=sigma_C_minus,
+                    sigma_C=sigma_C, sigma_mc=sigma_C,
+                    sigma_B=float(np.sqrt(var_B)),
+                    sigma_ln_A=float(np.sqrt(var_ln_A)),
+                    sigma_log=float(np.sqrt(sigma2_res)),
+                    # FIXED: Added np.sqrt around var_B to maintain mathematical validity
+                    corr_CB=float(cov_lnA_B / (np.sqrt(var_ln_A) * np.sqrt(var_B)) if var_ln_A > 0 and var_B > 0 else 0.0),
+                ))
+            return self.results
 
     def plot(self, truth_val=None):
         if truth_val is None:

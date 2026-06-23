@@ -165,10 +165,6 @@ def fit_all_log(main_df, main_inf_df=None, main_df_err=None):
 
 
 def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df=None, skip_cols=None, n_fit=None, save_pdf=None):
-    """
-    Fits all expectation value columns in a dataframe using VarProLinearized 
-    and plots an N x 5 grid (Full View, Zoomed Tail, and 3 Linearized Space plots).
-    """
     if skip_cols is None:
         skip_cols = []
         
@@ -198,17 +194,13 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
     print(f"Fitting {N} columns for {formatted_name}...")
     for y_col in y_cols:
         fitter = VarProLinearized(
-            df=df, x_col=x_col, y_col=y_col, 
+            df=df, x_col=x_col, y_col=y_col,
             err_df=err_df, inf_df=inf_df, n_fit=n_fit,
-            use_energy_b=True  # Ensure B and B/2 logic is applied
+            use_energy_b=True
         )
-        # ENABLE compute_uq=True
         fitter.fit_linearized(compute_uq=True, verbose=False)
         fitters.append(fitter)
 
-    # -----------------------------------------------------------
-    # Setup the N x 5 Plot
-    # -----------------------------------------------------------
     colors = {
         'exponential':      'blue',
         'sqrt_exponential': 'orange',
@@ -219,7 +211,6 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
         'sqrt_exponential': r'SqrtExp($e^{-B\sqrt{x}}$)',
         'power_law':        r'Power($x^{-B}$)',
     }
-    
     x_labels_log = {
         'exponential':      r'$x \;/\; x_{\max}$',
         'sqrt_exponential': r'$\sqrt{x \;/\; x_{\max}}$',
@@ -234,17 +225,16 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
     fig, axes = plt.subplots(nrows=N, ncols=5, figsize=(28, 5 * N), squeeze=False)
     fig.suptitle(formatted_name, fontsize=24, fontweight='bold')
 
-    for idx, fitter in enumerate(fitters):
+    for idx, fitter in enumerate(fitters):  # ← everything below is inside this loop
         y_col = fitter.y_col
         ax_full = axes[idx, 0]
         ax_zoom = axes[idx, 1]
-        
         ax_log_axes = {
-            'exponential': axes[idx, 2],
+            'exponential':      axes[idx, 2],
             'sqrt_exponential': axes[idx, 3],
-            'power_law': axes[idx, 4]
+            'power_law':        axes[idx, 4],
         }
-        
+
         if not fitter.results:
             ax_full.text(0.5, 0.5, f"Fit failed for {y_col}", ha='center', va='center')
             continue
@@ -255,7 +245,7 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
             return fitter.y_min + fitter.y_range * np.asarray(y_sc, dtype=float)
 
         y_data = unscale(fitter.raw_y)
-        
+
         # =======================================================
         # Left Panel (Col 0): Full View
         # =======================================================
@@ -265,30 +255,39 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
             C_sc   = res['C']
             sig_sc = res.get('sigma_mc', 0.0)
             C      = float(unscale(C_sc))
-            sigma  = float(fitter.y_range * sig_sc)  # Unscale uncertainty
-            
-            x_plot  = np.linspace(fitter.x_min, fitter.x_max * 1.5, 200)
-            t_plot  = x_plot / fitter.x_max
-            phi_p   = fitter._compute_basis(res['B'], t_plot)
-            y_plot  = unscale(C_sc + res['A'] * phi_p[:, 1])
+            sigma  = float(fitter.y_range * sig_sc)
+
+            x_plot = np.linspace(fitter.x_min, fitter.x_max * 1.5, 200)
+            t_plot = x_plot / fitter.x_max
+            phi_p  = fitter._compute_basis(res['B'], t_plot)
+            y_plot = unscale(C_sc + res['A'] * phi_p[:, 1])
 
             ax_full.plot(x_plot, y_plot, '-', color=colors[model], linewidth=2, alpha=0.8, label=labels[model])
             ax_full.axhline(C, color=colors[model], linestyle='--', alpha=0.3)
-            
-            # Draw Uncertainty Band for C
-            ax_full.fill_between([fitter.x_min, fitter.x_max * 1.5], 
-                                 C - sigma, C + sigma, 
+            ax_full.fill_between([fitter.x_min, fitter.x_max * 1.5],
+                                 C - sigma, C + sigma,
                                  color=colors[model], alpha=0.1)
 
+        if inf_df is not None and y_col in inf_df.columns:
+            inf_val = float(inf_df[y_col].iloc[0])
+            err_val = float(err_df[y_col].iloc[0]) if (err_df is not None and y_col in err_df.columns) else 0.0
+            x_band  = [fitter.x_min, fitter.x_max * 1.5]
+            ax_full.axhline(inf_val, color='red', linestyle='--', linewidth=1.5,
+                            alpha=0.7, label='CBS limit', zorder=6)
+            if err_val:
+                ax_full.fill_between(x_band,
+                                     inf_val - err_val, inf_val + err_val,
+                                     color='red', alpha=0.15, label='CBS ± err', zorder=5)
+
         if truth_val is not None:
-            ax_full.axhline(truth_val, color='r', linestyle=':', linewidth=2, label=f'Exact')
+            ax_full.axhline(truth_val, color='r', linestyle=':', linewidth=2, label='Exact')
 
         ax_full.set_title(f"{y_col} - Full View")
         ax_full.set_xlabel("Basis Size")
         ax_full.set_ylabel(y_col)
         ax_full.grid(True, alpha=0.3)
         ax_full.legend(fontsize=9)
-        
+
         # =======================================================
         # Middle Panel (Col 1): Zoomed Tail
         # =======================================================
@@ -308,8 +307,8 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
             C_sc   = res['C']
             sig_sc = res.get('sigma_mc', 0.0)
             C      = float(unscale(C_sc))
-            sigma  = float(fitter.y_range * sig_sc)  # Unscale uncertainty
-            
+            sigma  = float(fitter.y_range * sig_sc)
+
             x_plot = np.linspace(fitter.x_min, fitter.x_max * 1.5, 200)
             t_plot = x_plot / fitter.x_max
             phi_p  = fitter._compute_basis(res['B'], t_plot)
@@ -317,13 +316,10 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
 
             ax_zoom.plot(x_plot, y_plot, '-', color=colors[model], linewidth=2, alpha=0.8, label=labels[model])
             ax_zoom.axhline(C, color=colors[model], linestyle='--', alpha=0.3)
-            
-            # Draw Uncertainty Band for C
-            ax_zoom.fill_between([fitter.x_min, fitter.x_max * 1.5], 
-                                 C - sigma, C + sigma, 
+            ax_zoom.fill_between([fitter.x_min, fitter.x_max * 1.5],
+                                 C - sigma, C + sigma,
                                  color=colors[model], alpha=0.1)
 
-            # Update zoomed bounds to fit uncertainty limits
             y_min_z = min(y_min_z, C - sigma)
             y_max_z = max(y_max_z, C + sigma)
 
@@ -332,8 +328,21 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
                 y_min_z = min(y_min_z, np.min(y_plot[mask_p]))
                 y_max_z = max(y_max_z, np.max(y_plot[mask_p]))
 
+        if inf_df is not None and y_col in inf_df.columns:
+            inf_val = float(inf_df[y_col].iloc[0])
+            err_val = float(err_df[y_col].iloc[0]) if (err_df is not None and y_col in err_df.columns) else 0.0
+            x_band  = [fitter.x_min, fitter.x_max * 1.5]
+            ax_zoom.axhline(inf_val, color='red', linestyle='-', linewidth=1.5,
+                            alpha=0.7, label='CBS limit', zorder=6)
+            if err_val:
+                ax_zoom.fill_between(x_band,
+                                     inf_val - err_val, inf_val + err_val,
+                                     color='red', alpha=0.15, label='CBS ± err', zorder=5)
+            y_min_z = min(y_min_z, inf_val - err_val)
+            y_max_z = max(y_max_z, inf_val + err_val)
+
         if truth_val is not None:
-            ax_zoom.axhline(truth_val, color='r', linestyle=':', linewidth=2, label=f'Exact')
+            ax_zoom.axhline(truth_val, color='r', linestyle='--', linewidth=2, label='Exact')
             y_min_z = min(y_min_z, truth_val)
             y_max_z = max(y_max_z, truth_val)
 
@@ -348,88 +357,72 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
         ax_zoom.grid(True, alpha=0.3)
 
         # =======================================================
-        # Right Panels (Cols 2, 3, 4): Linearized Space (with 95% CI & PI)
+        # Right Panels (Cols 2, 3, 4): Linearized Space
         # =======================================================
-        for model in ['exponential', 'sqrt_exponential', 'power_law']:
+        for model in ['exponential', 'sqrt_exponential', 'power_law']:  # ← sibling of Full/Zoom, NOT inside if
             ax_log = ax_log_axes[model]
             if model not in fitter.results:
                 continue
-                
+
             res = fitter.results[model]
             fitter.model_type = model
             color = colors[model]
-            
+
             B, C, A = res['B'], res['C'], res['A']
             tx = fitter._make_tx(model)
-            
+
             if fitter.is_increasing:
                 diff = C - fitter.raw_y
             else:
                 diff = fitter.raw_y - C
 
             valid = diff > 0
-            tx_v = tx[valid]
+            tx_v      = tx[valid]
             ln_diff_v = np.log(diff[valid])
-            
+
             n_pts = len(tx_v)
             ax_log.scatter(tx_v, ln_diff_v, color=color, s=40, zorder=4, label=f'Data ({n_pts} pts)')
-            
+
             n_invalid = int(np.sum(~valid))
             if n_invalid:
-                ax_log.scatter(tx[~valid], np.full(n_invalid, ln_diff_v.min() if len(ln_diff_v) else 0),
-                               color='red', marker='x', s=50, zorder=5, label=f'Invalid (y≤C): {n_invalid}')
-            
-            ln_A = np.log(abs(A)) if abs(A) > 1e-15 else 0.0
+                ax_log.scatter(tx[~valid],
+                               np.full(n_invalid, ln_diff_v.min() if len(ln_diff_v) else 0),
+                               color='red', marker='x', s=50, zorder=5,
+                               label=f'Invalid (y≤C): {n_invalid}')
+
+            ln_A  = np.log(abs(A)) if abs(A) > 1e-15 else 0.0
             slope = -B
             tx_line = np.linspace(tx_v.min() if n_pts else 0, tx_v.max() if n_pts else 1, 200)
             ln_line = ln_A + slope * tx_line
-            
+
             r2 = res.get('r2_linearized', float('nan'))
-            ax_log.plot(tx_line, ln_line, '-', color=color, linewidth=2, 
+            ax_log.plot(tx_line, ln_line, '-', color=color, linewidth=2,
                         label=f'Fit (R²={r2:.5f})\nB={B:.4f}')
-            
-            # ── 95% Confidence and Prediction Interval Bands ──────────
+
             if len(ln_diff_v) > 3:
                 from scipy import stats
-                
-                df_log = n_pts - 2
-                
-                # Critical t-value for 95% interval
-                t_crit = stats.t.ppf(0.975, df_log)
-                
-                # Calculate residual variance
-                resid_log = ln_diff_v - (ln_A + slope * tx_v)
+
+                df_log     = n_pts - 2
+                t_crit     = stats.t.ppf(0.975, df_log)
+                resid_log  = ln_diff_v - (ln_A + slope * tx_v)
                 sigma2_res = np.sum(resid_log ** 2) / df_log
-                
-                # Calculate mean and sum of squared differences for x
-                mean_tx = np.mean(tx_v)
-                ss_tx = np.sum((tx_v - mean_tx) ** 2)
-                
+                mean_tx    = np.mean(tx_v)
+                ss_tx      = np.sum((tx_v - mean_tx) ** 2)
                 if ss_tx == 0:
                     ss_tx = 1e-15
-                    
-                # 1. Confidence Interval Variance (Uncertainty of the Mean Line)
+
                 var_line = sigma2_res * (1.0 / n_pts + (tx_line - mean_tx) ** 2 / ss_tx)
-                se_line = np.sqrt(var_line)
-                
-                # 2. Prediction Interval Variance (Uncertainty of Future Points)
                 var_pred = sigma2_res * (1.0 + 1.0 / n_pts + (tx_line - mean_tx) ** 2 / ss_tx)
-                se_pred = np.sqrt(var_pred)
-                
-                # 95% CI Bounds
-                ci_upper = ln_line + t_crit * se_line
-                ci_lower = ln_line - t_crit * se_line
+                se_line  = np.sqrt(var_line)
+                se_pred  = np.sqrt(var_pred)
 
-                # 95% PI Bounds
-                pi_upper = ln_line + t_crit * se_pred
-                pi_lower = ln_line - t_crit * se_pred
-
-                # Plot PI Band first (Wider, more transparent)
-                ax_log.fill_between(tx_line, pi_lower, pi_upper,
+                ax_log.fill_between(tx_line,
+                                    ln_line - t_crit * se_pred,
+                                    ln_line + t_crit * se_pred,
                                     color=color, alpha=0.08, label='95% PI Band')
-
-                # Plot CI Band on top (Narrower, slightly darker)
-                ax_log.fill_between(tx_line, ci_lower, ci_upper,
+                ax_log.fill_between(tx_line,
+                                    ln_line - t_crit * se_line,
+                                    ln_line + t_crit * se_line,
                                     color=color, alpha=0.2, label='95% CI Band')
 
             ax_log.set_title(titles_log[model], fontsize=11)
@@ -440,13 +433,9 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
 
     fig.tight_layout(rect=[0, 0, 1, 0.98])
     fig.subplots_adjust(top=0.95, hspace=0.3)
-    
+
     if save_pdf:
-        if isinstance(save_pdf, str):
-            filename = save_pdf
-        else:
-            filename = f"{system_name}_fits.pdf"
-            
+        filename = save_pdf if isinstance(save_pdf, str) else f"{system_name}_fits.pdf"
         plt.savefig(filename, format='pdf', bbox_inches='tight')
         print(f"Saved plot to {filename}")
 
