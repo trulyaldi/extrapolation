@@ -440,3 +440,209 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
         print(f"Saved plot to {filename}")
 
     plt.show()
+
+
+
+
+def generate_and_fit_synthetic(
+    system_name='synth_random',
+    n_values=18,
+    n_basis=60,
+    basis_start=100,
+    basis_step=100,
+    cbs_basis=16000,
+    convergence_model='mixed',   # 'mixed' | 'exponential' | 'sqrt_exponential' | 'power_law'
+    probs=None,                  # shape probabilities; default = uniform over the 4 kinds
+    annotate_kind=False,         # if True, appends kind to column name: obs_03_bump
+    seed=42,
+    save_pdf=None,               # path string -> save plot as PDF; None -> skip
+    plot=True,                   # False -> build data only, skip fitter/plot
+):
+    """Generate a randomised synthetic convergence dataset and fit/plot it with
+    ``fit_and_plot_system``.
+
+    Purpose: stress-test ``VarProLinearized`` on many varied but realistic
+    convergence curves where the ground truth (asymptote C, amplitude, decay
+    model, shape) is known, so recovered asymptotes and uncertainties can be
+    validated against it.
+
+    Each of ``n_values`` columns converges (in the long run) toward a CBS limit
+    ``C`` via one of three decay families (exponential / sqrt-exponential /
+    power-law) and takes one of four shapes:
+
+      * 'inc'  -- pure monotone increasing  (approaches C from below)
+      * 'dec'  -- pure monotone decreasing  (approaches C from above)
+      * 'bump' -- long-run DECREASING, but rises in the early region then falls
+      * 'dip'  -- long-run INCREASING, but dips in the early region then rises
+
+    All per-column parameters (CBS limit, amplitude, decay rate, noise level,
+    bump geometry, convergence speed) are drawn from physically motivated
+    distributions internally so no tuning knobs are exposed to the caller.
+
+    Returns ``(df_init, df_inf, df_err, df_truth)`` where ``df_truth`` holds
+    per-column ground truth (C, amp, kind, model, B, r6, noise levels) for
+    downstream recovery checks.
+    """
+    rng = np.random.default_rng(seed)
+
+    # ── shape probabilities ────────────────────────────────────────────────────
+    if probs is None:
+        probs = {'inc': 0.25, 'dec': 0.25, 'bump': 0.25, 'dip': 0.25}
+    kinds_pool = list(probs.keys())
+    p = np.asarray([probs[k] for k in kinds_pool], dtype=float)
+    p /= p.sum()
+
+    # ── basis grid ─────────────────────────────────────────────────────────────
+    basis_sizes = np.arange(
+        basis_start, basis_start + n_basis * basis_step, basis_step, dtype=float
+    )
+    x_max = float(basis_sizes[-1])
+    t     = basis_sizes / x_max
+    t0    = float(t[0])
+    t_win = 1.0
+    t_inf = float(cbs_basis) / x_max
+
+    models = ['exponential', 'sqrt_exponential', 'power_law']
+
+    # ── helpers ────────────────────────────────────────────────────────────────
+    def solve_B(model, r6):
+        """Decay rate so the remaining fraction at window-end == r6."""
+        r6 = float(np.clip(r6, 1e-6, 0.5))
+        if model == 'exponential':
+            return -np.log(r6) / (t_win - t0)
+        if model == 'sqrt_exponential':
+            return -np.log(r6) / (np.sqrt(t_win) - np.sqrt(t0))
+        return np.log(r6) / np.log(t0 / t_win)   # power-law
+
+    def decay(model, B, tt):
+        """Basis function: g(tt) -> 0 as tt -> inf."""
+        if model == 'exponential':
+            return np.exp(-B * tt)
+        if model == 'sqrt_exponential':
+            return np.exp(-B * np.sqrt(tt))
+        return tt ** (-B)
+
+    def hnorm(model, B, tt):
+        """Normalised so h(t0) == 1, making |amp| the first-basis offset."""
+        return decay(model, B, tt) / decay(model, B, t0)
+
+    # ── per-column generation ──────────────────────────────────────────────────
+    kinds = rng.choice(kinds_pool, size=n_values, p=p)
+
+    data      = {'basis size': basis_sizes.astype(int)}
+    inf_data  = {'basis size': [int(cbs_basis)]}
+    err_data  = {}
+    truth_rows = []
+
+    for i in range(n_values):
+        kind = str(kinds[i])
+
+        # --- physical parameters (all drawn from the rng) ---------------------
+
+        # CBS limit: span covers typical atomic-observable magnitudes;
+        # avoid |C| < 0.5 so relative amplitude is well-defined.
+        C = float(rng.uniform(-20.0, 20.0))
+        while abs(C) < 0.5:
+            C = float(rng.uniform(-20.0, 20.0))
+
+        # Amplitude: 0.3 %..30 % of |C| (log-uniform), matching real data spread.
+        amp = max(abs(C), 1.0) * 10.0 ** rng.uniform(-2.5, -0.5)
+
+        # Decay family.
+        model = rng.choice(models) if convergence_model == 'mixed' else convergence_model
+
+        # Convergence speed: fraction of amplitude still remaining at window-end.
+        # Log-uniform over [5e-5, 5e-3] keeps signal above the tail noise floor,
+        # matching the 99.7–99.999 % converged regime seen in real Be/Li data.
+        r6 = 10.0 ** rng.uniform(np.log10(5e-5), np.log10(5e-3))
+
+        # Bump/dip geometry: excursion decays 1.5x–3x faster than the main term
+        # and covers 70 %–95 % of the main amplitude so A still wins long-run.
+        bump_rate_mult = rng.uniform(1.5, 3.0)
+        bump_frac      = rng.uniform(0.70, 0.95)
+
+        # Noise: head std = 5 %–20 % of amp, decaying with a random rate so the
+        # tail is always clean (noise_decay drawn from 3–6, so exp(-noise_decay)
+        # gives tail/head ratio ~ 0.002–5e-3 at t=1).
+        noise_frac0 = rng.uniform(0.05, 0.07)
+        noise_decay = rng.uniform(3.0, 4.0)
+        
+
+        # --- build the clean curve --------------------------------------------
+        B      = solve_B(model, r6)
+        B_fast = B * bump_rate_mult
+
+        h_main = hnorm(model, B,      t)
+        h_exc  = hnorm(model, B_fast, t)
+
+        if kind == 'inc':
+            clean    = C - amp * h_main
+            true_dir = 'increasing'
+        elif kind == 'dec':
+            clean    = C + amp * h_main
+            true_dir = 'decreasing'
+        elif kind == 'bump':
+            clean    = C + amp * h_main - amp * bump_frac * h_exc
+            true_dir = 'decreasing'
+        else:  # dip
+            clean    = C - amp * h_main + amp * bump_frac * h_exc
+            true_dir = 'increasing'
+
+        # --- add decaying measurement noise -----------------------------------
+        sigma_t = noise_frac0 * amp * np.exp(-noise_decay * t)
+        y = clean + rng.normal(0.0, sigma_t, size=len(basis_sizes))
+
+        # --- CBS reference point at basis == cbs_basis ------------------------
+        h_inf      = hnorm(model, B,      t_inf)
+        h_inf_fast = hnorm(model, B_fast, t_inf)
+
+        if kind == 'inc':
+            clean_inf = C - amp * h_inf
+        elif kind == 'dec':
+            clean_inf = C + amp * h_inf
+        elif kind == 'bump':
+            clean_inf = C + amp * h_inf - amp * bump_frac * h_inf_fast
+        else:
+            clean_inf = C - amp * h_inf + amp * bump_frac * h_inf_fast
+
+        sigma_tail = noise_frac0 * amp * np.exp(-noise_decay * t_win)
+        cbs_val    = clean_inf + rng.normal(0.0, sigma_tail)
+        err_val    = max(sigma_tail, amp * 1e-9)
+
+        # --- store ------------------------------------------------------------
+        name = f'obs_{i + 1:02d}' + (f'_{kind}' if annotate_kind else '')
+
+        data[name]     = y
+        inf_data[name] = [cbs_val]
+        err_data[name] = [err_val]
+        truth_rows.append({
+            'column': name, 'kind': kind, 'true_dir': true_dir, 'model': model,
+            'C': C, 'amp': amp, 'A_first_offset': float(clean[0] - C),
+            'B': float(B), 'r6': float(r6),
+            'bump_frac': float(bump_frac), 'bump_rate_mult': float(bump_rate_mult),
+            'noise_frac0': float(noise_frac0), 'noise_decay': float(noise_decay),
+            'sigma_head': float(sigma_t[0]), 'sigma_tail': float(sigma_tail),
+        })
+
+    df_init  = pd.DataFrame(data)
+    df_inf   = pd.DataFrame(inf_data)
+    df_err   = pd.DataFrame(err_data)
+    df_truth = pd.DataFrame(truth_rows)
+
+    print(f"[{system_name}] generated {n_values} columns  "
+          f"basis {int(basis_sizes[0])}..{int(basis_sizes[-1])}  "
+          f"(+CBS @ {int(cbs_basis)})")
+    print(f"  shapes : {df_truth['kind'].value_counts().to_dict()}")
+    print(f"  models : {df_truth['model'].value_counts().to_dict()}")
+
+    if plot:
+        fit_and_plot_system(
+            df=df_init,
+            system_name=system_name,
+            x_col='basis size',
+            err_df=df_err,
+            inf_df=df_inf,
+            save_pdf=save_pdf,
+        )
+
+    return df_init, df_inf, df_err, df_truth
