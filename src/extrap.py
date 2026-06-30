@@ -1,6 +1,4 @@
-from scipy.optimize import least_squares, lsq_linear
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.stats import kendalltau
 from scipy.optimize import minimize_scalar, brentq
