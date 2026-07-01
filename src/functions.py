@@ -2,7 +2,6 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
-from extrapolator import VarProIRLS
 from extrap import VarProLinearized
 import re
 
@@ -1117,3 +1116,79 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
         print(f"Saved plot to {filename}")
 
     plt.show()
+
+
+import time
+
+def fit_system_summary(df, system_name, x_col='basis size', err_df=None, inf_df=None,
+                        skip_cols=None, n_fit=None):
+    if skip_cols is None:
+        skip_cols = []
+
+    y_cols = [c for c in df.columns if c != x_col and c not in skip_cols]
+    if not y_cols:
+        print("No columns found to fit!")
+        return pd.DataFrame()
+
+    rows = []
+    t_start = time.perf_counter()
+
+    for y_col in y_cols:
+        t0 = time.perf_counter()
+        fitter = VarProLinearized(
+            df=df, x_col=x_col, y_col=y_col,
+            err_df=err_df, inf_df=inf_df, n_fit=n_fit,
+            use_energy_b=True
+        )
+        fitter.fit_linearized(compute_uq=True, verbose=False)
+        fit_time = time.perf_counter() - t0
+
+        cbs_ref = cbs_err = np.nan
+        if inf_df is not None and y_col in inf_df.columns:
+            cbs_ref = float(inf_df[y_col].iloc[0])
+            if err_df is not None and y_col in err_df.columns:
+                cbs_err = float(err_df[y_col].iloc[0])
+
+        if not fitter.results:
+            rows.append({
+                'system': system_name, 'column': y_col, 'model': None,
+                'A': np.nan, 'B': np.nan, 'C': np.nan, 'sigma_C': np.nan, 'R2': np.nan,
+                'exact': fitter.truth_val, 'cbs_ref': cbs_ref, 'cbs_err': cbs_err,
+                'C_minus_exact': np.nan, 'z_score': np.nan,
+                'fit_time_s': fit_time, 'status': 'fit_failed',
+            })
+            continue
+
+        for model, res in fitter.results.items():
+            C_sc    = res['C']
+            sig_sc  = res.get('sigma_mc', 0.0)
+            C       = fitter.y_min + fitter.y_range * float(C_sc)
+            sigma_C = float(fitter.y_range * sig_sc)
+            A_phys  = float(fitter.y_range * res['A'])
+
+            diff_exact = (C - fitter.truth_val) if fitter.truth_val is not None else np.nan
+            z = diff_exact / sigma_C if (sigma_C and not np.isnan(diff_exact)) else np.nan
+
+            rows.append({
+                'system':        system_name,
+                'column':        y_col,
+                'model':         model,
+                'A':             A_phys,
+                'B':             res['B'],
+                'C':             C,
+                'sigma_C':       sigma_C,
+                'R2':            res.get('r2_linearized', np.nan),
+                'exact':         fitter.truth_val,
+                'cbs_ref':       cbs_ref,
+                'cbs_err':       cbs_err,
+                'C_minus_exact': diff_exact,
+                'z_score':       z,
+                'fit_time_s':    fit_time,
+                'status':        'ok',
+            })
+
+    total_time = time.perf_counter() - t_start
+    summary = pd.DataFrame(rows)
+    print(f"Fitted {len(y_cols)} columns for {system_name} in {total_time:.3f}s "
+          f"({1000*total_time/max(len(y_cols),1):.1f} ms/col)")
+    return summary

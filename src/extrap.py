@@ -526,7 +526,7 @@ class VarProLinearized:
                 print(
                     f"[{model_type:<20}] "
                     f"B={B:12.6f} ({b_tag})  "
-                    f"C_scaled={C:12.8f}  C={C_unscaled:12.8f}  "
+                    f"C_scaled={C:12.15f}  C={C_unscaled:12.15f}  "
                     f"A={A_unscaled:12.6f}  "
                     f"R²(log)={best_r2:.6f}  "
                     f"SSR={ssr:.4e}"
