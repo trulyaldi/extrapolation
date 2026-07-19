@@ -25,3 +25,23 @@ def test_save_result_updates_existing():
     assert updated_id == result_id
     assert result["extrapolated_value"] == -2.0
     assert result["uncertainty"] == 0.2
+
+
+def test_different_models_create_different_results():
+    exp_id = save_result(
+        "PYTEST_MODEL_SYSTEM",
+        "energy",
+        "exp",
+        "demo",
+        -1.0,
+    )
+
+    power_id = save_result(
+        "PYTEST_MODEL_SYSTEM",
+        "energy",
+        "power",
+        "demo",
+        -2.0,
+    )
+
+    assert exp_id != power_id
