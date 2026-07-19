@@ -44,7 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("list", help="list datasets")
 
-    metadata_parser = subparsers.add_parser("metadata", help="inspect dataset provenance and columns")
+    show_parser = subparsers.add_parser("show", help="inspect dataset provenance and columns")
+    show_parser.add_argument("dataset_name")
+    metadata_parser = subparsers.add_parser(
+        "metadata", help="deprecated alias for the show command"
+    )
     metadata_parser.add_argument("dataset_name")
 
     export_parser = subparsers.add_parser("export", help="export one dataset as CSV")
@@ -92,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"schema changed (use --allow-schema-change): {source_path}")
         elif args.command == "list":
             _print_frame(db.list_datasets())
-        elif args.command == "metadata":
+        elif args.command in {"show", "metadata"}:
             metadata = db.get_dataset_metadata(args.dataset_name)
             for key, value in metadata.items():
                 print(f"{key}: {value}")
@@ -100,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Exported: {db.export_dataset(args.dataset_name, args.destination)}")
         elif args.command == "sql":
             _print_frame(db.execute_readonly_sql(args.query))
-    except (DatasetImportError, DatasetValidationError, KeyError, RuntimeError) as error:
+    except (DatasetImportError, DatasetValidationError, KeyError, RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
     return 0

@@ -24,7 +24,7 @@ Initialize and import the repository sources:
 ```bash
 python tools/data_db.py sync
 python tools/data_db.py list
-python tools/data_db.py metadata large-dataset/be_1po
+python tools/data_db.py show large-dataset/be_1po
 ```
 
 The normal synchronization policy is **database-authoritative**.  An unchanged
@@ -43,6 +43,9 @@ python tools/data_db.py sync
 ```
 
 ## Python API
+
+When launched from the repository root, Python supports the following import
+directly; no `PYTHONPATH` adjustment is required:
 
 ```python
 from database import DatasetDatabase

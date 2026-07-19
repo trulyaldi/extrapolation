@@ -2,6 +2,10 @@
 -- It supports the project's differently shaped CSV files without generating a
 -- SQL table for every source file, while reconstructing wide DataFrames in
 -- their original column order.
+-- DuckDB does not support the cascading foreign-key behavior required to
+-- atomically replace or delete a dataset and its cells.  The API therefore
+-- enforces those parent/child relationships in one write transaction; primary
+-- and unique keys below protect every stored identity.
 CREATE TABLE IF NOT EXISTS datasets (
     dataset_name VARCHAR PRIMARY KEY,
     data_role VARCHAR NOT NULL,
