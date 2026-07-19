@@ -38,8 +38,8 @@ def import_reference_values() -> None:
                 VALUES (
                     ?,
                     ?,
-                    CAST(? AS DECIMAL(38, 18)),
-                    CAST(? AS DECIMAL(38, 18)),
+                    CAST(? AS DECIMAL(38, 30)),
+                    CAST(? AS DECIMAL(38, 30)),
                     ?
                 )
                 """,
