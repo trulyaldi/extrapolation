@@ -64,3 +64,29 @@ def test_metadata_round_trip():
 
 def test_get_missing_result_returns_none():
     assert get_result(999999999) is None
+
+
+import pytest
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("system", ""),
+        ("expectation_value", None),
+        ("model", "   "),
+        ("basis_family", ""),
+    ],
+)
+def test_save_result_rejects_empty_identity_fields(field, value):
+    kwargs = {
+        "system": "SYS",
+        "expectation_value": "energy",
+        "model": "exp",
+        "basis_family": "demo",
+        "extrapolated_value": -1.0,
+    }
+    kwargs[field] = value
+
+    with pytest.raises(ValueError):
+        save_result(**kwargs)

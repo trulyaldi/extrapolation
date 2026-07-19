@@ -12,6 +12,17 @@ def save_result(
     uncertainty=None,
     metadata=None,
 ):
+    required = {
+        "system": system,
+        "expectation_value": expectation_value,
+        "model": model,
+        "basis_family": basis_family,
+    }
+
+    for name, value in required.items():
+        if value is None or not str(value).strip():
+            raise ValueError(f"{name} must be non-empty")
+
     metadata_json = json.dumps(metadata) if metadata is not None else None
 
     with get_connection() as con:
