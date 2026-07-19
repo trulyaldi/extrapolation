@@ -386,6 +386,16 @@ class DatasetDatabase:
                 """
             ).fetchdf()
 
+    def schema_versions(self) -> tuple[str, ...]:
+        """Return applied migration identifiers for reproducibility manifests."""
+        with self._read_connection() as connection:
+            return tuple(
+                row[0]
+                for row in connection.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version"
+                ).fetchall()
+            )
+
     def get_dataset_metadata(self, dataset_name: str) -> dict[str, Any]:
         """Return provenance, shape, role, and ordered original column names."""
         dataset_name = _validate_dataset_name(dataset_name)
@@ -464,6 +474,27 @@ class DatasetDatabase:
                 f"{dataset_name!r} is {metadata['data_role']!r}, not an observation dataset"
             )
         return self.load_dataset(dataset_name)
+
+    def load_bundle(
+        self,
+        dataset_name: str,
+        *,
+        error_dataset: str | None = "auto",
+        reference_dataset: str | None = "auto",
+    ):
+        """Load observations and deterministically resolve optional companions.
+
+        The relationship policy lives in :mod:`extrapolation.data`; this thin
+        convenience method keeps SQL and source-data access in this package.
+        """
+        from extrapolation.data import load_dataset_bundle
+
+        return load_dataset_bundle(
+            self,
+            dataset_name,
+            error_dataset=error_dataset,
+            reference_dataset=reference_dataset,
+        )
 
     def add_or_replace_dataset(
         self,

@@ -1,0 +1,14 @@
+study = "be_states"
+datasets = ["large-dataset/be_1po", "large-dataset/be_3po"]
+observables = ["Energy", "MV"]
+
+[fit]
+method = "linearized"
+n_fit = 8
+compute_uq = true
+
+[outputs]
+directory = "outputs/be_states"
+summary_csv = "summary.csv"
+result_json = true
+plots = false

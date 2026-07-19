@@ -1,548 +1,712 @@
-# AGENTS.md
-
 ## Project Purpose
 
-This repository implements asymptotic extrapolation and curve-fitting workflows for computational-science datasets.
+This repository implements asymptotic extrapolation and uncertainty-analysis workflows for computational-science datasets.
 
-The current development priority is to reorganize scientific data scattered across CSV files into a convenient DuckDB-backed data layer.
+The source-data layer is already organized through DuckDB. The current development priority is to make the fitting workflow:
 
-The database is intended to manage **input scientific data**.
+- low friction for interactive use;
+- reusable across notebooks, scripts, and batch studies;
+- reproducible;
+- easy to validate and test;
+- compatible with the existing scientific methodology.
 
-It is not intended to persist extrapolation or fitting results.
+The intended user experience is:
+
+```python
+from extrapolation import fit_dataset
+
+result = fit_dataset(
+    "large-dataset/be_1po",
+    observable="Energy",
+)
+
+result.summary()
+result.plot()
+result.plot_log()
+result.plot_profile()
+```
+
+Do not redesign the scientific extrapolation algorithm unless a specific, tested bug requires it.
 
 ---
 
-## Current Task
+## Current Architecture
 
-Refactor the `new_db` branch so that:
-
-1. CSV datasets are imported into and organized through DuckDB.
-2. Users can inspect, add, update, and delete scientific data comfortably.
-3. Extrapolation code loads data through a small Python database API instead of reading arbitrary CSV files directly.
-4. Existing fitting and uncertainty-quantification behavior remains intact.
-5. Database result-saving logic is removed.
-
-Work directly on the checked-out `new_db` branch.
-
-Do not create or switch to another branch unless explicitly instructed.
-
----
-
-## Critical Architectural Decision
-
-The database is the source-data management layer.
-
-The intended flow is:
+The intended data flow is:
 
 ```text
-CSV files
-    ↓
-database import/synchronization
-    ↓
+CSV/XLS source files
+        ↓
+DatasetDatabase synchronization
+        ↓
 DuckDB scientific-data catalog
-    ↓
+        ↓
 pandas DataFrame
-    ↓
-extrapolation and uncertainty analysis
+        ↓
+validated fit selection
+        ↓
+VarProLinearized numerical engine
+        ↓
+FitResult
+        ↓
+plots, summaries, JSON/CSV reports
 ```
 
-Do not implement this flow:
+The database stores source scientific data. It must not automatically persist every fitting result.
 
-```text
-fit data
-    ↓
-save every fitting result to DuckDB
-```
-
-Fitting functions should return ordinary Python results. Saving reports or fitting outputs is outside the database layer unless explicitly requested later.
+Fitting results should be ordinary Python objects. Optional exported reports, manifests, figures, JSON, or CSV files may be written explicitly by the user.
 
 ---
 
-## Required Cleanup
+## Existing Database Layer
 
-Remove obsolete fitting-result persistence, including any code whose main purpose is to maintain an `extrapolation_results` table.
+Preserve the existing `DatasetDatabase` behavior unless a directly relevant bug is found.
 
-Search the repository for:
+The database layer already supports:
 
-```text
-save_result
-get_result
-list_results
-extrapolation_results
-database.results
-```
+- initialization and migrations;
+- source synchronization;
+- dataset listing;
+- DataFrame loading;
+- value and row modification;
+- export;
+- read-only SQL;
+- database-authoritative synchronization safeguards.
 
-Remove or refactor:
+Do not redesign the schema as part of the fitting-workflow work.
 
-* Result-saving modules.
-* Result-specific SQL migrations.
-* Result-specific indexes.
-* Calls to `save_result(...)` from fitting classes or functions.
-* Tests that exist only to verify result persistence.
-* Dead imports and unused parameters created by this cleanup.
+Do not delete or rewrite existing CSV/XLS source files.
 
-Do not remove fitting calculations, returned fit dictionaries, uncertainty calculations, plots, or report-generation code merely because result persistence is removed.
-
-Before deleting a file, inspect its references across the repository.
+Do not reintroduce fitting-result persistence into DuckDB.
 
 ---
 
-## Data That Must Be Preserved
+## Primary Goal
 
-The CSV directories contain scientific data and should be treated as valuable source material.
+Create one clear, supported fitting workflow that works consistently from:
 
-Likely data locations include:
+- Python scripts;
+- Jupyter notebooks;
+- command-line tools;
+- batch studies;
+- tests.
 
-```text
-large-dataset/
-large-dataset-init/
-large-dataset-err/
-new-dataset/
-small-dataset/
-muon/
-data/
+The fitting API must remove routine boilerplate while preserving access to the lower-level solver for advanced users.
+
+Target high-level API:
+
+```python
+from extrapolation import fit_dataset
+
+result = fit_dataset(
+    dataset="large-dataset/be_1po",
+    observable="Energy",
+)
 ```
 
-Inspect the actual repository rather than assuming every listed directory exists.
+Target project API, only if it remains a thin convenience layer:
 
-Do not delete CSV files solely because their names contain:
+```python
+from extrapolation import ExtrapolationProject
 
-```text
-test
-init
-err
-error
+project = ExtrapolationProject.open()
+
+result = project.fit(
+    dataset="large-dataset/be_1po",
+    observable="Energy",
+)
 ```
 
-Some files with names such as `*_test.csv` may contain real scientific observations or uncertainty rows rather than disposable test fixtures.
-
-Determine file semantics from their contents and how the existing code uses them.
-
-Do not alter original CSV files during the initial refactor.
+Do not create multiple competing high-level APIs. Prefer one canonical function, with any project object delegating to it.
 
 ---
 
-## Database Design Goals
+## Required Work
 
-Use DuckDB as the persistent store.
+### 1. Make the repository installable
 
-The design must support:
+Add or complete `pyproject.toml` using the `src/` layout.
 
-* Multiple scientific datasets.
-* Different CSV column layouts.
-* Dataset names and source-file provenance.
-* Ordered independent-variable values.
-* Multiple expectation-value or observable columns.
-* Missing values.
-* Uncertainty or error data.
-* Reimporting changed CSV files.
-* Querying through SQL when useful.
-* Loading fitting-ready pandas DataFrames.
-* Safe manual modification of database values.
-
-Prefer a simple design that matches the actual data over an abstract enterprise schema.
-
-Avoid introducing unnecessary concepts such as:
-
-* basis-family fields that are not required by the project;
-* user accounts;
-* fitting-result history;
-* generic workflow engines;
-* web APIs;
-* ORM frameworks;
-* distributed database features.
-
----
-
-## Schema Guidance
-
-First inspect every distinct CSV shape.
-
-Then choose the simplest schema that handles those shapes without losing information.
-
-A normalized catalog may contain concepts such as:
-
-```text
-datasets
-source_files
-dataset_columns or properties
-measurements
-uncertainties
-```
-
-A wide-table approach may also be appropriate if it makes editing and DataFrame retrieval substantially simpler.
-
-Do not blindly create one SQL table per CSV before examining naming collisions, schema evolution, and query ergonomics.
-
-Do not blindly force all data into long format if the fitting pipeline constantly needs to reconstruct the original wide DataFrames.
-
-Whichever design is selected, document the tradeoff in the repository.
-
-The database must preserve:
-
-* logical dataset identity;
-* original source path;
-* original column names;
-* numeric values;
-* missing cells;
-* row ordering or independent-variable ordering;
-* whether values are observations, uncertainties, references, or metadata.
-
----
-
-## Import and Synchronization Requirements
-
-Provide one clear entry point for importing the repository’s CSV data.
-
-A command-line interface is preferred, for example:
+The project must support:
 
 ```bash
+python -m pip install -e .
+```
+
+After installation, imports must work from any directory without modifying `sys.path`.
+
+Preferred import style:
+
+```python
+from extrapolation import fit_dataset, FitResult
+from extrapolation.database import DatasetDatabase
+from extrapolation.fitting import VarProLinearized
+```
+
+Avoid requiring:
+
+```python
+from functions import VarProLinearized
+```
+
+Maintain compatibility aliases where practical, but new code and documentation should use package-qualified imports.
+
+Do not rename every file at once if a smaller compatibility-preserving package wrapper is sufficient.
+
+### 2. Implement one canonical `fit_dataset()` function
+
+Add a high-level function whose responsibility is orchestration, not numerical reinvention.
+
+Suggested signature:
+
+```python
+def fit_dataset(
+    dataset: str,
+    observable: str,
+    *,
+    db: DatasetDatabase | None = None,
+    method: str = "linearized",
+    model: str = "auto",
+    n_fit: int | None = None,
+    basis_min: float | None = None,
+    basis_max: float | None = None,
+    use_energy_b: bool | None = None,
+    compute_uq: bool = True,
+    missing: str = "drop",
+    verbose: bool = False,
+) -> FitResult:
+    ...
+```
+
+The exact signature may be adjusted to match actual solver capabilities, but it must remain small and understandable.
+
+The function should:
+
+1. create or reuse `DatasetDatabase`;
+2. load the named dataset;
+3. obtain dataset metadata;
+4. determine the independent-variable column;
+5. resolve related error/reference datasets when available;
+6. validate the requested observable and selected rows;
+7. apply explicit, documented row selection;
+8. instantiate the existing numerical solver;
+9. run the requested existing fitting method;
+10. return a stable `FitResult`.
+
+Do not duplicate the numerical fitting algorithm inside `fit_dataset()`.
+
+Do not put SQL inside numerical fitting classes.
+
+### 3. Add a stable `FitResult`
+
+Create a result type that separates reusable scientific results from solver implementation state.
+
+A dataclass is preferred.
+
+The result should expose, where available:
+
+```python
+result.dataset_name
+result.observable
+result.x_col
+result.method
+result.model
+result.baseline
+result.baseline_uncertainty
+result.confidence_interval
+result.parameters
+result.r_squared
+result.residual_sum_squares
+result.residuals
+result.scan_values
+result.scan_scores
+result.selected_data
+result.metadata
+```
+
+Use names that match the actual scientific meaning in the repository.
+
+Recommended methods:
+
+```python
+result.summary()
+result.to_dict()
+result.to_json(path)
+result.plot()
+result.plot_log()
+result.plot_profile()
+```
+
+Plot methods may delegate to standalone plotting functions.
+
+Do not make plotting required for fitting.
+
+Do not require a live solver object to serialize the scientific result.
+
+If retaining the solver internally is useful for compatibility, keep it optional and excluded from serialization.
+
+### 4. Add dataset bundling and relationship resolution
+
+Remove the need for users to manually load observation, error, and reference DataFrames.
+
+Add a small bundle type or equivalent loader:
+
+```python
+bundle = db.load_bundle("large-dataset/be_1po")
+
+bundle.observations
+bundle.errors
+bundle.reference
+bundle.metadata
+bundle.x_col
+```
+
+If the existing naming conventions can reliably associate files such as:
+
+```text
+large-dataset/be_1po
+large-dataset-err/be_1po_err
+large-dataset-init/be_1po
+```
+
+implement that resolution in one documented location.
+
+Prefer explicit metadata relationships when available.
+
+Naming-convention fallback is acceptable, but it must be deterministic and tested.
+
+A missing related error/reference dataset is not automatically an error. Return `None` when optional data is unavailable.
+
+Do not guess between multiple ambiguous matches. Raise a clear error or require explicit selection.
+
+### 5. Add metadata-driven defaults
+
+Use dataset metadata for stable defaults such as:
+
+- independent-variable column;
+- observable columns;
+- ignored columns;
+- default fitting method;
+- default fit-point count;
+- minimum basis size;
+- optional related error dataset;
+- optional related reference dataset.
+
+Do not hard-code repository-wide assumptions such as `"basis size"` when metadata already provides the correct column.
+
+Explicit user arguments must override metadata defaults.
+
+Fallback behavior must be documented and deterministic.
+
+### 6. Add pre-fit validation
+
+Validate data before entering logarithms, regressions, or uncertainty scans.
+
+Validation should check, as applicable:
+
+- dataset exists;
+- independent-variable column exists;
+- observable exists;
+- selected columns are numeric;
+- enough finite points remain;
+- independent-variable values are valid;
+- duplicate independent-variable values are handled explicitly;
+- row ordering is deterministic;
+- error values are finite and positive;
+- observation and error rows align;
+- reference data has the expected shape;
+- the logarithmic transformation has a feasible domain;
+- the scan range is nonempty;
+- the requested method is supported.
+
+Errors must be actionable.
+
+Prefer:
+
+```text
+Cannot fit observable "Energy" in "large-dataset/be_1po":
+only 2 finite points remain after filtering; at least 3 are required.
+```
+
+Avoid exposing raw NumPy warnings as the primary user-facing failure.
+
+Provide either:
+
+```python
+validate_fit_request(...)
+```
+
+or validation integrated into `fit_dataset()` with a reusable report type.
+
+### 7. Make row selection explicit and reproducible
+
+Any behavior currently hidden in helpers, including minimum basis size or taking the last N rows, must become explicit configuration.
+
+Support a small set of clear options such as:
+
+```python
+fit_dataset(
+    dataset,
+    observable,
+    basis_min=99,
+    basis_max=None,
+    n_fit=6,
+)
+```
+
+Record the effective selection in `FitResult.metadata`.
+
+Do not silently reorder or drop rows without recording what happened.
+
+Default sorting by the independent variable is acceptable if documented.
+
+For missing values, support one documented policy such as:
+
+```python
+missing="drop"
+```
+
+and reject unsupported policies clearly.
+
+### 8. Unify single and batch fitting
+
+All higher-level fitting paths must delegate to the same canonical single-fit implementation.
+
+Implement, or refactor existing helpers toward:
+
+```python
+fit_dataset(...)
+fit_all_observables(...)
+fit_study(...)
+```
+
+Example:
+
+```python
+results = fit_all_observables(
+    "large-dataset/be_1po",
+)
+```
+
+Batch fitting must not contain a second copy of the numerical algorithm.
+
+Existing helpers such as `fit_all_log`, `fit_all_irls`, or plotting/report classes may remain as compatibility wrappers, but their fitting work should eventually delegate to `fit_dataset()`.
+
+Add regression tests proving that direct low-level fitting and high-level fitting agree numerically for representative data.
+
+### 9. Separate fitting from plotting
+
+Numerical fitting must be usable in headless environments.
+
+Recommended separation:
+
+```python
+result = fit_dataset(...)
+plot_fit(result)
+plot_log(result)
+plot_profile(result)
+```
+
+Convenience methods on `FitResult` may call these functions.
+
+Plot functions should:
+
+- return matplotlib `Figure` and `Axes` objects;
+- not call `plt.show()` unconditionally;
+- accept an optional output path;
+- not rerun the fit;
+- use data stored in `FitResult`;
+- preserve current scientific plot meanings.
+
+Do not globally mutate matplotlib style at import time.
+
+### 10. Add a fitting CLI
+
+Add a command-line entry point.
+
+Preferred installed command:
+
+```bash
+extrapolate fit large-dataset/be_1po --observable Energy
+```
+
+A module or script fallback is acceptable:
+
+```bash
+python -m extrapolation.cli fit large-dataset/be_1po --observable Energy
+```
+
+Required behavior:
+
+```bash
+extrapolate data init
+extrapolate data sync
+extrapolate data list
+extrapolate data show large-dataset/be_1po
+
+extrapolate fit large-dataset/be_1po --observable Energy
+extrapolate fit large-dataset/be_1po --all
+```
+
+Useful optional outputs:
+
+```bash
+--json outputs/result.json
+--csv outputs/summary.csv
+--plot-dir outputs/figures
+--verbose
+```
+
+The CLI must call the public Python API rather than reproduce fitting logic.
+
+Keep the existing `tools/data_db.py` working unless intentionally replaced with a documented compatibility wrapper.
+
+### 11. Add reproducible study configuration
+
+Support repeatable multi-dataset runs through a small YAML or TOML configuration.
+
+Example:
+
+```yaml
+study: be_states
+
+datasets:
+  - large-dataset/be_1po
+  - large-dataset/be_3po
+
+observables:
+  - Energy
+  - MV
+
+fit:
+  method: linearized
+  n_fit: 6
+  compute_uq: true
+
+outputs:
+  directory: outputs/be_states
+  summary_csv: summary.csv
+```
+
+Run with a command such as:
+
+```bash
+extrapolate run studies/be_states.yaml
+```
+
+Do not build a generic workflow engine.
+
+Study execution must call the same public fitting functions used interactively.
+
+Configuration parsing must validate unknown keys and malformed values.
+
+### 12. Add run manifests
+
+When users explicitly export a result or study, write a small reproducibility manifest.
+
+Include, when available:
+
+- logical dataset name;
+- source hash or dataset version metadata;
+- observable;
+- independent-variable column;
+- selected row identifiers or range;
+- fitting method;
+- model;
+- numerical options;
+- uncertainty options;
+- package version;
+- database schema version;
+- timestamp;
+- output file list.
+
+Do not automatically store manifests in DuckDB.
+
+Do not require manifests for interactive fitting.
+
+---
+
+## Scientific Methodology That Must Remain Stable
+
+The project uses a hybrid linear/nonlinear parameter-scan approach for asymptotic fitting.
+
+The core behavior includes:
+
+1. scan candidate asymptotic baseline values;
+2. subtract each candidate baseline from the dependent variable;
+3. reject candidates that violate the logarithm domain;
+4. logarithmically linearize the remaining relationship;
+5. perform linear regression;
+6. choose the optimum using the established fit criterion;
+7. quantify baseline uncertainty from profile degradation around the optimum.
+
+Do not replace this with an unrelated nonlinear optimizer.
+
+Do not change scan ranges, numerical tolerances, uncertainty thresholds, parameter meanings, default model interpretation, or result units unless a targeted test demonstrates a bug and the reason is documented.
+
+Use vectorized NumPy/SciPy operations where practical.
+
+Handle invalid logarithm candidates deliberately rather than through uncontrolled warnings.
+
+---
+
+## Public API Design Rules
+
+Prefer a small, discoverable API.
+
+Good:
+
+```python
+result = fit_dataset("large-dataset/be_1po", "Energy")
+```
+
+Avoid requiring users to understand internal constructor details for routine work.
+
+Keep lower-level access available:
+
+```python
+solver = VarProLinearized(...)
+solver.fit_linearized(...)
+```
+
+Use keyword-only arguments for optional fitting controls where practical.
+
+Avoid domain-specific Boolean arguments in new public APIs when a named mode is clearer.
+
+If `use_energy_b` must remain, document it clearly and consider a future named alternative while preserving compatibility.
+
+Do not introduce deeply nested factories, dependency-injection frameworks, registries, or plugin systems.
+
+---
+
+## Compatibility
+
+Preserve current notebooks and scripts where practical.
+
+Use deprecation warnings rather than abrupt removal for commonly used imports or functions.
+
+Compatibility wrappers must be thin and must call the canonical implementation.
+
+Do not maintain two independent code paths indefinitely.
+
+Document changed imports and provide direct replacements.
+
+---
+
+## Testing Requirements
+
+Use temporary directories and temporary DuckDB files.
+
+Do not modify the developer's real database.
+
+Do not require network access.
+
+Add focused tests for packaging, high-level fitting, numerical agreement with the existing solver, metadata defaults, relationship resolution, validation failures, selection behavior, JSON serialization, headless plotting, batch delegation, CLI smoke tests, and study configuration.
+
+Use compact fixtures instead of copying the full production dataset into tests.
+
+---
+
+## Documentation Requirements
+
+Update the README with one clear quick start.
+
+It should include:
+
+```bash
+python -m pip install -e .
+python tools/data_db.py init
 python tools/data_db.py sync
 ```
 
-Equivalent naming is acceptable if it fits the repository.
-
-The import process should:
-
-1. Discover configured CSV files.
-2. Identify the logical dataset represented by each file.
-3. Validate required columns.
-4. Convert valid numeric values safely.
-5. Preserve missing values as SQL `NULL` or the corresponding pandas missing value.
-6. Import all data in a transaction.
-7. Report malformed files clearly.
-8. Avoid silently discarding cells.
-9. Avoid duplicating unchanged data on repeated runs.
-10. make reimport behavior explicit.
-
-Prefer deterministic, idempotent imports.
-
-Using file hashes or modification metadata to skip unchanged sources is acceptable.
-
-Do not silently reinterpret an existing dataset when its schema changes.
-
----
-
-## Database Modification Requirements
-
-The pipeline must make the database comfortable to modify.
-
-Provide a small, documented Python API for common operations.
-
-The intended style is similar to:
+Then:
 
 ```python
-from database import DatasetDatabase
+from extrapolation import fit_dataset
 
-db = DatasetDatabase()
+result = fit_dataset(
+    "large-dataset/be_1po",
+    observable="Energy",
+)
 
-db.list_datasets()
-db.load_dataset("large-dataset/be_1po")
-db.update_value(...)
-db.insert_row(...)
-db.delete_row(...)
-db.export_dataset(...)
+print(result.summary())
+result.plot()
 ```
 
-The exact class and method names may differ.
+Document the role of source files and DuckDB, dataset discovery, single and batch fitting, study runs, exports, lower-level solver access, automatic related-dataset association, and metadata overrides.
 
-At minimum, users must be able to:
-
-* list datasets;
-* inspect dataset metadata;
-* load a dataset as a pandas DataFrame;
-* add or replace a dataset;
-* update a value;
-* add a row;
-* delete a row;
-* delete a dataset;
-* export a dataset to CSV;
-* execute read-only SQL for advanced inspection.
-
-Write operations must use transactions.
-
-Validate dataset names, column names, and numeric values.
-
-Do not build SQL statements by directly interpolating untrusted values.
-
-Identifiers that cannot be parameterized must be strictly validated or safely quoted.
+Keep examples runnable.
 
 ---
 
-## Source Synchronization and Manual Edits
+## Implementation Order
 
-Resolve the interaction between CSV reimport and manual database edits explicitly.
+1. inspect the current package, fitting helpers, plotting code, tests, and notebooks;
+2. establish `pyproject.toml` and package imports;
+3. add `FitResult`;
+4. add dataset bundle/relationship resolution;
+5. add validation and explicit row selection;
+6. implement canonical `fit_dataset()`;
+7. make plotting consume `FitResult`;
+8. refactor batch helpers to delegate to `fit_dataset()`;
+9. add CLI;
+10. add study configuration and manifests;
+11. update documentation;
+12. run tests and smoke tests;
+13. inspect the final diff for unrelated changes.
 
-Do not implement a system where a routine synchronization silently destroys database corrections.
+Keep each logical change reviewable.
 
-Choose and document one of these policies:
-
-### Database-authoritative policy
-
-After initial import, the database becomes authoritative. Reimport is an explicit replacement operation.
-
-### Override policy
-
-Imported source values remain separate from manual overrides, and effective values combine the two.
-
-### Explicit conflict policy
-
-Synchronization detects database modifications and requires an explicit conflict-resolution option.
-
-Prefer the simplest policy that remains safe and understandable.
-
-Include tests for the selected behavior.
+Do not perform broad formatting unrelated to this work.
 
 ---
 
-## Fitting API Integration
+## Validation Commands
 
-The fitting layer should receive pandas DataFrames or NumPy arrays.
+At minimum, attempt:
 
-Database-specific SQL should remain inside the database package.
-
-Preferred separation:
-
-```text
-database package
-    loads and modifies data
-
-fitting package
-    fits supplied data
-
-application or notebook
-    selects a dataset and connects the two
+```bash
+python -m pip install -e .
+python -m pytest
+python -m compileall src
 ```
 
-Avoid placing SQL queries directly inside numerical fitting classes.
+Run a fresh-database smoke test in a temporary location and a representative high-level fit for `large-dataset/be_1po`, observable `Energy`.
 
-Adapt existing helpers such as `upload_basis` and `upload_error` only when necessary for compatibility.
+Run CLI smoke tests using the final supported syntax.
 
-A transitional wrapper is acceptable:
+Use a noninteractive matplotlib backend for automated plot tests.
 
-```python
-def upload_basis(dataset_name):
-    return database.load_observations(dataset_name)
-```
-
-New code should use clearly named database loading methods.
+Do not claim success for commands that were not executed.
 
 ---
 
-## Extrapolation Behavior That Must Remain Unchanged
+## Code Quality
 
-Preserve the scientific fitting methodology unless a bug is directly encountered.
+Prefer small functions, dataclasses for value objects, public type hints, explicit exceptions, `pathlib.Path`, deterministic behavior, pandas/NumPy interoperability, narrow module responsibilities, one canonical fitting path, and portable serialization.
 
-The project uses a hybrid linear/nonlinear parameter scan:
-
-1. Scan candidate asymptotic baseline values.
-2. Subtract each candidate baseline from the dependent variable.
-3. Reject candidates that make the logarithm invalid.
-4. Apply logarithmic linearization.
-5. Run ordinary least-squares regression.
-6. Select the baseline according to the configured residual or fit-quality criterion.
-7. Quantify uncertainty from degradation of the profile around the optimum.
-
-Do not replace this approach with an unrelated nonlinear optimizer.
-
-Do not change numerical defaults, scan ranges, uncertainty thresholds, or result meanings without documenting the reason and adding targeted tests.
-
-Use vectorized NumPy or SciPy operations where practical.
-
-Handle logarithm-domain errors explicitly.
+Avoid hidden global database connections, SQL inside numerical solvers, duplicated fitting implementations, import-time side effects, mutable defaults, silent row dropping, silent guessing, automatic fit persistence, and unnecessary framework abstractions.
 
 ---
 
-## Repository Inspection Before Editing
+## Scope Control
 
-Before implementing changes:
+Do not redesign the DuckDB schema, redesign the core mathematics, delete source files, rewrite all notebooks, create a GUI or web service, introduce cloud infrastructure or an ORM, build a generic workflow engine, store every fit in DuckDB, rename the whole repository, or perform unrelated cleanup.
 
-1. Run:
+Make the smallest coherent implementation that creates a polished, reusable fitting workflow.
+
+---
+
+## Git Safety
+
+Before editing:
 
 ```bash
 git status --short
 git branch --show-current
 ```
 
-2. Confirm the current branch is:
-
-```text
-new_db
-```
-
-3. Inspect:
-
-```text
-README files
-requirements files
-pyproject.toml or setup files
-src/
-sql/
-tests/
-tools/
-notebooks
-CSV directories
-```
-
-4. Search all references to database modules and result persistence.
-
-5. Inspect representative files from every distinct CSV format.
-
-6. Identify existing test commands before changing code.
-
-Do not assume the ZIP bundle or any prior generated patch is authoritative. Work from the repository’s current contents.
-
----
-
-## Implementation Order
-
-Use this order unless repository evidence requires a small adjustment:
-
-1. Map CSV formats and existing data-loading behavior.
-2. Map current database files, migrations, and APIs.
-3. Remove fitting-result persistence.
-4. Design the minimum viable source-data schema.
-5. Implement database initialization and migration.
-6. Implement CSV import and synchronization.
-7. Implement query and modification APIs.
-8. Integrate DataFrame loading with the fitting pipeline.
-9. Add focused tests.
-10. Add concise usage documentation.
-11. Run validation.
-12. Review the final diff for unrelated changes.
-
-Keep commits or logical change groups easy to review.
-
----
-
-## Testing Requirements
-
-Add focused automated tests for:
-
-* database creation from an empty state;
-* migration from the current branch state where practical;
-* importing at least one representative CSV shape;
-* importing files with missing values;
-* importing observations and uncertainty/error data;
-* repeated import without duplication;
-* loading a fitting-ready DataFrame;
-* updating a value;
-* inserting and deleting a row;
-* persistence of manual edits under the chosen synchronization policy;
-* deletion or replacement of a dataset;
-* absence of result-saving calls from the fitting path;
-* SQL parameter safety for user-provided values.
-
-Use temporary directories and temporary DuckDB files in tests.
-
-Do not write tests against the developer’s real database.
-
-Do not require network access.
-
-Do not duplicate the complete production CSV collection inside test fixtures. Use compact representative fixtures.
-
----
-
-## Validation Commands
-
-Discover and use the repository’s real commands.
-
-Likely checks may include:
-
-```bash
-python -m pytest
-python -m compileall src
-```
-
-Also run the new import CLI against the repository data when safe.
-
-Example:
-
-```bash
-python tools/data_db.py sync
-python tools/data_db.py list
-```
-
-If a command cannot be run because of a missing dependency or environment issue, report the exact failure.
-
-Do not claim tests passed unless they were executed successfully.
-
----
-
-## Documentation Requirements
-
-Add concise documentation covering:
-
-* what the database stores;
-* what it deliberately does not store;
-* schema overview;
-* how to initialize the database;
-* how to import or synchronize CSV files;
-* how to list datasets;
-* how to load a pandas DataFrame;
-* how to edit data;
-* how manual edits interact with CSV reimport;
-* how to export data;
-* how fitting code accesses database data;
-* how to rebuild a disposable local database.
-
-Include runnable command examples.
-
-Do not write extensive generic database tutorials.
-
----
-
-## Code Quality
-
-Follow the repository’s existing Python style.
-
-Prefer:
-
-* small functions;
-* type hints on public APIs;
-* explicit transactions;
-* context managers;
-* `pathlib.Path`;
-* parameterized SQL;
-* descriptive error messages;
-* pandas and NumPy interoperability;
-* deterministic behavior;
-* narrow module responsibilities.
-
-Avoid:
-
-* hidden global database connections;
-* import-time schema mutation;
-* mutable default arguments;
-* broad `except Exception` blocks without context;
-* duplicated SQL across modules;
-* implicit deletion during synchronization;
-* needless abstraction layers.
-
----
-
-## Scope Control
-
-Do not:
-
-* redesign the mathematical extrapolation algorithm;
-* rename every existing module;
-* rewrite all notebooks;
-* introduce a GUI;
-* introduce a server;
-* add cloud database infrastructure;
-* persist every fitting run;
-* modify scientific input data without explicit justification;
-* delete files based only on their names;
-* perform unrelated formatting across the repository.
-
-Make the smallest coherent refactor that establishes the new database direction.
-
----
-
-## Git Safety
-
-Do not discard existing uncommitted user changes.
+Do not discard uncommitted user changes.
 
 Do not run:
 
@@ -552,41 +716,50 @@ git clean -fd
 git checkout -- .
 ```
 
-Do not force-push.
+Do not force-push or amend existing commits unless explicitly requested.
 
-Do not amend existing commits unless explicitly asked.
+Do not commit generated databases, plots, manifests, caches, or temporary study outputs unless explicitly intended.
 
-Do not commit generated database files unless the repository already intentionally tracks them.
+---
 
-Generated local files such as these should normally be ignored:
+## Completion Criteria
 
-```text
-*.duckdb
-*.duckdb.wal
-*.db
-__pycache__/
-.pytest_cache/
+The task is complete only when a fresh user can install, initialize, synchronize, and then run:
+
+```python
+from extrapolation import fit_dataset
+
+result = fit_dataset(
+    "large-dataset/be_1po",
+    observable="Energy",
+)
+
+result.summary()
+result.plot()
 ```
 
-Check existing ignore rules before changing `.gitignore`.
+without manually reading CSV files, manually locating related files, modifying `sys.path`, manually wiring DataFrames into the solver, or understanding internal solver constructor details for a routine fit.
+
+The lower-level solver must remain available for expert use.
 
 ---
 
 ## Final Deliverable
 
-At completion, provide:
+At completion, report:
 
-1. A concise explanation of the selected database design.
-2. A list of deleted result-persistence components.
-3. A list of major files added or modified.
-4. Instructions for importing existing CSV data.
-5. Examples for listing, loading, modifying, and exporting datasets.
-6. The selected CSV/manual-edit synchronization policy.
-7. Tests and validation commands executed.
-8. Any remaining limitations or ambiguous source-data formats.
-9. `git status --short`.
-10. A suggested commit message.
+1. final public Python API;
+2. package/import structure;
+3. files added, modified, or removed;
+4. compatibility behavior and deprecations;
+5. dataset relationship-resolution rules;
+6. validation and row-selection behavior;
+7. CLI commands;
+8. study configuration format;
+9. result and manifest export formats;
+10. tests and smoke tests executed;
+11. failures or remaining limitations;
+12. `git status --short`;
+13. a suggested commit message.
 
-Do not merely produce a design document. Implement the refactor in the repository.
-
-Do not report success until the resulting code has been inspected and the available tests have been run.
+Do not return only a design proposal. Implement the workflow, inspect the resulting code, and run the available validation commands.

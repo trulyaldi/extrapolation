@@ -77,6 +77,7 @@ class VarProLinearized:
         # ── state ────────────────────────────────────────────────────────
         self.model_type = None   
         self.results    = {}
+        self.scan_profiles = {}
         print(f' this trend is: {self.is_increasing}')
 
     # ------------------------------------------------------------------
@@ -258,6 +259,13 @@ class VarProLinearized:
         C_grid       = C_of_s(s_grid)
         tx_full_span = float(tx.max() - tx.min())
         r2_grid      = self._coarse_scan(C_grid, tx, fixed_b, tx_full_span)
+        # Retain the already-computed profile for stable, post-fit reporting.
+        # This does not alter the scan or its numerical defaults.
+        if self.model_type is not None:
+            self.scan_profiles[self.model_type] = (
+                C_grid.copy(),
+                r2_grid.copy(),
+            )
     
         # seed the tracker with the coarse-best point (exact lstsq coeffs)
         if np.any(np.isfinite(r2_grid)):

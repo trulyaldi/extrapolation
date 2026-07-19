@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "extrapolation"
+version = "0.1.0"
+description = "DuckDB-backed asymptotic extrapolation workflows"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb==1.5.4",
+    "matplotlib>=3.8",
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+extrapolate = "extrapolation.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["extrap", "functions"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["database*", "extrapolation*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
