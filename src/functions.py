@@ -3,29 +3,32 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 from extrap import VarProLinearized
-from database.results import save_result
+from database import DatasetDatabase
 import re
 
-def upload_df(file_path, start_basis_size = 99):
-  df = pd.read_csv(file_path)
-  df['Basis Size'] = df['Basis Size'].astype(int)
+def load_fit_dataset(dataset_name, start_basis_size=99, db_path=None):
+  """Load an imported observation dataset for fitting without reading CSV files."""
+  db = DatasetDatabase(db_path)
+  metadata = db.get_dataset_metadata(dataset_name)
+  df = db.load_observations(dataset_name)
+  x_col = metadata['independent_column']
+  df[x_col] = pd.to_numeric(df[x_col], errors='raise').astype(int)
+  return df.loc[df[x_col] >= start_basis_size].reset_index(drop=True)
 
-  for i in range(df['Basis Size'].values[0],start_basis_size + 1,100):
-    df.drop(df[df['Basis Size'] == i].index, inplace = True)
 
-  return df
+def upload_df(dataset_name, start_basis_size=99, db_path=None):
+  """Compatibility wrapper for :func:`load_fit_dataset`."""
+  return load_fit_dataset(dataset_name, start_basis_size, db_path)
 
-def upload_basis(file_path):
-  df = pd.read_csv(file_path)
-  df['basis size'] = df['basis size'].astype(int)
 
-  return df[:-1]
+def upload_basis(dataset_name, db_path=None):
+  """Load all but the final row of an imported observation dataset."""
+  return DatasetDatabase(db_path).load_observations(dataset_name).iloc[:-1].copy()
 
-def upload_error(file_path):
-  df = pd.read_csv(file_path)
-  df['basis size'] = df['basis size'].astype(int)
 
-  return df.tail(1)
+def upload_error(dataset_name, db_path=None):
+  """Load the final row from an imported uncertainty dataset."""
+  return DatasetDatabase(db_path).load_dataset(dataset_name).tail(1).copy()
 
 def graph(df: pd.DataFrame, n_cols: int = 4):
     df_plot = df.copy()
@@ -1122,7 +1125,7 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
 import time
 
 def fit_system_summary(df, system_name, x_col='basis size', err_df=None, inf_df=None,
-                        skip_cols=None, n_fit=None, save_to_db=False):
+                        skip_cols=None, n_fit=None):
     if skip_cols is None:
         skip_cols = []
 
@@ -1167,24 +1170,6 @@ def fit_system_summary(df, system_name, x_col='basis size', err_df=None, inf_df=
             sigma_C = float(fitter.y_range * sig_sc)
             A_phys  = float(fitter.y_range * res['A'])
 
-            if save_to_db:
-                save_result(
-                    system=system_name,
-                    expectation_value=y_col,
-                    model=model,
-                    basis_family=x_col,
-                    extrapolated_value=C,
-                    uncertainty=sigma_C,
-                    metadata={
-                        "A": A_phys,
-                        "B": float(res["B"]),
-                        "R2": float(res.get("r2_linearized", np.nan)),
-                        "fit_time_s": fit_time,
-                        "status": "ok",
-                        "scan_config": fitter.scan_config.copy(),
-                        "uq_config": fitter.uq_config.copy(),
-        },
-    )
 
             diff_exact = (C - fitter.truth_val) if fitter.truth_val is not None else np.nan
             z = diff_exact / sigma_C if (sigma_C and not np.isnan(diff_exact)) else np.nan

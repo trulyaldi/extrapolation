@@ -1,14 +1,15 @@
 from pathlib import Path
+from typing import Iterable
 
 import duckdb
 
+from database.connection import DB_PATH, PROJECT_ROOT
 
-ROOT = Path(__file__).resolve().parents[2]
-DB_PATH = ROOT / "data" / "database" / "extrapolation.duckdb"
-SOURCE_FILES = [
-    ROOT / "large-dataset" / "reference_vals.txt",
-    ROOT / "src" / "new_reference_vals.txt",
-]
+
+SOURCE_FILES = (
+    PROJECT_ROOT / "large-dataset" / "reference_vals.txt",
+    PROJECT_ROOT / "src" / "new_reference_vals.txt",
+)
 
 
 def read_rows(path: Path) -> list[tuple[str, str, str, str, str]]:
@@ -21,7 +22,12 @@ def read_rows(path: Path) -> list[tuple[str, str, str, str, str]]:
             if not line.strip():
                 continue
 
-            system, expectation_value, ref_value, uncertainty, source = line.split()
+            parts = line.split()
+            if len(parts) != 5:
+                raise ValueError(
+                    f"{path}: expected five whitespace-delimited values on line {len(rows) + 2}"
+                )
+            system, expectation_value, ref_value, uncertainty, source = parts
             rows.append(
                 (system, expectation_value, ref_value, uncertainty, source)
             )
@@ -29,9 +35,20 @@ def read_rows(path: Path) -> list[tuple[str, str, str, str, str]]:
     return rows
 
 
-def import_reference_values() -> None:
-    with duckdb.connect(str(DB_PATH)) as connection:
-        for source_file in SOURCE_FILES:
+def import_reference_values(
+    db_path: Path | str = DB_PATH,
+    source_files: Iterable[Path] = SOURCE_FILES,
+) -> int:
+    """Import bundled reference values without overwriting catalog entries.
+
+    Reference data are input values, not extrapolation outputs.  ``INSERT OR
+    IGNORE`` preserves an existing catalog value if this command is repeated.
+    The destination database must already be initialized.
+    """
+    rows = [row for source_file in source_files for row in read_rows(source_file)]
+    with duckdb.connect(str(db_path)) as connection:
+        connection.execute("BEGIN TRANSACTION")
+        try:
             connection.executemany(
                 """
                 INSERT OR IGNORE INTO reference_values
@@ -43,8 +60,14 @@ def import_reference_values() -> None:
                     ?
                 )
                 """,
-                read_rows(source_file),
+                rows,
             )
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+        else:
+            connection.execute("COMMIT")
+    return len(rows)
 
 
 if __name__ == "__main__":

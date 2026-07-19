@@ -2,12 +2,11 @@
 # small-dataset/
 __pycache__/
 *.pyc
+.pytest_cache/
 .venv/
 .codex
 .claude/
 
-.venv/
-
-data/database/*.duckdb
-
-data/database/*.duckdb
+*.duckdb
+*.duckdb.wal
+*.db

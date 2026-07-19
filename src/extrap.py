@@ -3,7 +3,6 @@ import matplotlib.pyplot as plt
 from scipy.stats import kendalltau
 from scipy.optimize import minimize_scalar, brentq
 
-
 class VarProLinearized:
 
     def _determine_direction(self):
@@ -567,7 +566,7 @@ class VarProLinearized:
 
         if compute_uq and self.results:
             self.compute_uncertainty()
-            
+
         return self.results
 
     # ------------------------------------------------------------------
