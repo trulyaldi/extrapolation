@@ -1,17 +1,13 @@
-from pathlib import Path
 import duckdb
 
-db_path = Path("data/database/extrapolation.duckdb")
-db_path.parent.mkdir(parents=True, exist_ok=True)
+from database.connection import DB_PATH, PROJECT_ROOT
 
-con = duckdb.connect(str(db_path))
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+migration_dir = PROJECT_ROOT / "sql" / "migrations"
 
-migration_dir = Path("sql/migrations")
+with duckdb.connect(str(DB_PATH)) as con:
+    for migration in sorted(migration_dir.glob("*.sql")):
+        print(f"Applying {migration.name}...")
+        con.execute(migration.read_text())
 
-for migration in sorted(migration_dir.glob("*.sql")):
-    print(f"Applying {migration.name}...")
-    con.execute(migration.read_text())
-
-con.close()
-
-print(f"Database initialized: {db_path}")
+print(f"Database initialized: {DB_PATH}")
