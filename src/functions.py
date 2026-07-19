@@ -3,6 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 from extrap import VarProLinearized
+from database.results import save_result
 import re
 
 def upload_df(file_path, start_basis_size = 99):
@@ -1121,7 +1122,7 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
 import time
 
 def fit_system_summary(df, system_name, x_col='basis size', err_df=None, inf_df=None,
-                        skip_cols=None, n_fit=None):
+                        skip_cols=None, n_fit=None, save_to_db=False):
     if skip_cols is None:
         skip_cols = []
 
@@ -1165,6 +1166,23 @@ def fit_system_summary(df, system_name, x_col='basis size', err_df=None, inf_df=
             C       = fitter.y_min + fitter.y_range * float(C_sc)
             sigma_C = float(fitter.y_range * sig_sc)
             A_phys  = float(fitter.y_range * res['A'])
+
+            if save_to_db:
+                save_result(
+                    system=system_name,
+                    expectation_value=y_col,
+                    model=model,
+                    basis_family=x_col,
+                    extrapolated_value=C,
+                    uncertainty=sigma_C,
+                    metadata={
+                        "A": A_phys,
+                        "B": float(res["B"]),
+                        "R2": float(res.get("r2_linearized", np.nan)),
+                        "fit_time_s": fit_time,
+                        "status": "ok",
+        },
+    )
 
             diff_exact = (C - fitter.truth_val) if fitter.truth_val is not None else np.nan
             z = diff_exact / sigma_C if (sigma_C and not np.isnan(diff_exact)) else np.nan
