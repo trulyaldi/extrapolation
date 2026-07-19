@@ -22,9 +22,11 @@ text files without overwriting an existing reference catalog value.
 Initialize and import the repository sources:
 
 ```bash
+python tools/data_db.py init
 python tools/data_db.py sync
 python tools/data_db.py list
 python tools/data_db.py show large-dataset/be_1po
+python tools/data_db.py export large-dataset/be_1po /tmp/be_1po.csv
 ```
 
 The normal synchronization policy is **database-authoritative**.  An unchanged
@@ -45,7 +47,10 @@ python tools/data_db.py sync
 ## Python API
 
 When launched from the repository root, Python supports the following import
-directly; no `PYTHONPATH` adjustment is required:
+directly; no `PYTHONPATH` adjustment is required.  The root-level `database`
+package extends its module search path to `src/database`; the CLI likewise adds
+the repository's `src` directory before importing the implementation.  For
+other entry points, `PYTHONPATH=src python your_script.py` is also supported.
 
 ```python
 from database import DatasetDatabase
