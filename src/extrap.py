@@ -671,7 +671,7 @@ class VarProLinearized:
             C       = float(unscale(C_sc))
             sigma   = float(self.y_range * sig_sc)
             diff_str = f"{abs(C - truth_val):.2e}" if truth_val is not None else "-"
-            print(f"{model:<22} | {C:<17.9f} | {sigma:<20.2e} | {diff_str}")
+            print(f"{model:<22} | {C:<17.15f} | {sigma:<20.2e} | {diff_str}")
 
         # ---- Plot 1: full view ----------------------------------------
         plt.figure(figsize=(12, 7))
