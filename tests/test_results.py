@@ -60,3 +60,7 @@ def test_metadata_round_trip():
     result = get_result(result_id)
 
     assert result["metadata"] == {"r2": 0.999, "n_fit": 4}
+
+
+def test_get_missing_result_returns_none():
+    assert get_result(999999999) is None
