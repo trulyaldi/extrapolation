@@ -161,7 +161,19 @@ def list_results(limit=20):
             [limit],
         ).fetchall()
 
-    return rows
+    return [
+    {
+        "id": row[0],
+        "created_at": row[1],
+        "system": row[2],
+        "expectation_value": row[3],
+        "model": row[4],
+        "basis_family": row[5],
+        "extrapolated_value": row[6],
+        "uncertainty": row[7],
+    }
+    for row in rows
+]
 
 def find_results(system, expectation_value):
     """
@@ -186,4 +198,15 @@ def find_results(system, expectation_value):
             [system, expectation_value],
         ).fetchall()
 
-    return rows
+    return [
+    {
+        "id": row[0],
+        "created_at": row[1],
+        "model": row[2],
+        "basis_family": row[3],
+        "extrapolated_value": row[4],
+        "uncertainty": row[5],
+        "metadata": json.loads(row[6]) if row[6] else None,
+    }
+    for row in rows
+]
