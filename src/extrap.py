@@ -56,6 +56,21 @@ class VarProLinearized:
         self.fixed_b      = float(b_init) if b_init is not None else None
         self.use_energy_b = bool(use_energy_b)
 
+        self.scan_config = {
+        "n_coarse": 1250,
+        "xtol": 1e-15,
+        "polish": True,
+    }
+
+        self.uq_config = {
+            "tail_frac": 0.5,
+            "k_cov": 1.0,
+            "q": 0.84,
+            "floor_frac": 0.3,
+            "use_PI": True,
+            "robust_scale": True,
+    }
+
      
         self._df    = df
         self._n_fit = n_fit
@@ -202,7 +217,11 @@ class VarProLinearized:
         return r2_log, intercept, slope, True
 
 
-    def _search_C(self, tx, fixed_b=None, n_coarse=1250, xtol=1e-15, polish=True):
+    def _search_C(self, tx, fixed_b=None, n_coarse=None, xtol=None, polish=None):
+
+        n_coarse = self.scan_config["n_coarse"] if n_coarse is None else n_coarse
+        xtol = self.scan_config["xtol"] if xtol is None else xtol
+        polish = self.scan_config["polish"] if polish is None else polish
 
         y = self.raw_y
     
@@ -554,9 +573,24 @@ class VarProLinearized:
     # ------------------------------------------------------------------
     # Uncertainty quantification (B-Boundary Error Propagation)
     # ------------------------------------------------------------------
-    def compute_uncertainty(self, tail_frac=0.5, k_cov=1.0,
-                                q=0.84, floor_frac=0.3,
-                                use_PI=True, robust_scale=True):
+    def compute_uncertainty(
+        self,
+        tail_frac=None,
+        k_cov=None,
+        q=None,
+        floor_frac=None,
+        use_PI=None,
+        robust_scale=None,
+    ):
+            tail_frac = self.uq_config["tail_frac"] if tail_frac is None else tail_frac
+            k_cov = self.uq_config["k_cov"] if k_cov is None else k_cov
+            q = self.uq_config["q"] if q is None else q
+            floor_frac = self.uq_config["floor_frac"] if floor_frac is None else floor_frac
+            use_PI = self.uq_config["use_PI"] if use_PI is None else use_PI
+            robust_scale = (
+                self.uq_config["robust_scale"] if robust_scale is None else robust_scale
+            )
+
             if not self.results:
                 raise RuntimeError("No results found. Run fit_linearized() first.")
 

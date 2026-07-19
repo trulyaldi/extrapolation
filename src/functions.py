@@ -1181,6 +1181,8 @@ def fit_system_summary(df, system_name, x_col='basis size', err_df=None, inf_df=
                         "R2": float(res.get("r2_linearized", np.nan)),
                         "fit_time_s": fit_time,
                         "status": "ok",
+                        "scan_config": fitter.scan_config.copy(),
+                        "uq_config": fitter.uq_config.copy(),
         },
     )
 
