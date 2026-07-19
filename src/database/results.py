@@ -56,7 +56,7 @@ def save_result(
             )
         else:
             result_id = con.execute(
-                "SELECT COALESCE(MAX(id), 0) + 1 FROM extrapolation_results"
+                "SELECT nextval('extrapolation_result_id_seq')"
             ).fetchone()[0]
 
             con.execute(
