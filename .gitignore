@@ -9,3 +9,5 @@ __pycache__/
 .venv/
 
 data/database/*.duckdb
+
+data/database/*.duckdb
