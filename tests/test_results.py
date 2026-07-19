@@ -45,3 +45,18 @@ def test_different_models_create_different_results():
     )
 
     assert exp_id != power_id
+
+
+def test_metadata_round_trip():
+    result_id = save_result(
+        "PYTEST_METADATA",
+        "energy",
+        "exp",
+        "demo",
+        -1.5,
+        metadata={"r2": 0.999, "n_fit": 4},
+    )
+
+    result = get_result(result_id)
+
+    assert result["metadata"] == {"r2": 0.999, "n_fit": 4}
