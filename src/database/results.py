@@ -41,7 +41,7 @@ def save_result(
                 """
                 UPDATE extrapolation_results
                 SET
-                    created_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP,
                     extrapolated_value = ?,
                     uncertainty = ?,
                     metadata = ?
@@ -97,6 +97,7 @@ def get_result(result_id):
             SELECT
                 id,
                 created_at,
+                updated_at,
                 system,
                 expectation_value,
                 model,
@@ -116,13 +117,14 @@ def get_result(result_id):
     return {
         "id": row[0],
         "created_at": row[1],
-        "system": row[2],
-        "expectation_value": row[3],
-        "model": row[4],
-        "basis_family": row[5],
-        "extrapolated_value": row[6],
-        "uncertainty": row[7],
-        "metadata": json.loads(row[8]) if row[8] else None,
+        "updated_at": row[2],
+        "system": row[3],
+        "expectation_value": row[4],
+        "model": row[5],
+        "basis_family": row[6],
+        "extrapolated_value": row[7],
+        "uncertainty": row[8],
+        "metadata": json.loads(row[9]) if row[9] else None,
     }
 
 def list_results(limit=20):
