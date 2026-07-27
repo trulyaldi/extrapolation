@@ -4,42 +4,39 @@ from scipy.stats import kendalltau
 from scipy.optimize import minimize_scalar, brentq
 
 
+
 class VarProLinearized:
-
-    def _determine_direction(self):
-
-        tau, _ = kendalltau(self.raw_x, self.raw_y)
-        return tau > 0
-
-    def __init__(self, df, x_col, y_col, err_df=None, inf_df=None,
-                 b_init=None, n_fit=None, use_energy_b=True):
-
-        x_all = df[x_col].values.astype(float)
-        y_all = df[y_col].values.astype(float)
-
-        self.y_col  = y_col
-        self.x_col  = x_col
+    def __init__(self, df, x_col, y_col, err_df=None, inf_df=None, b_init=None, n_fit=None, use_energy_b=True,):
+        self.x_col = x_col
+        self.y_col = y_col
         self.err_df = err_df
+        self._df = df
+        self._n_fit = n_fit
 
-        # ── truth value from inf_df ──────────────────────────────────────
-        if inf_df is not None and y_col in inf_df.columns:
-            self.truth_val = float(inf_df[y_col].iloc[-1])
-        else:
-            self.truth_val = None
+        x_all = df[x_col].to_numpy(dtype=float)
+        y_all = df[y_col].to_numpy(dtype=float)
 
-        # ── y / x scaling uses ALL rows (consistent with VarProIRLS) ────
-        self.y_min   = float(np.min(y_all))
-        self.y_max   = float(np.max(y_all))
+        # Known infinite-limit value, when available.
+        self.truth_val = (
+            float(inf_df[y_col].iloc[-1])
+            if inf_df is not None and y_col in inf_df.columns
+            else None
+        )
+
+        # Scaling is based on all available rows.
+        self.y_min = float(np.min(y_all))
+        self.y_max = float(np.max(y_all))
         self.y_range = self.y_max - self.y_min
-        if self.y_range == 0:
+
+        if self.y_range == 0.0:
             self.y_range = 1.0
 
-        self.x_min   = float(x_all.min())
-        self.x_max   = float(x_all.max())
+        self.x_min = float(np.min(x_all))
+        self.x_max = float(np.max(x_all))
         self.range_x = self.x_max - self.x_min
 
-        # ── select fitting rows ──────────────────────────────────────────
-        if n_fit is not None and n_fit < len(df):
+        # Select rows used for fitting.
+        if n_fit is not None and n_fit < len(x_all):
             x_fit = x_all[:n_fit]
             y_fit = y_all[:n_fit]
         else:
@@ -48,22 +45,23 @@ class VarProLinearized:
 
         self.raw_x = x_fit
         self.raw_y = (y_fit - self.y_min) / self.y_range
-
-
         self.is_increasing = self._determine_direction()
 
-        # ── fixed B (None = free optimisation) ───────────────────────────
-        self.fixed_b      = float(b_init) if b_init is not None else None
+        # None means B will be fitted freely.
+        self.fixed_b = float(b_init) if b_init is not None else None
         self.use_energy_b = bool(use_energy_b)
 
-     
-        self._df    = df
-        self._n_fit = n_fit
+        # Fit state.
+        self.model_type = None
+        self.results = {}
 
-        # ── state ────────────────────────────────────────────────────────
-        self.model_type = None   
-        self.results    = {}
-        print(f' this trend is: {self.is_increasing}')
+        print(f"Trend is increasing: {self.is_increasing}")
+
+    def _determine_direction(self):
+        tau, _ = kendalltau(self.raw_x, self.raw_y)
+        return bool(tau > 0)
+
+
 
     # ------------------------------------------------------------------
     # Linearized predictor variable (depends on model)
@@ -107,6 +105,72 @@ class VarProLinearized:
             return [-np.inf, -np.inf], [np.inf, 0.0]
         else:
             return [-np.inf, 0.0],    [np.inf, np.inf]
+
+    def _get_b_bounds(self):
+        y = self.raw_y
+
+        y_range = float(np.max(y) - np.min(y))
+        sigma   = max(float(np.std(y)), np.finfo(float).eps * float(np.abs(y).max()))
+        snr     = y_range / sigma
+
+        if snr <= 1.0:
+            raise ValueError(f"Data is noise-dominated: SNR={snr:.3f} <= 1.0, cannot constrain b.")
+
+        eps_basis = 1.0 / snr
+
+        tx          = self._make_tx(self.model_type)
+        tx_min      = float(tx.min())
+        tx_max      = float(tx.max())
+        tx_span     = tx_max - tx_min
+
+        if tx_span <= 0:
+            raise ValueError("tx domain has zero span, cannot constrain b.")
+
+        tx_sorted   = np.sort(tx)
+        dtx         = np.diff(tx_sorted)
+        dtx_positive = dtx[dtx > tx_max * np.finfo(float).eps ** 0.5]
+        delta_tx    = float(dtx_positive.min()) if len(dtx_positive) > 0 else tx_span
+
+        b_max = min(
+            -np.log(eps_basis) / delta_tx,
+            -np.log(np.finfo(float).eps) / delta_tx
+        )
+        b_min = -np.log1p(-1.0 / snr) / tx_span
+
+        if b_max <= b_min:
+            raise ValueError(
+                f"b bounds degenerate: b_min={b_min:.3e} >= b_max={b_max:.3e}. "
+                f"SNR={snr:.1f}, delta_tx={delta_tx:.3e}"
+            )
+
+        return b_min, b_max
+
+        # ------------------------------------------------------------------
+    # Helper to classify property types for B vs B/2 scaling
+    # ------------------------------------------------------------------
+    def _is_singular_property(self, col_name):
+        # 1. Force drach_MV to be singular
+        if col_name == 'drach_MV':
+            return True
+            
+        # 2. Make all other drach_ properties nonsingular 
+
+        if 'drach_' in col_name:
+            return False
+            
+        # 3. Standard singular keywords
+        singular_keywords = ['MV', 'delta', 'prval']
+        for kw in singular_keywords:
+            if kw in col_name:
+                return True
+                
+        # 4. Everything else is nonsingular
+        return False
+
+
+    # ------------------------------------------------------------------
+    # Single-C linear fit
+    # ------------------------------------------------------------------
 
     def _get_b_bounds(self):
         y = self.raw_y
@@ -375,27 +439,161 @@ class VarProLinearized:
             r2 = np.where(ok, np.where(Syy_c > 1e-15, r2_vals, 0.0), -np.inf)
     
         return r2
-    # ------------------------------------------------------------------
-    # Helper to classify property types for B vs B/2 scaling
-    # ------------------------------------------------------------------
-    def _is_singular_property(self, col_name):
-        # 1. Force drach_MV to be singular
-        if col_name == 'drach_MV':
-            return True
-            
-        # 2. Make all other drach_ properties nonsingular 
 
-        if 'drach_' in col_name:
-            return False
-            
-        # 3. Standard singular keywords
-        singular_keywords = ['MV', 'delta', 'prval']
-        for kw in singular_keywords:
-            if kw in col_name:
-                return True
+
+    # ------------------------------------------------------------------
+    # Main fitting method
+    # ------------------------------------------------------------------
+
+    def fit_linearized(self, models=None, verbose=False, compute_uq=True, on_iteration=None):
+
+        if models is None:
+            models = ['exponential', 'sqrt_exponential', 'power_law']
+
+        # ── Resolve per-model B from Energy fit if requested ─────────────
+        # energy_b_map: dict[model_type -> float | None]
+        energy_b_map: dict = {m: None for m in models}
+
+        should_use_energy_b = (
+            self.use_energy_b
+            and self.y_col != 'Energy'
+            and 'Energy' in self._df.columns
+        )
+        
+        # Check if the current column is a singular property (needs B/2)
+        is_singular = self._is_singular_property(self.y_col)
+
+        if should_use_energy_b:
+            if verbose:
+                prop_type = "singular (using B/2)" if is_singular else "nonsingular (using B)"
+                print(f"[use_energy_b] Fitting 'Energy' first to derive B "
+                      f"for '{self.y_col}' [{prop_type}] ...")
+
+            _energy_fitter = VarProLinearized(
+                df          = self._df,
+                x_col       = self.x_col,
+                y_col       = 'Energy',
+                err_df      = None,
+                inf_df      = None,
+                b_init      = None,        
+                n_fit       = self._n_fit,
+                use_energy_b= True,       
+            )
+            _energy_results = _energy_fitter.fit_linearized(
+                models  = models,
+                verbose = verbose,
+            )
+
+            for m in models:
+                if m in _energy_results:
+                    energy_b = float(_energy_results[m]['B'])
+                    
+                    # Apply the scaling here: B/2 for singular, B for nonsingular
+                    energy_b_map[m] = energy_b / 2.0 if is_singular else energy_b
+                    
+                    if verbose:
+                        scaling_str = "B/2" if is_singular else "B"
+                        print(f"[use_energy_b]   {m:<22} {scaling_str} from Energy = "
+                              f"{energy_b_map[m]:.6f}")
+
+        if verbose:
+            if should_use_energy_b:
+                print(f"  [B anchored to Energy fit]")
+            elif self.fixed_b is not None:
+                print(f"  [B fixed = {self.fixed_b}]")
+            else:
+                print(f"  [B free]")
+
+        # ── Start Fitting (Retry loop removed) ───────────────────────────
+        self.results = {}
+
+        for model_type in models:
+            self.model_type = model_type
+            tx = self._make_tx(model_type)
+
+            if energy_b_map.get(model_type) is not None:
+                effective_fixed_b = energy_b_map[model_type]
+            else:
+                effective_fixed_b = self.fixed_b
+
+            # ── 1. Find best C ───────────────────────────────────────
+            best_r2, best_C, intercept, slope = self._search_C(
+                tx, fixed_b=effective_fixed_b
+            )
+
+            # ── 2. Extract parameters ────────────────────────────────
+            if effective_fixed_b is not None:
+                B = effective_fixed_b
+            else:
+                B = max(-slope, 1e-6)
+
+            if self.is_increasing:
+                A = -np.exp(intercept)   # A < 0
+            else:
+                A = np.exp(intercept)    # A > 0
+
+            C = best_C
+
+            # ── 3. Compute predictions and goodness-of-fit ───────────
+            t_scaled = self.raw_x / self.x_max
+            phi      = self._compute_basis(B, t_scaled)
+            y_pred   = C + A * phi[:, 1]
+
+            resid  = self.raw_y - y_pred
+            ssr    = float(np.sum(resid ** 2))
+            dof    = max(1, len(self.raw_y) - 3)
+
+            # ── 4. Store results ─────────────────────────────────────
+            self.results[model_type] = {
+                'B':              B,
+                'C':              C,
+                'A':              A,
+                'ssr':            ssr,
+                'r2_linearized':  best_r2,
+                't_scaled':       t_scaled.copy(),
+                'sigma_noise':    float(np.sqrt(ssr / dof)),
+                'y_pred':         y_pred.copy(),
+                'final_weights':  np.ones(len(self.raw_x)),
+            }
+
+            if verbose:
+                C_unscaled = self.y_min + self.y_range * C
+                A_unscaled = self.y_range * A
                 
-        # 4. Everything else is nonsingular
-        return False
+                if energy_b_map.get(model_type) is not None:
+                    b_tag = f"from Energy ({'B/2' if is_singular else 'B'})"
+                elif self.fixed_b is not None:
+                    b_tag = "fixed"
+                else:
+                    b_tag = "free"
+                    
+                print(
+                    f"[{model_type:<20}] "
+                    f"B={B:12.6f} ({b_tag})  "
+                    f"C_scaled={C:12.15f}  C={C_unscaled:12.15f}  "
+                    f"A={A_unscaled:12.6f}  "
+                    f"R²(log)={best_r2:.6f}  "
+                    f"SSR={ssr:.4e}"
+                )
+
+            if on_iteration is not None:
+                on_iteration({
+                    'model':     model_type,
+                    'B':         B,
+                    'C':         C,
+                    'A':         A,
+                    'r2':        best_r2,
+                    'ssr':       ssr,
+                    'y_pred':    y_pred.copy(),
+                    'raw_x':     self.raw_x.copy(),
+                    'raw_y':     self.raw_y.copy(),
+                    't_scaled':  t_scaled.copy(),
+                })
+
+        if compute_uq and self.results:
+            self.compute_uncertainty()
+            
+        return self.results
 
     # ------------------------------------------------------------------
     # Main fitting method
@@ -554,89 +752,136 @@ class VarProLinearized:
     # ------------------------------------------------------------------
     # Uncertainty quantification (B-Boundary Error Propagation)
     # ------------------------------------------------------------------
-    def compute_uncertainty(self, tail_frac=0.5, k_cov=1.0,
-                                q=0.84, floor_frac=0.3,
-                                use_PI=True, robust_scale=True):
-            if not self.results:
-                raise RuntimeError("No results found. Run fit_linearized() first.")
 
-            for model, res in self.results.items():
-                self.model_type = model
-                B, A, C = res['B'], res['A'], res['C']
-                tx = self._make_tx(model)
+    def compute_uncertainty(
+        self,
+        k_cov=1.0,
+        q=0.84,
+        use_PI=True,
+        robust_scale=True,
+    ):
+        if not self.results:
+            raise RuntimeError("Run fit_linearized() first.")
 
-                diff  = (C - self.raw_y) if self.is_increasing else (self.raw_y - C)
-                valid = diff > 0
-                tx_v, diff_v = tx[valid], diff[valid]
-                Nv = len(tx_v)
+        def weighted_quantile(values, weights, quantile):
+            order = np.argsort(values)
+            values, weights = values[order], weights[order]
+            cumulative = np.cumsum(weights) - 0.5 * weights
+            cumulative /= weights.sum()
+            return float(np.interp(quantile, cumulative, values))
 
-                if Nv < 3:
-                    fb = float(np.max(np.abs(np.diff(self.raw_y))))
-                    # FIXED: Added missing keys to prevent downstream KeyErrors
-                    res.update(dict(sigma_C=fb, sigma_mc=fb,
-                                    sigma_C_plus=fb, sigma_C_minus=fb, 
-                                    sigma_B=0.0, sigma_ln_A=0.0, 
-                                    sigma_log=0.0, corr_CB=0.0))
-                    continue
+        for model, res in self.results.items():
+            self.model_type = model
+            B, A, C = map(float, (res["B"], res["A"], res["C"]))
+            tx = self._make_tx(model)
 
-                ln_diff_v   = np.log(diff_v)
-                ln_pred_v   = np.log(np.abs(A)) - B * tx_v
-                residuals_v = ln_diff_v - ln_pred_v
+            diff = (C - self.raw_y) if self.is_increasing else (self.raw_y - C)
+            valid = diff > 0
+            tx_v, diff_v, y_v = tx[valid], diff[valid], self.raw_y[valid]
+            Nv = len(tx_v)
 
-                # (Channel 2) robust log-residual scale: pre-asymptotic bias -> not noise
-                if robust_scale:
-                    mad = np.median(np.abs(residuals_v - np.median(residuals_v)))
-                    sigma2_res = (1.4826 * mad) ** 2
-                else:
-                    sigma2_res = np.sum(residuals_v ** 2) / (Nv - 2)
-
-                X_v      = np.column_stack((np.ones(Nv), -tx_v))
-                # FIXED: Using pinv adds protection against near-singular matrix errors
-                cov_beta = sigma2_res * np.linalg.pinv(X_v.T @ X_v)
-                var_ln_A, var_B, cov_lnA_B = cov_beta[0,0], cov_beta[1,1], cov_beta[0,1]
-
-                # confidence (mean) variance + (use_PI) prediction term
-                var_fit = var_ln_A + (tx_v**2)*var_B - 2.0*tx_v*cov_lnA_B
-                var_z   = var_fit + (sigma2_res if use_PI else 0.0)
-                se_z    = np.sqrt(np.maximum(var_z, 0.0))
-
-                P_nom   = np.exp(np.log(np.abs(A)) - B * tx_v)
-                d_plus  = P_nom * (1.0 - np.exp(-k_cov * se_z))   # Lower curve error boundary delta
-                d_minus = P_nom * (np.exp( k_cov * se_z) - 1.0)   # Upper curve error boundary delta
-
-                # (Channel 1) aggregate over the ASYMPTOTIC region only (largest tx)
-                order  = np.argsort(tx_v)
-                n_tail = max(3, int(np.ceil(tail_frac * Nv)))
-                tail   = order[-n_tail:]
-                
-                # FIXED: Added direction-aware mapping logic
-                if self.is_increasing:
-                    # y = C - P => C = y + P. Upper fluctuation (d_minus) pushes C upwards.
-                    sigma_C_plus  = float(np.quantile(d_minus[tail], q))
-                    sigma_C_minus = float(np.quantile(d_plus[tail],  q))
-                else:
-                    # y = C + P => C = y - P. Upper fluctuation (d_minus) pulls C downwards.
-                    sigma_C_plus  = float(np.quantile(d_plus[tail],  q))
-                    sigma_C_minus = float(np.quantile(d_minus[tail], q))
-
-                # conservative side
-                sigma_C = max(sigma_C_plus, sigma_C_minus)
-
-                # floor at a fraction of the remaining extrapolation correction
-                i_conv    = int(np.argmax(tx))                # most-converged data point
-                remaining = abs(C - self.raw_y[i_conv])
-                sigma_C   = max(sigma_C, floor_frac * remaining)
-
+            if Nv < 3:
+                fb = float(np.max(np.abs(np.diff(self.raw_y))))
                 res.update(dict(
-                    sigma_C_plus=sigma_C_plus, sigma_C_minus=sigma_C_minus,
-                    sigma_C=sigma_C, sigma_mc=sigma_C,
-                    sigma_B=float(np.sqrt(var_B)),
-                    sigma_ln_A=float(np.sqrt(var_ln_A)),
-                    sigma_log=float(np.sqrt(sigma2_res)),
-                    # FIXED: Added np.sqrt around var_B to maintain mathematical validity
-                    corr_CB=float(cov_lnA_B / (np.sqrt(var_ln_A) * np.sqrt(var_B)) if var_ln_A > 0 and var_B > 0 else 0.0),
+                    sigma_C=fb, sigma_mc=fb,
+                    sigma_C_plus=fb, sigma_C_minus=fb,
+                    sigma_C_floor=fb,
+                    sigma_B=0.0, sigma_ln_A=0.0,
+                    sigma_log=0.0, corr_CB=0.0,
                 ))
-            return self.results
+                continue
+
+            ln_pred_v = np.log(abs(A)) - B * tx_v
+            P_nom = np.exp(ln_pred_v)
+
+            eps_weight = np.finfo(float).eps * max(1.0, float(P_nom.max()))
+            weights = 1.0 / (P_nom + eps_weight)
+            weights /= weights.sum()
+
+            residuals_log = np.log(diff_v) - ln_pred_v
+
+            if robust_scale:
+                center_log = weighted_quantile(residuals_log, weights, 0.5)
+                mad_log = weighted_quantile(
+                    np.abs(residuals_log - center_log), weights, 0.5
+                )
+                sigma_log = 1.4826 * mad_log
+            else:
+                center_log = np.sum(weights * residuals_log)
+                sigma_log = np.sqrt(
+                    np.sum(weights * (residuals_log - center_log) ** 2)
+                )
+
+            sigma2_log = sigma_log**2
+
+            X = np.column_stack((np.ones(Nv), -tx_v))
+            cov_beta = sigma2_log * np.linalg.pinv(X.T @ X)
+
+            var_ln_A = float(cov_beta[0, 0])
+            var_B = float(cov_beta[1, 1])
+            cov_lnA_B = float(cov_beta[0, 1])
+
+            var_fit = var_ln_A + tx_v**2 * var_B - 2.0 * tx_v * cov_lnA_B
+            var_z = var_fit + (sigma2_log if use_PI else 0.0)
+            se_z = np.sqrt(np.maximum(var_z, 0.0))
+
+            d_lower = P_nom * (1.0 - np.exp(-k_cov * se_z))
+            d_upper = P_nom * (np.exp(k_cov * se_z) - 1.0)
+
+            if self.is_increasing:
+                sigma_C_plus = weighted_quantile(d_upper, weights, q)
+                sigma_C_minus = weighted_quantile(d_lower, weights, q)
+                y_pred = C - P_nom
+            else:
+                sigma_C_plus = weighted_quantile(d_lower, weights, q)
+                sigma_C_minus = weighted_quantile(d_upper, weights, q)
+                y_pred = C + P_nom
+
+            residuals_y = y_v - y_pred
+
+            if robust_scale:
+                center_y = weighted_quantile(residuals_y, weights, 0.5)
+                mad_y = weighted_quantile(
+                    np.abs(residuals_y - center_y), weights, 0.5
+                )
+                sigma_y = 1.4826 * mad_y
+            else:
+                center_y = np.sum(weights * residuals_y)
+                sigma_y = np.sqrt(
+                    np.sum(weights * (residuals_y - center_y) ** 2)
+                )
+
+            n_effective = 1.0 / np.sum(weights**2)
+            sigma_C_floor = sigma_y / np.sqrt(n_effective)
+
+            numerical_floor = np.finfo(float).eps * max(
+                1.0, float(np.max(np.abs(self.raw_y)))
+            )
+            sigma_C_floor = float(max(sigma_C_floor, numerical_floor))
+
+            sigma_C_plus = max(sigma_C_plus, sigma_C_floor)
+            sigma_C_minus = max(sigma_C_minus, sigma_C_floor)
+            sigma_C = max(sigma_C_plus, sigma_C_minus)
+
+            sigma_B = np.sqrt(max(var_B, 0.0))
+            sigma_ln_A = np.sqrt(max(var_ln_A, 0.0))
+            denominator = sigma_ln_A * sigma_B
+            corr = cov_lnA_B / denominator if denominator > 0.0 else 0.0
+
+            res.update(dict(
+                sigma_C_plus=float(sigma_C_plus),
+                sigma_C_minus=float(sigma_C_minus),
+                sigma_C=float(sigma_C),
+                sigma_mc=float(sigma_C),
+                sigma_C_floor=sigma_C_floor,
+                sigma_B=float(sigma_B),
+                sigma_ln_A=float(sigma_ln_A),
+                sigma_log=float(sigma_log),
+                corr_CB=float(corr),
+                n_effective=float(n_effective),
+            ))
+
+        return self.results
 
     def plot(self, truth_val=None):
         if truth_val is None:
