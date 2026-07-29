@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
-from extrap import VarProLinearized
+from extrap import extraplus
 import re
 
 def upload_df(file_path, start_basis_size = 99):
@@ -111,7 +111,7 @@ def fit_all_irls(main_df, main_inf_df=None, main_df_err=None):
         return float(vals[-1]) if vals.size else None
 
     for y_col in y_cols:
-        solver = VarProLinearized(main_df, x_col, y_col,
+        solver = extraplus(main_df, x_col, y_col,
                             err_df=main_df_err,
                             inf_df=main_inf_df)
         solver.fit_irls(verbose=False)
@@ -148,7 +148,7 @@ def fit_all_log(main_df, main_inf_df=None, main_df_err=None):
         return float(vals[-1]) if vals.size else None
 
     for y_col in y_cols:
-        solver = VarProLinearized(main_df, x_col, y_col,
+        solver = extraplus(main_df, x_col, y_col,
                             err_df=main_df_err,
                             inf_df=main_inf_df,
                             use_energy_b=True)
@@ -347,7 +347,7 @@ class CBSFitPlotter:
 
         fitters = []
         for y_col in y_cols:
-            fitter = VarProLinearized(
+            fitter = extraplus(
                 df=df, x_col=x_col, y_col=y_col,
                 err_df=spec['err_df'], inf_df=spec['inf_df'], n_fit=spec['n_fit'],
                 use_energy_b=True
@@ -869,7 +869,7 @@ def fit_and_plot_system(df, system_name, x_col='basis size', err_df=None, inf_df
     fitters = []
     print(f"Fitting {N} columns for {formatted_name}...")
     for y_col in y_cols:
-        fitter = VarProLinearized(
+        fitter = extraplus(
             df=df, x_col=x_col, y_col=y_col,
             err_df=err_df, inf_df=inf_df, n_fit=n_fit,
             use_energy_b=True
@@ -1135,7 +1135,7 @@ def fit_system_summary(df, system_name, x_col='basis size', err_df=None, inf_df=
 
     for y_col in y_cols:
         t0 = time.perf_counter()
-        fitter = VarProLinearized(
+        fitter = extraplus(
             df=df, x_col=x_col, y_col=y_col,
             err_df=err_df, inf_df=inf_df, n_fit=n_fit,
             use_energy_b=True

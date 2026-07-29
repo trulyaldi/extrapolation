@@ -5,7 +5,7 @@ from scipy.optimize import minimize_scalar, brentq
 
 
 
-class VarProLinearized:
+class extraplus:
     def __init__(self, df, x_col, y_col, err_df=None, inf_df=None, b_init=None, n_fit=None, use_energy_b=True,):
         self.x_col = x_col
         self.y_col = y_col
@@ -167,51 +167,6 @@ class VarProLinearized:
         # 4. Everything else is nonsingular
         return False
 
-
-    # ------------------------------------------------------------------
-    # Single-C linear fit
-    # ------------------------------------------------------------------
-
-    def _get_b_bounds(self):
-        y = self.raw_y
-
-        y_range = float(np.max(y) - np.min(y))
-        n_tail  = max(3, len(y) // 5)
-        sigma   = max(float(np.std(y[-n_tail:])), np.finfo(float).eps * float(np.abs(y).max()))
-        snr     = y_range / sigma
-
-        if snr <= 1.0:
-            raise ValueError(f"Data is noise-dominated: SNR={snr:.3f} <= 1.0, cannot constrain b.")
-
-        eps_basis = 1.0 / snr
-
-        tx          = self._make_tx(self.model_type)
-        tx_min      = float(tx.min())
-        tx_max      = float(tx.max())
-        tx_span     = tx_max - tx_min
-
-        if tx_span <= 0:
-            raise ValueError("tx domain has zero span, cannot constrain b.")
-
-        tx_sorted   = np.sort(tx)
-        dtx         = np.diff(tx_sorted)
-        dtx_positive = dtx[dtx > tx_max * np.finfo(float).eps ** 0.5]
-        delta_tx    = float(dtx_positive.min()) if len(dtx_positive) > 0 else tx_span
-
-        b_max = min(
-            -np.log(eps_basis) / delta_tx,
-            -np.log(np.finfo(float).eps) / delta_tx
-        )
-        b_min = -np.log1p(-1.0 / snr) / tx_span
-
-        if b_max <= b_min:
-            raise ValueError(
-                f"b bounds degenerate: b_min={b_min:.3e} >= b_max={b_max:.3e}. "
-                f"SNR={snr:.1f}, delta_tx={delta_tx:.3e}"
-            )
-
-        return b_min, b_max
-
     # ------------------------------------------------------------------
     # Single-C linear fit
     # ------------------------------------------------------------------
@@ -229,7 +184,7 @@ class VarProLinearized:
         tx_full_span  = tx.max() - tx.min()
         tx_valid_span = tx_v.max() - tx_v.min() if len(tx_v) > 1 else 0.0
         
-        if tx_valid_span < 0.5 * tx_full_span:
+        if tx_valid_span < 0.5 * tx_full_span: ############# HARD-CODED
             return -np.inf, 0.0, 0.0, False
 
         # 3. LOG-SPACE REGRESSION 
@@ -440,7 +395,6 @@ class VarProLinearized:
     
         return r2
 
-
     # ------------------------------------------------------------------
     # Main fitting method
     # ------------------------------------------------------------------
@@ -469,161 +423,7 @@ class VarProLinearized:
                 print(f"[use_energy_b] Fitting 'Energy' first to derive B "
                       f"for '{self.y_col}' [{prop_type}] ...")
 
-            _energy_fitter = VarProLinearized(
-                df          = self._df,
-                x_col       = self.x_col,
-                y_col       = 'Energy',
-                err_df      = None,
-                inf_df      = None,
-                b_init      = None,        
-                n_fit       = self._n_fit,
-                use_energy_b= True,       
-            )
-            _energy_results = _energy_fitter.fit_linearized(
-                models  = models,
-                verbose = verbose,
-            )
-
-            for m in models:
-                if m in _energy_results:
-                    energy_b = float(_energy_results[m]['B'])
-                    
-                    # Apply the scaling here: B/2 for singular, B for nonsingular
-                    energy_b_map[m] = energy_b / 2.0 if is_singular else energy_b
-                    
-                    if verbose:
-                        scaling_str = "B/2" if is_singular else "B"
-                        print(f"[use_energy_b]   {m:<22} {scaling_str} from Energy = "
-                              f"{energy_b_map[m]:.6f}")
-
-        if verbose:
-            if should_use_energy_b:
-                print(f"  [B anchored to Energy fit]")
-            elif self.fixed_b is not None:
-                print(f"  [B fixed = {self.fixed_b}]")
-            else:
-                print(f"  [B free]")
-
-        # ── Start Fitting (Retry loop removed) ───────────────────────────
-        self.results = {}
-
-        for model_type in models:
-            self.model_type = model_type
-            tx = self._make_tx(model_type)
-
-            if energy_b_map.get(model_type) is not None:
-                effective_fixed_b = energy_b_map[model_type]
-            else:
-                effective_fixed_b = self.fixed_b
-
-            # ── 1. Find best C ───────────────────────────────────────
-            best_r2, best_C, intercept, slope = self._search_C(
-                tx, fixed_b=effective_fixed_b
-            )
-
-            # ── 2. Extract parameters ────────────────────────────────
-            if effective_fixed_b is not None:
-                B = effective_fixed_b
-            else:
-                B = max(-slope, 1e-6)
-
-            if self.is_increasing:
-                A = -np.exp(intercept)   # A < 0
-            else:
-                A = np.exp(intercept)    # A > 0
-
-            C = best_C
-
-            # ── 3. Compute predictions and goodness-of-fit ───────────
-            t_scaled = self.raw_x / self.x_max
-            phi      = self._compute_basis(B, t_scaled)
-            y_pred   = C + A * phi[:, 1]
-
-            resid  = self.raw_y - y_pred
-            ssr    = float(np.sum(resid ** 2))
-            dof    = max(1, len(self.raw_y) - 3)
-
-            # ── 4. Store results ─────────────────────────────────────
-            self.results[model_type] = {
-                'B':              B,
-                'C':              C,
-                'A':              A,
-                'ssr':            ssr,
-                'r2_linearized':  best_r2,
-                't_scaled':       t_scaled.copy(),
-                'sigma_noise':    float(np.sqrt(ssr / dof)),
-                'y_pred':         y_pred.copy(),
-                'final_weights':  np.ones(len(self.raw_x)),
-            }
-
-            if verbose:
-                C_unscaled = self.y_min + self.y_range * C
-                A_unscaled = self.y_range * A
-                
-                if energy_b_map.get(model_type) is not None:
-                    b_tag = f"from Energy ({'B/2' if is_singular else 'B'})"
-                elif self.fixed_b is not None:
-                    b_tag = "fixed"
-                else:
-                    b_tag = "free"
-                    
-                print(
-                    f"[{model_type:<20}] "
-                    f"B={B:12.6f} ({b_tag})  "
-                    f"C_scaled={C:12.15f}  C={C_unscaled:12.15f}  "
-                    f"A={A_unscaled:12.6f}  "
-                    f"R²(log)={best_r2:.6f}  "
-                    f"SSR={ssr:.4e}"
-                )
-
-            if on_iteration is not None:
-                on_iteration({
-                    'model':     model_type,
-                    'B':         B,
-                    'C':         C,
-                    'A':         A,
-                    'r2':        best_r2,
-                    'ssr':       ssr,
-                    'y_pred':    y_pred.copy(),
-                    'raw_x':     self.raw_x.copy(),
-                    'raw_y':     self.raw_y.copy(),
-                    't_scaled':  t_scaled.copy(),
-                })
-
-        if compute_uq and self.results:
-            self.compute_uncertainty()
-            
-        return self.results
-
-    # ------------------------------------------------------------------
-    # Main fitting method
-    # ------------------------------------------------------------------
-
-    def fit_linearized(self, models=None, verbose=False, compute_uq=True, on_iteration=None):
-
-        if models is None:
-            models = ['exponential', 'sqrt_exponential', 'power_law']
-
-        # ── Resolve per-model B from Energy fit if requested ─────────────
-        # energy_b_map: dict[model_type -> float | None]
-        energy_b_map: dict = {m: None for m in models}
-
-        should_use_energy_b = (
-            self.use_energy_b
-            and self.y_col != 'Energy'
-            and 'Energy' in self._df.columns
-        )
-        
-        # Check if the current column is a singular property (needs B/2)
-        is_singular = self._is_singular_property(self.y_col)
-
-        if should_use_energy_b:
-            if verbose:
-                prop_type = "singular (using B/2)" if is_singular else "nonsingular (using B)"
-                print(f"[use_energy_b] Fitting 'Energy' first to derive B "
-                      f"for '{self.y_col}' [{prop_type}] ...")
-
-            _energy_fitter = VarProLinearized(
+            _energy_fitter = extraplus(
                 df          = self._df,
                 x_col       = self.x_col,
                 y_col       = 'Energy',
