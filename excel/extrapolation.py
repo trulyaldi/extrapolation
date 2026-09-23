@@ -1,19 +1,21 @@
 """
-Excel-callable wrappers around ``extrap.py``'s ``extraplus`` class.
+Excel-callable wrappers around the ``extraplus`` class from the ``extraplus`` package.
 
 This module intentionally contains NO extrapolation algorithm of its own.
-All fitting and uncertainty calculations are delegated to ``extrap.extraplus``.
+All fitting and uncertainty calculations are delegated to ``extraplus.extraplus``.
 
-The Excel-facing API is kept compatible with the previous extrapolation.py:
+Excel functions:
 
     EXTRAP1 / EXTRAP2 / EXTRAP3
         Return the extrapolated infinite-limit value C.
 
-    UNCERTY1 / UNCERTY2 / UNCERTY3
+    UNCERTAINTY1 / UNCERTAINTY2 / UNCERTAINTY3
         Return the uncertainty of C in the original y units.
+        (Called UNCERTY1 / UNCERTY2 / UNCERTY3 in older versions.)
 
-    PARAMETER_B1 / PARAMETER_B2 / PARAMETER_B3
+    DECAY_RATE1 / DECAY_RATE2 / DECAY_RATE3
         Return the fitted/fixed B parameter.
+        (Called PARAMETER_B1 / PARAMETER_B2 / PARAMETER_B3 in older versions.)
 
     EXTRAP1_V / EXTRAP2_V / EXTRAP3_V
         Spill [C, uncertainty, B] vertically.
@@ -22,10 +24,13 @@ The Excel-facing API is kept compatible with the previous extrapolation.py:
         Spill [C, uncertainty, B] horizontally.
 
     EXTRAP1_PLOT / EXTRAP2_PLOT / EXTRAP3_PLOT
-        Insert extrap.py's standard Matplotlib fit plot into Excel.
+        Insert the standard extraplus Matplotlib fit plot into Excel.
 
     EXTRAP1_PLOT_LOG / EXTRAP2_PLOT_LOG / EXTRAP3_PLOT_LOG
-        Insert extrap.py's logarithmic Matplotlib plot into Excel.
+        Insert the logarithmic extraplus Matplotlib plot into Excel.
+
+    EXTRAPLUS_VERSION
+        Return the installed extraplus package version.
 
 Model mapping:
 
@@ -33,25 +38,23 @@ Model mapping:
     2 -> sqrt_exponential
     3 -> power_law
 
-Expected folder layout:
+Invalid input does not raise into Excel: the non-plot functions return a short
+text starting with "Error: " (for example "Error: At least three paired numeric
+x/y observations are required.").
 
-    your_folder/
-        extrap.py
-        extrapolation.py
-        your_workbook.xlsm
-
-In Excel, set xlwings ``UDF Modules`` to ``extrapolation`` and import the
-Python UDFs as before.
+Installation: the ``extraplus`` package must be importable. The Windows
+installer (excel/install.bat) installs the package, this module and the
+``extraplus.xlam`` add-in into a per-user folder; nothing has to sit next to
+the workbook. See excel/README.md.
 """
 
 from __future__ import annotations
 
 from contextlib import redirect_stdout
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, wraps
+from importlib.metadata import version as _package_version
 from io import StringIO
-from pathlib import Path
-import sys
 from typing import Any, Optional
 
 import numpy as np
@@ -61,19 +64,15 @@ from matplotlib.figure import Figure
 
 
 # ---------------------------------------------------------------------------
-# Import extraplus from extrap.py next to THIS file.
+# Import extraplus from the installed ``extraplus`` package.
 # ---------------------------------------------------------------------------
-
-_THIS_DIR = Path(__file__).resolve().parent
-if str(_THIS_DIR) not in sys.path:
-    sys.path.insert(0, str(_THIS_DIR))
 
 try:
     from extraplus import extraplus
 except ImportError as exc:  # pragma: no cover - installation/configuration error
     raise ImportError(
-        "Could not import 'extraplus' from extrap.py. "
-        "Place extrap.py in the same folder as extrapolation.py."
+        "Could not import 'extraplus'. Install the extraplus package into this "
+        "Python environment (on Windows, run excel/install.bat)."
     ) from exc
 
 
@@ -212,7 +211,7 @@ def _as_bool(value: Any, default: bool) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Thin adapter around extrap.extraplus
+# Thin adapter around extraplus.extraplus
 # ---------------------------------------------------------------------------
 
 
@@ -278,7 +277,7 @@ def _fit_with_extraplus(
     if "sigma_C" in result:
         sigma_C_scaled = float(result["sigma_C"])
     elif "sigma_mc" in result:
-        # Compatibility with older extrap.py versions.
+        # Compatibility with older extraplus versions.
         sigma_C_scaled = float(result["sigma_mc"])
     else:
         raise ValueError("extraplus did not produce sigma_C uncertainty.")
@@ -360,6 +359,27 @@ def _run_udf(
         _as_bool(use_pi, True),
         _as_bool(robust_scale, True),
     )
+
+
+def _excel_errors(function):
+    """
+    Return a short "Error: ..." text to Excel instead of raising.
+
+    Only the failure path changes: when the wrapped UDF succeeds, its value is
+    returned unchanged.  ValueError messages come from the input checks above
+    and are shown as they are; any other exception also shows its type.
+    """
+
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        except ValueError as exc:
+            return f"Error: {exc}"
+        except Exception as exc:  # never hand a traceback to an Excel cell
+            return f"Error: {type(exc).__name__}: {exc}"
+
+    return wrapper
 
 
 
@@ -563,6 +583,7 @@ def _run_plot_udf(
 @xw.arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
 @xw.arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.")
 @xw.arg("n_fit", doc="Optional number of first numeric rows used in the fit.")
+@_excel_errors
 def EXTRAP1(x_range, y_range, b_fixed=None, n_fit=None):
     """Exponential extrapolated value C at infinity."""
     return _run_udf(x_range, y_range, _EXPONENTIAL, b_fixed, n_fit).extrapolated
@@ -573,6 +594,7 @@ def EXTRAP1(x_range, y_range, b_fixed=None, n_fit=None):
 @xw.arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
 @xw.arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.")
 @xw.arg("n_fit", doc="Optional number of first numeric rows used in the fit.")
+@_excel_errors
 def EXTRAP2(x_range, y_range, b_fixed=None, n_fit=None):
     """Square-root-exponential extrapolated value C at infinity."""
     return _run_udf(x_range, y_range, _SQRT_EXPONENTIAL, b_fixed, n_fit).extrapolated
@@ -583,6 +605,7 @@ def EXTRAP2(x_range, y_range, b_fixed=None, n_fit=None):
 @xw.arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
 @xw.arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.")
 @xw.arg("n_fit", doc="Optional number of first numeric rows used in the fit.")
+@_excel_errors
 def EXTRAP3(x_range, y_range, b_fixed=None, n_fit=None):
     """Power-law extrapolated value C at infinity."""
     return _run_udf(x_range, y_range, _POWER_LAW, b_fixed, n_fit).extrapolated
@@ -596,6 +619,7 @@ def EXTRAP3(x_range, y_range, b_fixed=None, n_fit=None):
 @xw.func(category="Extrapolation", volatile=False)
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
+@_excel_errors
 def UNCERTAINTY1(
     x_range,
     y_range,
@@ -623,6 +647,7 @@ def UNCERTAINTY1(
 @xw.func(category="Extrapolation", volatile=False)
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
+@_excel_errors
 def UNCERTAINTY2(
     x_range,
     y_range,
@@ -650,6 +675,7 @@ def UNCERTAINTY2(
 @xw.func(category="Extrapolation", volatile=False)
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
+@_excel_errors
 def UNCERTAINTY3(
     x_range,
     y_range,
@@ -682,6 +708,7 @@ def UNCERTAINTY3(
 @xw.func(category="Extrapolation", volatile=False)
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
+@_excel_errors
 def DECAY_RATE1(x_range, y_range, b_fixed=None, n_fit=None):
     """Exponential B for the normalized variable x/x_max."""
     return _run_udf(x_range, y_range, _EXPONENTIAL, b_fixed, n_fit).B
@@ -690,6 +717,7 @@ def DECAY_RATE1(x_range, y_range, b_fixed=None, n_fit=None):
 @xw.func(category="Extrapolation", volatile=False)
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
+@_excel_errors
 def DECAY_RATE2(x_range, y_range, b_fixed=None, n_fit=None):
     """Square-root-exponential B for sqrt(x/x_max)."""
     return _run_udf(x_range, y_range, _SQRT_EXPONENTIAL, b_fixed, n_fit).B
@@ -698,6 +726,7 @@ def DECAY_RATE2(x_range, y_range, b_fixed=None, n_fit=None):
 @xw.func(category="Extrapolation", volatile=False)
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
+@_excel_errors
 def DECAY_RATE3(x_range, y_range, b_fixed=None, n_fit=None):
     """Power-law B for (x/x_max)^(-B)."""
     return _run_udf(x_range, y_range, _POWER_LAW, b_fixed, n_fit).B
@@ -732,6 +761,7 @@ def _horizontal_fit_output(result: _FitOutput):
 @xw.ret(expand="table")
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
+@_excel_errors
 def EXTRAP1_V(
     x_range,
     y_range,
@@ -761,6 +791,7 @@ def EXTRAP1_V(
 @xw.ret(expand="table")
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
+@_excel_errors
 def EXTRAP2_V(
     x_range,
     y_range,
@@ -790,6 +821,7 @@ def EXTRAP2_V(
 @xw.ret(expand="table")
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
+@_excel_errors
 def EXTRAP3_V(
     x_range,
     y_range,
@@ -819,6 +851,7 @@ def EXTRAP3_V(
 @xw.ret(expand="table")
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
+@_excel_errors
 def EXTRAP1_H(
     x_range,
     y_range,
@@ -848,6 +881,7 @@ def EXTRAP1_H(
 @xw.ret(expand="table")
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
+@_excel_errors
 def EXTRAP2_H(
     x_range,
     y_range,
@@ -877,6 +911,7 @@ def EXTRAP2_H(
 @xw.ret(expand="table")
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
+@_excel_errors
 def EXTRAP3_H(
     x_range,
     y_range,
@@ -900,6 +935,18 @@ def EXTRAP3_H(
         robust_scale,
     )
     return _horizontal_fit_output(result)
+
+
+# ---------------------------------------------------------------------------
+# Installed version
+# ---------------------------------------------------------------------------
+
+
+@xw.func(category="Extrapolation", volatile=False)
+@_excel_errors
+def EXTRAPLUS_VERSION():
+    """Installed version of the extraplus package."""
+    return _package_version("extraplus")
 
 
 # ---------------------------------------------------------------------------
@@ -1140,6 +1187,7 @@ __all__ = [
     "EXTRAP1_H",
     "EXTRAP2_H",
     "EXTRAP3_H",
+    "EXTRAPLUS_VERSION",
     "EXTRAP1_PLOT",
     "EXTRAP2_PLOT",
     "EXTRAP3_PLOT",

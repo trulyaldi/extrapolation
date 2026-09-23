@@ -1,0 +1,118 @@
+"""
+Tests for the Excel UDF wrappers in excel/extrapolation.py.
+
+They call the Python functions behind the Excel formulas directly (no Excel
+needed) and check that they still work with the current extraplus core.  Their
+main job is to catch a mismatch between the wrappers and the core, for example
+a change to the arguments of ``extraplus.compute_uncertainty()``.
+"""
+
+import importlib.metadata
+import math
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "excel"))
+
+import extrapolation  # noqa: E402
+from extraplus import extraplus  # noqa: E402
+
+# Be 1Se ground-state energy, first 12 basis sizes of
+# research/data/large-dataset/Be_1Se.csv (the converged value is -14.6673565...).
+BE_1SE_ENERGY = [
+    (100, -14.6661876127332),
+    (200, -14.6667402339119),
+    (300, -14.6672828224583),
+    (400, -14.6673249180953),
+    (500, -14.66734057696),
+    (600, -14.6673445259951),
+    (700, -14.6673478029866),
+    (800, -14.6673503395393),
+    (900, -14.6673519816691),
+    (1000, -14.6673531093866),
+    (1100, -14.6673536576132),
+    (1200, -14.6673541629258),
+]
+
+MODELS = {1: "exponential", 2: "sqrt_exponential", 3: "power_law"}
+SCALAR_UDFS = [f"{base}{n}" for base in ("EXTRAP", "UNCERTAINTY", "DECAY_RATE") for n in MODELS]
+SPILL_UDFS = [f"EXTRAP{n}{suffix}" for suffix in ("_V", "_H") for n in MODELS]
+
+
+def excel_column(values):
+    """Shape a list like an Excel column range passed with np.array, ndim=2."""
+    return np.asarray(values, dtype=object).reshape(-1, 1)
+
+
+@pytest.fixture
+def xy():
+    x, y = zip(*BE_1SE_ENERGY)
+    return excel_column(x), excel_column(y)
+
+
+@pytest.mark.parametrize("name", SCALAR_UDFS)
+def test_scalar_udfs_return_finite_numbers(name, xy):
+    result = getattr(extrapolation, name)(*xy)
+    assert isinstance(result, float), f"{name} returned {result!r}"
+    assert math.isfinite(result)
+
+
+@pytest.mark.parametrize("name", SPILL_UDFS)
+def test_spill_udfs_return_three_finite_numbers(name, xy):
+    result = getattr(extrapolation, name)(*xy)
+    assert isinstance(result, np.ndarray), f"{name} returned {result!r}"
+    assert result.shape == ((3, 1) if name.endswith("_V") else (1, 3))
+    assert np.all(np.isfinite(result))
+
+
+def test_extrapolated_value_is_near_the_converged_energy(xy):
+    # The largest basis (16000) gives -14.6673565083605.
+    for n in MODELS:
+        assert getattr(extrapolation, f"EXTRAP{n}")(*xy) == pytest.approx(-14.66735651, abs=1e-5)
+
+
+@pytest.mark.parametrize("n", MODELS)
+def test_wrapper_matches_extraplus_called_directly(n, xy):
+    """The wrapper must only rescale what extraplus computes, with the Excel defaults."""
+    x, y = (np.asarray(col, dtype=float).ravel() for col in xy)
+    solver = extraplus(df=pd.DataFrame({"x": x, "y": y}), x_col="x", y_col="y",
+                       err_df=None, inf_df=None, b_init=None, n_fit=None, use_energy_b=False)
+    solver.fit_linearized(models=[MODELS[n]], verbose=False, compute_uq=False)
+    solver.compute_uncertainty(k_cov=1.0, q=0.84, use_PI=True, robust_scale=True)
+    res = solver.results[MODELS[n]]
+
+    assert getattr(extrapolation, f"EXTRAP{n}")(*xy) == solver.y_min + solver.y_range * res["C"]
+    assert getattr(extrapolation, f"UNCERTAINTY{n}")(*xy) == solver.y_range * res["sigma_C"]
+    assert getattr(extrapolation, f"DECAY_RATE{n}")(*xy) == res["B"]
+
+
+def test_version_udf():
+    assert extrapolation.EXTRAPLUS_VERSION() == importlib.metadata.version("extraplus")
+
+
+@pytest.mark.parametrize(
+    "x, y, b_fixed, expected",
+    [
+        ([100, 200, 300], [1.0, 2.0], None, "must contain the same number of cells"),
+        ([100, 200], [1.0, 2.0], None, "At least three paired numeric"),
+        ([100, 200, 300], [1.0, 1.0, 1.0], None, "y_range is constant"),
+        ([100, 200, 300, 400], [3.0, 2.0, 1.5, 1.2], -1.0, "b_fixed must be greater than zero"),
+        ([100, 200, 300, 400], [3.0, 2.0, 1.5, 1.2], "abc", "could not convert"),
+    ],
+)
+def test_bad_input_returns_error_text(x, y, b_fixed, expected):
+    for name in SCALAR_UDFS + SPILL_UDFS:
+        result = getattr(extrapolation, name)(excel_column(x), excel_column(y), b_fixed)
+        assert isinstance(result, str) and result.startswith("Error: "), f"{name}: {result!r}"
+        assert expected in result, f"{name}: {result!r}"
+
+
+def test_blank_and_text_cells_are_ignored(xy):
+    x, y = xy
+    padded_x = excel_column(["Basis Size", *x.ravel(), None, ""])
+    padded_y = excel_column(["Energy", *y.ravel(), None, ""])
+    assert extrapolation.EXTRAP1(padded_x, padded_y) == extrapolation.EXTRAP1(x, y)
