@@ -1,0 +1,6 @@
+# Core library versions for the Windows lock, aligned with the research .venv
+# (pandas 3.x vs the research 2.x was a major-version difference).
+numpy==2.3.3
+scipy==1.16.2
+pandas==2.3.2
+matplotlib==3.10.6
