@@ -14,7 +14,7 @@ Extrapolation of basis-set sequences to the complete-basis limit. The repository
   from extraplus import extraplus
   ```
 
-- **Excel** (`excel/`): xlwings UDF wrappers (`extrapolation.py`) around `extraplus`, with a Windows `setup.bat`. See [excel/README.md](excel/README.md).
+- **Excel** (`excel/`): xlwings UDF wrappers (`extrapolation.py`) around `extraplus`, shipped as the `extraplus.xlam` add-in with a one-click Windows installer. User guide: [excel/README.md](excel/README.md); building a release: [excel/build/README.md](excel/build/README.md).
 
 - **Research** (`research/`): notebooks, plotting helpers (`notebooks/functions.py`), and the datasets under `data/`.
 
