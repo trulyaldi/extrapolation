@@ -1,0 +1,4 @@
+research/ export-ignore
+tests/ export-ignore
+legacy/ export-ignore
+*.bat text eol=crlf
