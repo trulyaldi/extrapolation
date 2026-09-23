@@ -553,134 +553,58 @@ class extraplus:
     # Uncertainty quantification (B-Boundary Error Propagation)
     # ------------------------------------------------------------------
 
-    def compute_uncertainty(
-        self,
-        k_cov=1.0,
-        q=0.84,
-        use_PI=True,
-        robust_scale=True,
-    ):
+    def compute_uncertainty(self):
+        """Residual-sensitivity uncertainty of the asymptote C.
+
+        Each family's fit asserts z_i = ln|y_i - C| = a - B*tx_i on its valid points.
+        M = I - X pinv(X) removes what the fit re-adjusts for free: X = [1, tx] when B
+        is fitted, X = [1] when B is imposed.  Then
+
+            r = M (z + B*tx),   g = M dz/dC,   dz_i/dC = +-1/|y_i - C|
+            sigma_model = ||r|| / ||g||,       sigma_C = max(sigma_model, sigma_num)
+
+        r is the log-space misfit that no (a, B) removes, and g is the part of a unit
+        shift in C that (a, B) cannot absorb.  To first order, shifting C by sigma_model
+        adds as much misfit as is already present.  This is the Gauss-Newton error of C
+        with sqrt(SSR) in place of sqrt(SSR / dof).  Nothing is divided by sqrt(N), and
+        duplicated rows cancel.
+        sigma_num is half a unit in the last decimal digit that the input carries.
+        No constants are fitted, and the known limit never enters.
+
+        Limits: a fit with R^2_log <= 0, or with no residual degree of freedom, has no
+        relation to perturb and gets sigma = inf.  sigma_model -> 0 whenever the family
+        reproduces the sampled points, so a bias that leaves no trace inside the sampled
+        range cannot be seen here.
+        """
         if not self.results:
             raise RuntimeError("Run fit_linearized() first.")
 
-        def weighted_quantile(values, weights, quantile):
-            order = np.argsort(values)
-            values, weights = values[order], weights[order]
-            cumulative = np.cumsum(weights) - 0.5 * weights
-            cumulative /= weights.sum()
-            return float(np.interp(quantile, cumulative, values))
+        y = self.raw_y
+        imposed = self.fixed_b is not None or (
+            self.use_energy_b and self.y_col != "Energy" and "Energy" in self._df.columns)
+
+        def ulp(v):                                   # unit in the last decimal digit of v
+            m, e = np.format_float_scientific(v, unique=True, trim="-").split("e")
+            return 10.0 ** (int(e) + 1 - len(m.lstrip("-").replace(".", "")))
+
+        y_in = self._df[self.y_col].to_numpy(dtype=float)[:len(y)]
+        y_in = y_in[np.isfinite(y_in) & (y_in != 0.0)]
+        sigma_num = 0.5 * min(map(ulp, y_in), default=0.0) / self.y_range
 
         for model, res in self.results.items():
-            self.model_type = model
-            B, A, C = map(float, (res["B"], res["A"], res["C"]))
-            tx = self._make_tx(model)
-
-            diff = (C - self.raw_y) if self.is_increasing else (self.raw_y - C)
-            valid = diff > 0
-            tx_v, diff_v, y_v = tx[valid], diff[valid], self.raw_y[valid]
-            Nv = len(tx_v)
-
-            if Nv < 3:
-                fb = float(np.max(np.abs(np.diff(self.raw_y))))
-                res.update(dict(
-                    sigma_C=fb, sigma_mc=fb,
-                    sigma_C_plus=fb, sigma_C_minus=fb,
-                    sigma_C_floor=fb,
-                    sigma_B=0.0, sigma_ln_A=0.0,
-                    sigma_log=0.0, corr_CB=0.0,
-                ))
-                continue
-
-            ln_pred_v = np.log(abs(A)) - B * tx_v
-            P_nom = np.exp(ln_pred_v)
-
-            eps_weight = np.finfo(float).eps * max(1.0, float(P_nom.max()))
-            weights = 1.0 / (P_nom + eps_weight)
-            weights /= weights.sum()
-
-            residuals_log = np.log(diff_v) - ln_pred_v
-
-            if robust_scale:
-                center_log = weighted_quantile(residuals_log, weights, 0.5)
-                mad_log = weighted_quantile(
-                    np.abs(residuals_log - center_log), weights, 0.5
-                )
-                sigma_log = 1.4826 * mad_log
-            else:
-                center_log = np.sum(weights * residuals_log)
-                sigma_log = np.sqrt(
-                    np.sum(weights * (residuals_log - center_log) ** 2)
-                )
-
-            sigma2_log = sigma_log**2
-
-            X = np.column_stack((np.ones(Nv), -tx_v))
-            cov_beta = sigma2_log * np.linalg.pinv(X.T @ X)
-
-            var_ln_A = float(cov_beta[0, 0])
-            var_B = float(cov_beta[1, 1])
-            cov_lnA_B = float(cov_beta[0, 1])
-
-            var_fit = var_ln_A + tx_v**2 * var_B - 2.0 * tx_v * cov_lnA_B
-            var_z = var_fit + (sigma2_log if use_PI else 0.0)
-            se_z = np.sqrt(np.maximum(var_z, 0.0))
-
-            d_lower = P_nom * (1.0 - np.exp(-k_cov * se_z))
-            d_upper = P_nom * (np.exp(k_cov * se_z) - 1.0)
-
-            if self.is_increasing:
-                sigma_C_plus = weighted_quantile(d_upper, weights, q)
-                sigma_C_minus = weighted_quantile(d_lower, weights, q)
-                y_pred = C - P_nom
-            else:
-                sigma_C_plus = weighted_quantile(d_lower, weights, q)
-                sigma_C_minus = weighted_quantile(d_upper, weights, q)
-                y_pred = C + P_nom
-
-            residuals_y = y_v - y_pred
-
-            if robust_scale:
-                center_y = weighted_quantile(residuals_y, weights, 0.5)
-                mad_y = weighted_quantile(
-                    np.abs(residuals_y - center_y), weights, 0.5
-                )
-                sigma_y = 1.4826 * mad_y
-            else:
-                center_y = np.sum(weights * residuals_y)
-                sigma_y = np.sqrt(
-                    np.sum(weights * (residuals_y - center_y) ** 2)
-                )
-
-            n_effective = 1.0 / np.sum(weights**2)
-            sigma_C_floor = sigma_y / np.sqrt(n_effective)
-
-            numerical_floor = np.finfo(float).eps * max(
-                1.0, float(np.max(np.abs(self.raw_y)))
-            )
-            sigma_C_floor = float(max(sigma_C_floor, numerical_floor))
-
-            sigma_C_plus = max(sigma_C_plus, sigma_C_floor)
-            sigma_C_minus = max(sigma_C_minus, sigma_C_floor)
-            sigma_C = max(sigma_C_plus, sigma_C_minus)
-
-            sigma_B = np.sqrt(max(var_B, 0.0))
-            sigma_ln_A = np.sqrt(max(var_ln_A, 0.0))
-            denominator = sigma_ln_A * sigma_B
-            corr = cov_lnA_B / denominator if denominator > 0.0 else 0.0
-
-            res.update(dict(
-                sigma_C_plus=float(sigma_C_plus),
-                sigma_C_minus=float(sigma_C_minus),
-                sigma_C=float(sigma_C),
-                sigma_mc=float(sigma_C),
-                sigma_C_floor=sigma_C_floor,
-                sigma_B=float(sigma_B),
-                sigma_ln_A=float(sigma_ln_A),
-                sigma_log=float(sigma_log),
-                corr_CB=float(corr),
-                n_effective=float(n_effective),
-            ))
-
+            diff = (res["C"] - y) if self.is_increasing else (y - res["C"])
+            ok = diff > 0.0
+            d, tx = diff[ok], self._make_tx(model)[ok]
+            X = np.ones((len(d), 1)) if imposed else np.column_stack([np.ones(len(d)), tx])
+            sigma_model = np.inf
+            if res["r2_linearized"] > 0.0 and len(d) > X.shape[1] + 1:
+                V = np.column_stack([np.log(d) + res["B"] * tx, 1.0 / d])
+                r, g = (V - X @ np.linalg.lstsq(X, V, rcond=None)[0]).T
+                sigma_model = float(np.linalg.norm(r) / np.linalg.norm(g))
+            sigma_C = max(sigma_model, sigma_num)
+            res.update(sigma_C=sigma_C, sigma_mc=sigma_C,
+                       sigma_C_minus=sigma_C, sigma_C_plus=sigma_C,
+                       sigma_model=sigma_model, sigma_num=sigma_num)
         return self.results
 
     def plot(self, truth_val=None):
