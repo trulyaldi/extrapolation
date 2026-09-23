@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
-from extrap import extraplus
+from extraplus import extraplus
 import re
 
 def upload_df(file_path, start_basis_size = 99):

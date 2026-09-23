@@ -69,7 +69,7 @@ if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
 try:
-    from extrap import extraplus
+    from extraplus import extraplus
 except ImportError as exc:  # pragma: no cover - installation/configuration error
     raise ImportError(
         "Could not import 'extraplus' from extrap.py. "
