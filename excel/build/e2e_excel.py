@@ -1,30 +1,33 @@
 """
 End-to-end test of an installed Extraplus in a real Excel (Windows only).
 
-Run with the INSTALLED environment's Python so the reference values come from the
-same packages the add-in uses:
+Run with the INSTALLED environment's Python, so the reference values come from
+the same packages the add-in uses:
 
-    %EXTRAPLUS_HOME%\\venv\\Scripts\\python.exe e2e_excel.py --results r.json [options]
+    %EXTRAPLUS_HOME%\\venv\\Scripts\\python.exe e2e_excel.py --book B.xlsx --results R.json [options]
 
-Excel is started the way a user starts it (not as a COM automation instance,
-which would not load add-ins) and then attached to:
+Excel is started the way a user starts it, by opening --book (a COM automation
+instance would not load add-ins), and then attached to:
 
-    --launch explorer   through Explorer, which has the current user environment
-    --launch direct     directly from this process, without EXTRAPLUS_HOME, to
+    --launch explorer   through the Windows shell (Explorer), which has the
+                        current user environment including EXTRAPLUS_HOME
+    --launch direct     as a child of this process without EXTRAPLUS_HOME, to
                         exercise the add-in's registry fallback
 
-Default test: new workbook, data in A1:B13, formulas in column D and F, then
-compare every cell with extraplus called directly. --save stores the workbook as
-.xlsx; --reopen PATH instead opens an existing workbook and recalculates it.
+--mode new (default) creates --book if needed, writes the test data and
+formulas, compares every cell with extraplus called directly, and saves the
+book. --mode reopen only recalculates an existing book and compares.
 """
 
 import argparse
+import ctypes
 import json
 import math
 import os
 import subprocess
 import sys
 import time
+import traceback
 import winreg
 from pathlib import Path
 
@@ -36,14 +39,14 @@ from e2e_reference import DATA, MODELS, reference  # noqa: E402
 N = len(DATA)
 X = f"A2:A{N + 1}"
 Y = f"B2:B{N + 1}"
-FORMULAS = {
+CORE = {
     "D2": f"=EXTRAP1({X},{Y})", "D3": f"=EXTRAP2({X},{Y})", "D4": f"=EXTRAP3({X},{Y})",
     "D5": f"=UNCERTAINTY1({X},{Y})", "D6": f"=UNCERTAINTY2({X},{Y})", "D7": f"=UNCERTAINTY3({X},{Y})",
     "D8": f"=DECAY_RATE1({X},{Y})", "D9": f"=DECAY_RATE2({X},{Y})", "D10": f"=DECAY_RATE3({X},{Y})",
     "D11": "=EXTRAPLUS_VERSION()",
-    "D12": "=EXTRAP1(A2:A3,B2:B3)",
-    "F2": f"=EXTRAP1_V({X},{Y})",
+    "D12": "=EXTRAP1(A2:A3,B2:B3)",   # too few points -> "Error: ..."
 }
+SPILL = {"F2": f"=EXTRAP1_V({X},{Y})"}   # best effort: F2:F4
 
 
 def excel_exe():
@@ -61,27 +64,74 @@ def retry(fn, timeout=90, what="Excel"):
     while True:
         try:
             return fn()
-        except Exception as exc:  # Excel is busy while starting / calculating
+        except Exception as exc:  # Excel rejects calls while it starts or calculates
             if time.time() > deadline:
                 raise RuntimeError(f"timed out waiting for {what}: {exc!r}") from exc
             time.sleep(1)
 
 
-def launch(mode):
-    if xw.apps.count:
+def excel_processes():
+    cmd = ("Get-CimInstance Win32_Process -Filter \"Name='EXCEL.EXE'\" | "
+           "Select-Object ProcessId, ParentProcessId | ConvertTo-Json")
+    out = subprocess.run(["powershell.exe", "-NoProfile", "-Command", cmd],
+                         capture_output=True, text=True).stdout.strip()
+    data = json.loads(out) if out else []
+    return data if isinstance(data, list) else [data]
+
+
+def python_processes():
+    cmd = ("Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'python*' } | "
+           "Select-Object ProcessId, ParentProcessId, ExecutablePath, CommandLine | ConvertTo-Json")
+    out = subprocess.run(["powershell.exe", "-NoProfile", "-Command", cmd],
+                         capture_output=True, text=True).stdout.strip()
+    data = json.loads(out) if out else []
+    return data if isinstance(data, list) else [data]
+
+
+def shell_pid():
+    """PID of the Explorer process that owns the taskbar (the user's shell)."""
+    hwnd = ctypes.windll.user32.FindWindowW("Shell_TrayWnd", None)
+    pid = ctypes.c_ulong()
+    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return pid.value
+
+
+def wait_excel_exit(timeout=90):
+    deadline = time.time() + timeout
+    while excel_processes():
+        if time.time() > deadline:
+            return False
+        time.sleep(1)
+    return True
+
+
+def make_blank_book(path):
+    app = xw.App(visible=False, add_book=False)   # automation instance: loads no add-ins
+    try:
+        book = app.books.add()
+        book.save(str(path))
+        book.close()
+    finally:
+        app.quit()
+    wait_excel_exit()
+
+
+def launch(mode, book_path):
+    if excel_processes():
         raise SystemExit("Close Excel before running the test.")
-    exe = excel_exe()
     if mode == "explorer":
-        subprocess.Popen(["explorer.exe", exe])
+        subprocess.Popen(["explorer.exe", str(book_path)])
     else:
         env = {k: v for k, v in os.environ.items() if k.upper() != "EXTRAPLUS_HOME"}
-        subprocess.Popen([exe], env=env)
+        subprocess.Popen([excel_exe(), str(book_path)], env=env)
 
     def attach():
-        app = xw.apps.active
-        app.api.Version  # noqa: B018 - raises until Excel accepts COM calls
-        return app
-    return retry(attach, what="Excel to start")
+        for app in xw.apps:
+            for book in app.books:
+                if Path(book.fullname).resolve() == book_path.resolve():
+                    return app, book
+        raise RuntimeError("workbook not open yet")
+    return retry(attach, what="Excel to open the workbook")
 
 
 def addin_state(app):
@@ -95,16 +145,7 @@ def addin_state(app):
         return {"error": str(exc)}
 
 
-def python_processes():
-    cmd = ("Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'python*' } | "
-           "Select-Object ProcessId, ParentProcessId, ExecutablePath, CommandLine | ConvertTo-Json")
-    out = subprocess.run(["powershell.exe", "-NoProfile", "-Command", cmd],
-                         capture_output=True, text=True).stdout.strip()
-    data = json.loads(out) if out else []
-    return data if isinstance(data, list) else [data]
-
-
-def read_cells(sheet, addresses, timeout=180):
+def read_cells(sheet, addresses, timeout):
     """Values once no cell is still waiting for the UDF server."""
     def ready():
         values = {a: sheet.range(a).value for a in addresses}
@@ -116,7 +157,7 @@ def read_cells(sheet, addresses, timeout=180):
 
 def compare(values):
     x, y = zip(*DATA)
-    rows, max_abs, max_rel, all_equal = [], 0.0, 0.0, True
+    rows, max_abs, all_equal = [], 0.0, True
     for n in MODELS:
         ref = reference(x, y, n)
         for kind, cell, expected in (("EXTRAP", f"D{1 + n}", ref[0]),
@@ -125,79 +166,77 @@ def compare(values):
             got = values[cell]
             ok = isinstance(got, float)
             diff = abs(got - expected) if ok else math.inf
-            rel = diff / abs(expected) if ok and expected else diff
-            max_abs, max_rel = max(max_abs, diff), max(max_rel, rel)
+            max_abs = max(max_abs, diff)
             all_equal &= ok and got == expected
             rows.append({"function": f"{kind}{n}", "cell": cell, "excel": got,
                          "direct": expected, "abs_diff": diff})
-    spill = [values["F2"], values["F3"], values["F4"]]
-    return {"rows": rows, "max_abs_diff": max_abs, "max_rel_diff": max_rel,
-            "bit_identical": all_equal, "spill_F2_F4": spill,
-            "spill_matches_D": spill == [values["D2"], values["D5"], values["D8"]]}
+    return {"rows": rows, "max_abs_diff": max_abs, "bit_identical": all_equal}
 
 
-def run_new(app, results, save):
-    book = app.books.add()
+def test_book(app, book, results, mode):
     sheet = book.sheets[0]
-    sheet.range("A1").value = [["Basis Size", "Energy"], *[[a, b] for a, b in DATA]]
-    for cell, formula in FORMULAS.items():
-        sheet.range(cell).formula = formula
-    app.calculate()
-    cells = [*FORMULAS, "F3", "F4"]
+    if mode == "new":
+        sheet.range("A1").value = [["Basis Size", "Energy"], *[[a, b] for a, b in DATA]]
+        for cell, formula in {**CORE, **SPILL}.items():
+            sheet.range(cell).api.Formula2 = formula
+    else:
+        results["link_sources"] = list(book.api.LinkSources(1) or [])  # xlExcelLinks
+        app.api.CalculateFull()
+    results["formulas_as_stored"] = {c: sheet.range(c).api.Formula2 for c in {**CORE, **SPILL}}
     started = time.time()
-    values = read_cells(sheet, cells)
+    values = read_cells(sheet, [*CORE, "F2"], timeout=180)
     results["seconds_to_values"] = round(time.time() - started, 1)
     results["values"] = values
-    results["formulas_as_stored"] = {c: sheet.range(c).formula for c in FORMULAS}
-    results["comparison"] = compare(values)
     results["version_cell"] = values["D11"]
     results["error_cell"] = values["D12"]
-    if save:
-        book.save(str(save))
-        results["saved"] = str(save)
-    book.close()
-
-
-def run_reopen(app, results, path):
-    book = retry(lambda: app.books.open(str(path)), what="the workbook to open")
-    sheet = book.sheets[0]
-    results["formulas_as_stored"] = {c: sheet.range(c).formula for c in FORMULAS}
-    results["link_sources"] = list(book.api.LinkSources(1) or [])  # xlExcelLinks
-    app.api.CalculateFull()
-    results["values"] = read_cells(sheet, [*FORMULAS, "F3", "F4"])
-    results["comparison"] = compare(results["values"])
-    book.close()
+    results["comparison"] = compare(values)
+    try:
+        spill = list(read_cells(sheet, ["F2", "F3", "F4"], timeout=20).values())
+        results["spill_F2_F4"] = spill
+        results["spill_matches_D"] = spill == [values["D2"], values["D5"], values["D8"]]
+    except RuntimeError as exc:
+        results["spill_F2_F4"] = f"did not spill: {exc}"
+    if mode == "new":
+        book.save()
 
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--book", type=Path, required=True)
     parser.add_argument("--results", type=Path, required=True)
     parser.add_argument("--launch", choices=["explorer", "direct"], default="explorer")
-    parser.add_argument("--save", type=Path)
-    parser.add_argument("--reopen", type=Path)
+    parser.add_argument("--mode", choices=["new", "reopen"], default="new")
     args = parser.parse_args()
+    args.book = args.book.resolve()
 
-    results = {"launch": args.launch, "inputs": DATA}
-    app = launch(args.launch)
+    results = {"launch": args.launch, "mode": args.mode, "book": str(args.book), "inputs": DATA}
+    app = None
     try:
+        if args.mode == "new" and not args.book.exists():
+            make_blank_book(args.book)
+        app, book = launch(args.launch, args.book)
         app.display_alerts = False
         results["excel_version"] = app.version
+        results["excel_parent_is_shell"] = [p["ParentProcessId"] == shell_pid() for p in excel_processes()]
         results["addin"] = addin_state(app)
-        if args.reopen:
-            run_reopen(app, results, args.reopen)
-        else:
-            run_new(app, results, args.save)
+        test_book(app, book, results, args.mode)
         results["python_processes"] = python_processes()
+    except Exception:
+        results["exception"] = traceback.format_exc()
     finally:
-        try:
-            app.quit()
-        except Exception:
-            pass
-    args.results.write_text(json.dumps(results, indent=2, default=str))
+        if app is not None:
+            try:
+                app.quit()
+            except Exception:
+                pass
+        results["excel_exited"] = wait_excel_exit()
+        args.results.write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
+
     c = results.get("comparison", {})
-    print(json.dumps({k: results.get(k) for k in ("addin", "version_cell", "error_cell", "seconds_to_values")}, default=str))
-    print(f"bit_identical={c.get('bit_identical')} max_abs_diff={c.get('max_abs_diff')} "
-          f"spill_matches_D={c.get('spill_matches_D')}")
+    print(json.dumps({k: results.get(k) for k in (
+        "addin", "excel_parent_is_shell", "version_cell", "error_cell", "seconds_to_values",
+        "spill_F2_F4", "link_sources", "excel_exited", "exception")}, indent=1, default=str))
+    print(f"bit_identical={c.get('bit_identical')} max_abs_diff={c.get('max_abs_diff')}")
 
 
 if __name__ == "__main__":

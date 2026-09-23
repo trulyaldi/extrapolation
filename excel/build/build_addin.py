@@ -147,7 +147,11 @@ def build(out_dir, udf_dir):
         sheet.range("A:B").number_format = "@"   # keep "False" etc. as text
         sheet.range("A1").value = [list(row) for row in CONFIG]
 
+        # Application.MacroOptions (function descriptions, run by import_udfs)
+        # refuses to edit a hidden workbook, so show the add-in while importing.
+        book.api.IsAddin = False
         udfs.import_udfs(UDF_MODULE, book.api)
+        book.api.IsAddin = True
 
         props = book.api.BuiltinDocumentProperties
         props("Title").Value = "Extraplus"
@@ -173,6 +177,8 @@ def inspect_xlam(xlam, out_dir):
         code = udf_code.Lines(1, udf_code.CountOfLines) if udf_code.CountOfLines else ""
         (out_dir / "xlwings_udfs.bas").write_text(code, encoding="utf-8")
         xlwings_code = components["xlwings"].CodeModule
+        this_workbook = components["ThisWorkbook"].CodeModule
+        workbook_code = this_workbook.Lines(1, this_workbook.CountOfLines) if this_workbook.CountOfLines else ""
         sheet = book.sheets[f"{PROJECT}.conf"]
         config = sheet.range("A1").options(ndim=2).expand("down").resize(None, 2).value
         info = {
@@ -188,6 +194,7 @@ def inspect_xlam(xlam, out_dir):
             ),
             "config": [[k, v if v is not None else ""] for k, v in config],
             "is_addin": bool(book.api.IsAddin),
+            "has_workbook_open": "EnsureExtraplusHome" in workbook_code,
             "sheets": [s.name for s in book.sheets],
         }
         book.close()
@@ -217,6 +224,12 @@ def main():
         problems.append(f"PROJECT_NAME not set: {info['project_name_line']}")
     if "EXTRAPLUS_VERSION" not in info["functions"] or "EXTRAP1" not in info["functions"]:
         problems.append(f"functions missing: {info['functions']}")
+    if not info["is_addin"]:
+        problems.append("the workbook is not saved as an add-in (IsAddin is False)")
+    if "extraplus_env" not in info["components"] or not info["has_workbook_open"]:
+        problems.append("the EXTRAPLUS_HOME fallback (extraplus_env / Workbook_Open) is missing")
+    if "Module1" in info["components"]:
+        problems.append("the template's Module1 was not removed")
     if problems:
         raise SystemExit("Build check failed: " + "; ".join(problems))
 

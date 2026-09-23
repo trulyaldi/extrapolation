@@ -7,6 +7,8 @@ setlocal
 set "EXTRAPLUS_SETUP=%~dp0install.ps1"
 if not exist "%EXTRAPLUS_SETUP%" set "EXTRAPLUS_SETUP=%~dp0files\install.ps1"
 set "EXTRAPLUS_TEMP=%TEMP%\extraplus-uninstall-%RANDOM%.ps1"
+rem Leave the install folder so it is not our working directory.
+cd /d "%TEMP%"
 (
     copy /y "%EXTRAPLUS_SETUP%" "%EXTRAPLUS_TEMP%" >nul
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%EXTRAPLUS_TEMP%" -Uninstall %*

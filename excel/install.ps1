@@ -76,7 +76,7 @@ function Invoke-Native {
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        & $Exe @Arguments
+        & $Exe @Arguments | Out-Host   # show output; never return it to the caller
         $code = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previous
@@ -252,7 +252,7 @@ function Install-Uv([string]$Root, $Pins) {
 function Install-PythonEnvironment([string]$Root, [string]$Uv, $Pins, $Manifest) {
     Write-Step "Python $($Pins.PythonVersion)"
     Invoke-Native $Uv @('python', 'install', $Pins.PythonVersion, '--no-bin', '--no-registry')
-    $python = Get-NativeOutput $Uv @('python', 'find', '--managed-python', $Pins.PythonVersion)
+    $python = Get-NativeOutput $Uv @('python', 'find', '--managed-python', '--no-project', $Pins.PythonVersion)
     if (-not (Test-Path -LiteralPath $python)) { throw "uv did not report a Python $($Pins.PythonVersion) interpreter." }
     Write-Info "Using $python"
 
@@ -572,6 +572,9 @@ function Remove-InstallFolder([string]$Root) {
 function Uninstall-Extraplus {
     Write-Host "$AppDisplayName - uninstall"
     Assert-ExcelClosed
+    # Windows cannot delete a folder that is some process's working directory.
+    Set-Location -LiteralPath $env:TEMP
+    [Environment]::CurrentDirectory = $env:TEMP
 
     $roots = @()
     if ($InstallRoot) { $roots = @([IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')) } else { $roots = @(Find-InstalledRoots) }
