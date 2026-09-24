@@ -11,7 +11,7 @@ admin rights, or any Excel settings.
 
 **Requirements:** Windows 10 or 11, desktop Microsoft Excel (Microsoft 365, 2021,
 2019 or 2016; 32-bit Office has not been tested), and an internet connection while
-installing.
+installing. Tested with Excel 2021 (16.0.14332, 64-bit) on Windows 10 21H2.
 
 ## Install
 
@@ -53,6 +53,11 @@ affected.
 Close Excel, then **Settings > Apps > Extraplus for Excel > Uninstall**. (Or run
 `uninstall.bat` from the unzipped folder, or from the install folder shown by the
 installer.) This removes all Extraplus files and settings.
+
+## Known issues
+
+- Workbooks store the add-in's path; opening a workbook created on another user's
+  machine may show a link prompt or `#NAME?` — not yet tested.
 
 ## Troubleshooting
 

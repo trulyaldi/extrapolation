@@ -1,0 +1,103 @@
+{
+  "xlwings": "0.37.4",
+  "extraplus": "0.1.0",
+  "extrapolation_py_sha256": "84cc3acaf486673c88314706bafda36ee311ea736425cee8d3447ed460bd075b",
+  "built": "2026-09-24T13:08:32",
+  "components": [
+    "Dictionary",
+    "Sheet2",
+    "ThisWorkbook",
+    "extraplus_env",
+    "xlwings",
+    "xlwings_udfs"
+  ],
+  "functions": [
+    "DECAY_RATE1",
+    "DECAY_RATE2",
+    "DECAY_RATE3",
+    "EXTRAP1",
+    "EXTRAP1_H",
+    "EXTRAP1_PLOT",
+    "EXTRAP1_PLOT_LOG",
+    "EXTRAP1_V",
+    "EXTRAP2",
+    "EXTRAP2_H",
+    "EXTRAP2_PLOT",
+    "EXTRAP2_PLOT_LOG",
+    "EXTRAP2_V",
+    "EXTRAP3",
+    "EXTRAP3_H",
+    "EXTRAP3_PLOT",
+    "EXTRAP3_PLOT_LOG",
+    "EXTRAP3_V",
+    "EXTRAPLUS_VERSION",
+    "UNCERTAINTY1",
+    "UNCERTAINTY2",
+    "UNCERTAINTY3"
+  ],
+  "volatile_count": 0,
+  "project_name_line": "Public Const PROJECT_NAME As String = \"extraplus\"",
+  "config": [
+    [
+      "INTERPRETER_WIN",
+      "%EXTRAPLUS_HOME%\\venv\\Scripts\\pythonw.exe"
+    ],
+    [
+      "INTERPRETER",
+      ""
+    ],
+    [
+      "PYTHONPATH",
+      "%EXTRAPLUS_HOME%\\udf"
+    ],
+    [
+      "UDF MODULES",
+      "extrapolation"
+    ],
+    [
+      "ADD_WORKBOOK_TO_PYTHONPATH",
+      "False"
+    ],
+    [
+      "USE UDF SERVER",
+      "True"
+    ],
+    [
+      "DEBUG UDFS",
+      "False"
+    ],
+    [
+      "SHOW CONSOLE",
+      "False"
+    ],
+    [
+      "CONDA PATH",
+      ""
+    ],
+    [
+      "CONDA ENV",
+      ""
+    ],
+    [
+      "LICENSE_KEY",
+      ""
+    ],
+    [
+      "ONEDRIVE_CONSUMER_WIN",
+      ""
+    ],
+    [
+      "ONEDRIVE_COMMERCIAL_WIN",
+      ""
+    ],
+    [
+      "SHAREPOINT_WIN",
+      ""
+    ]
+  ],
+  "is_addin": true,
+  "has_workbook_open": true,
+  "sheets": [
+    "extraplus.conf"
+  ]
+}
