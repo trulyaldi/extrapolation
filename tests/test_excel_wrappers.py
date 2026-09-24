@@ -28,7 +28,7 @@ from matplotlib.figure import Figure  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "excel"))
 
 import extrapolation  # noqa: E402
-from extraplus import extraplus  # noqa: E402
+from extraplus import _plotting, api, extraplus  # noqa: E402
 
 # Be 1Se ground-state energy, first 12 basis sizes of
 # research/data/large-dataset/Be_1Se.csv (the converged value is -14.6673565...).
@@ -107,11 +107,11 @@ def test_version_udf():
 @pytest.mark.parametrize(
     "x, y, b_fixed, expected",
     [
-        ([100, 200, 300], [1.0, 2.0], None, "must contain the same number of cells"),
+        ([100, 200, 300], [1.0, 2.0], None, "x and y must have the same length"),
         ([100, 200], [1.0, 2.0], None, "At least three paired numeric"),
-        ([100, 200, 300], [1.0, 1.0, 1.0], None, "y_range is constant"),
+        ([100, 200, 300], [1.0, 1.0, 1.0], None, "y is constant"),
         ([100, 200, 300, 400], [3.0, 2.0, 1.5, 1.2], -1.0, "b_fixed must be greater than zero"),
-        ([100, 200, 300, 400], [3.0, 2.0, 1.5, 1.2], "abc", "could not convert"),
+        ([100, 200, 300, 400], [3.0, 2.0, 1.5, 1.2], "abc", "b_fixed must be a number"),
     ],
 )
 def test_bad_input_returns_error_text(x, y, b_fixed, expected):
@@ -172,7 +172,7 @@ def test_plot_titles_show_each_model_formula(xy):
     for suffix in ("", "_LOG"):
         titles = [run_plot_udf(f"EXTRAP{n}_PLOT{suffix}", *xy)[1].axes[0].get_title().split("\n")[0]
                   for n in MODELS]
-        assert titles == [extrapolation._MODEL_FORMULAS[MODELS[n]] for n in MODELS]
+        assert titles == [_plotting.MODEL_FORMULAS[MODELS[n]] for n in MODELS]
         assert len(set(titles)) == 3
 
 
@@ -198,8 +198,9 @@ def test_log_plot_has_the_confidence_band_but_no_prediction_band(n, xy):
     assert not any("PI" in t.get_text() for t in ax.get_legend().get_texts())
 
     # The y range is fitted to what remains, not to extraplus' own PI band.
-    solver = extrapolation._build_fitted_solver_for_plot(*xy, MODELS[n])[0]
-    original = extrapolation._figures_from_extraplus(solver, log_plot=True)
+    x, y = (np.asarray(col, dtype=float).ravel() for col in xy)
+    solver = api._solve(x, y, MODELS[n], None, None)
+    original = _plotting.figures_from_extraplus(solver, log_plot=True)
     try:
         (pi,) = [c for c in original[-1].axes[0].collections if c.get_label() == "95% PI Band"]
         pi_y = np.concatenate([path.vertices[:, 1] for path in pi.get_paths()])
