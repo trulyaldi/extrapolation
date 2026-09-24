@@ -218,6 +218,10 @@ def _fit(x: np.ndarray, y: np.ndarray, model: str, b_fixed, n_fit) -> Result:
         b_fixed=b_fixed,
         _x=tuple(float(value) for value in x),
         _y=tuple(float(value) for value in y),
+        _C_scaled=C_scaled,
+        _A_scaled=A_scaled,
+        _y_min=float(solver.y_min),
+        _y_range=float(solver.y_range),
     )
 
     if not math.isfinite(fitted.uncertainty):

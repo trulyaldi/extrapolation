@@ -110,6 +110,64 @@ def test_invalid_input_raises_value_error(x, y, kwargs, message):
         compare(x, y, **kwargs)
 
 
+@pytest.mark.parametrize("kwargs", [{}, {"b_fixed": 5.0}, {"n_fit": 6}, {"b_fixed": 4.0, "n_fit": 7}],
+                         ids=["default", "b_fixed", "n_fit", "both"])
+@pytest.mark.parametrize("rising", [False, True], ids=["falling", "rising"])
+@pytest.mark.parametrize("model", MODELS.values())
+def test_predict_equals_the_engine_fitted_values(model, rising, kwargs, be_xy):
+    x, y = be_xy
+    if rising:
+        y = [-v for v in y]
+    result = extrapolate(x, y, model, **kwargs)
+    solver = result._solver()
+    fitted = solver.y_min + solver.y_range * solver.results[model]["y_pred"]
+    x_fit = np.asarray(x[:result.n_fit_used], dtype=float)
+    np.testing.assert_allclose(result.predict(x_fit), fitted, rtol=1e-12, atol=0)
+    assert [result.predict(v) for v in x_fit] == result.predict(x_fit).tolist()
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"b_fixed": 5.0}, {"n_fit": 6}], ids=["default", "b_fixed", "n_fit"])
+@pytest.mark.parametrize("model", ["exponential", "sqrt_exponential"])
+def test_predict_tends_to_the_extrapolated_value(model, kwargs, be_xy):
+    result = extrapolate(*be_xy, model, **kwargs)
+    gaps = [abs(result.predict(x) - result.value) for x in (1300, 2000, 5000, 20000)]
+    assert gaps == sorted(gaps, reverse=True) and gaps[0] > 0
+    assert result.predict(1e300) == result.value
+
+
+def test_predict_returns_a_float_or_an_array_of_the_input_shape(be_xy):
+    result = extrapolate(*be_xy)
+    value = result.predict(1500)
+    assert type(value) is float
+    assert result.predict(np.float64(1500)) == result.predict("1500") == value
+    assert type(result.predict(np.asarray(1500.0))) is float
+    targets = [1300, 1500, 2000]
+    expected = [result.predict(v) for v in targets]
+    for convert in (list, tuple, np.asarray, pd.Series):
+        array = result.predict(convert(targets))
+        assert isinstance(array, np.ndarray) and array.shape == (3,) and array.tolist() == expected
+    assert result.predict(np.reshape(targets, (3, 1))).tolist() == [[v] for v in expected]
+    assert result.predict([]).shape == (0,)
+
+
+@pytest.mark.parametrize("target, message", [
+    (None, "target is required."),
+    ("", "target is required."),
+    (0, "target must be greater than zero."),
+    (-1500.0, "target must be greater than zero."),
+    ("abc", "target must be a number."),
+    (float("inf"), "target must be finite."),
+    (float("-inf"), "target must be finite."),
+    (float("nan"), "target must be finite."),
+    ([1500, 0], "target must be greater than zero."),
+])
+def test_predict_rejects_invalid_targets(target, message, be_xy):
+    result = extrapolate(*be_xy)
+    with pytest.raises(ValueError) as info:
+        result.predict(target)
+    assert str(info.value) == message
+
+
 def test_summary(be_xy):
     result = extrapolate(*be_xy, model="power_law")
     text = result.summary()

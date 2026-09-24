@@ -117,3 +117,24 @@ def optional_n_fit(value: Any, n_available: int) -> Optional[int]:
     if n_fit < 3:
         raise ValueError("n_fit must be at least 3.")
     return min(n_fit, n_available)
+
+
+def _target(value: Any) -> float:
+    if value is None or value == "":
+        raise ValueError("target is required.")
+
+    target = _number(value, "target")
+    if not math.isfinite(target):
+        raise ValueError("target must be finite.")
+    if target <= 0.0:
+        raise ValueError("target must be greater than zero.")
+    return target
+
+
+def targets(value: Any) -> np.ndarray:
+    """
+    The basis sizes to predict at, as a float array of the input's shape (0-d
+    for a scalar).  Each must be a finite number greater than zero.
+    """
+    items = np.asarray(value, dtype=object)
+    return np.array([_target(item) for item in items.reshape(-1)], dtype=float).reshape(items.shape)

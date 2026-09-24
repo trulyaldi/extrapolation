@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import numpy as np
 from matplotlib.figure import Figure
+from numpy.typing import ArrayLike
+
+from ._validation import targets
+from .extrap import extraplus
 
 # Plain-text forms of the fitted models (see extraplus._compute_basis).
 _FORMULAS = {
@@ -29,7 +33,8 @@ class Result:
 
     The model is ``y = A * phi(x / x_max) + C`` with ``phi(t) = exp(-B t)``
     (exponential), ``exp(-B sqrt(t))`` (sqrt_exponential) or ``t**(-B)``
-    (power_law).  ``value`` is the limit C for x -> infinity.
+    (power_law).  ``value`` is the limit C for x -> infinity, and
+    :meth:`predict` gives the fitted y at a finite x.
 
     Attributes
     ----------
@@ -65,6 +70,8 @@ class Result:
     ('exponential', 5, None)
     >>> sorted(result.to_dict())[:3]
     ['amplitude', 'b_fixed', 'decay_rate']
+    >>> result.value < result.predict(1000) < result.predict(600)   # y beyond the data
+    True
     """
 
     value: float
@@ -80,6 +87,56 @@ class Result:
     # The cleaned input, kept to redraw the plots.
     _x: tuple[float, ...] = field(repr=False)
     _y: tuple[float, ...] = field(repr=False)
+    # The fit in the engine's scaled units, y_scaled = (y - y_min) / y_range, for predict().
+    _C_scaled: float = field(repr=False)
+    _A_scaled: float = field(repr=False)
+    _y_min: float = field(repr=False)
+    _y_range: float = field(repr=False)
+
+    def predict(self, x: ArrayLike) -> Union[float, np.ndarray]:
+        """
+        The fitted curve ``A * phi(x / x_max) + C`` at the basis size x, in the
+        units of y.
+
+        It is meant for x beyond the data, the value a larger basis would give.
+        Inside the data range it returns the fitted value there, not the data.
+        For x -> infinity it tends to ``value``.  This is the Excel functions
+        FINITE_EXTRAP1 to FINITE_EXTRAP3.
+
+        Parameters
+        ----------
+        x : float or array-like
+            The basis size, or several of them (a list, tuple, NumPy array or
+            pandas Series).  Each must be a finite number greater than zero.
+
+        Returns
+        -------
+        float or numpy.ndarray
+            A float for a scalar x, otherwise an array of the same shape as x.
+
+        Raises
+        ------
+        ValueError
+            If x (the target) is missing, not a number, not finite, or not
+            greater than zero, for example "target must be greater than zero."
+
+        Examples
+        --------
+        >>> from extraplus import extrapolate
+        >>> result = extrapolate([100, 200, 300, 400, 500], [1.5, 1.2, 1.1, 1.05, 1.03])
+        >>> y_600 = result.predict(600)
+        >>> result.value < y_600 < 1.03
+        True
+        >>> result.predict([600, 700, 800]).shape
+        (3,)
+        """
+        t = targets(x)
+        # The engine's own basis function and unscaling, as in fit_linearized() and plot().
+        engine = object.__new__(extraplus)
+        engine.model_type = self.model
+        phi = engine._compute_basis(self.decay_rate, t.reshape(-1) / self.x_max)[:, 1]
+        y = self._y_min + self._y_range * (self._C_scaled + self._A_scaled * phi)
+        return float(y[0]) if t.ndim == 0 else y.reshape(t.shape)
 
     def summary(self) -> str:
         """

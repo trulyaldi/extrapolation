@@ -2,15 +2,18 @@
 Excel functions (xlwings UDFs) for extraplus.
 
 Each function converts its Excel ranges, calls the extraplus Python API
-(``extraplus.extrapolate()``, ``Result.plot()``, ``Result.plot_linearized()``)
-and formats the result for the cell, so Excel and Python give the same results
-by construction.  This module contains no fitting, validation or plotting
+(``extraplus.extrapolate()``, ``Result.predict()``, ``Result.plot()``,
+``Result.plot_linearized()``) and formats the result for the cell, so Excel and
+Python give the same results by construction.  This module contains no fitting, validation or plotting
 logic of its own.
 
 Excel functions:
 
     EXTRAP1 / EXTRAP2 / EXTRAP3
         Return the extrapolated infinite-limit value C.
+
+    FINITE_EXTRAP1 / FINITE_EXTRAP2 / FINITE_EXTRAP3
+        Return the fitted curve's value at a finite target basis size.
 
     UNCERTAINTY1 / UNCERTAINTY2 / UNCERTAINTY3
         Return the uncertainty of C in the original y units.
@@ -256,6 +259,50 @@ def EXTRAP2(x_range, y_range, b_fixed=None, n_fit=None):
 def EXTRAP3(x_range, y_range, b_fixed=None, n_fit=None):
     """Power-law extrapolated value C at infinity."""
     return _run_udf(x_range, y_range, _POWER_LAW, b_fixed, n_fit).value
+
+
+# ---------------------------------------------------------------------------
+# Fitted values at a finite basis size
+# ---------------------------------------------------------------------------
+
+# target defaults to None so that Excel calls Python (and shows "Error: target
+# is required.") when it is left out, instead of rejecting the formula.
+
+
+@xw.func(category="Extrapolation", volatile=False)
+@xw.arg("x_range", np.array, ndim=2, doc="Range containing basis-size x values.")
+@xw.arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
+@xw.arg("target", doc="Basis size to evaluate the fit at, usually beyond the data (a number > 0).")
+@xw.arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.")
+@xw.arg("n_fit", doc="Optional number of first numeric rows used in the fit.")
+@_excel_errors
+def FINITE_EXTRAP1(x_range, y_range, target=None, b_fixed=None, n_fit=None):
+    """Exponential fit evaluated at the basis size target."""
+    return _run_udf(x_range, y_range, _EXPONENTIAL, b_fixed, n_fit).predict(target)
+
+
+@xw.func(category="Extrapolation", volatile=False)
+@xw.arg("x_range", np.array, ndim=2, doc="Range containing basis-size x values.")
+@xw.arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
+@xw.arg("target", doc="Basis size to evaluate the fit at, usually beyond the data (a number > 0).")
+@xw.arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.")
+@xw.arg("n_fit", doc="Optional number of first numeric rows used in the fit.")
+@_excel_errors
+def FINITE_EXTRAP2(x_range, y_range, target=None, b_fixed=None, n_fit=None):
+    """Square-root-exponential fit evaluated at the basis size target."""
+    return _run_udf(x_range, y_range, _SQRT_EXPONENTIAL, b_fixed, n_fit).predict(target)
+
+
+@xw.func(category="Extrapolation", volatile=False)
+@xw.arg("x_range", np.array, ndim=2, doc="Range containing positive basis-size x values.")
+@xw.arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
+@xw.arg("target", doc="Basis size to evaluate the fit at, usually beyond the data (a number > 0).")
+@xw.arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.")
+@xw.arg("n_fit", doc="Optional number of first numeric rows used in the fit.")
+@_excel_errors
+def FINITE_EXTRAP3(x_range, y_range, target=None, b_fixed=None, n_fit=None):
+    """Power-law fit evaluated at the basis size target."""
+    return _run_udf(x_range, y_range, _POWER_LAW, b_fixed, n_fit).predict(target)
 
 
 # ---------------------------------------------------------------------------
@@ -702,6 +749,9 @@ __all__ = [
     "EXTRAP1",
     "EXTRAP2",
     "EXTRAP3",
+    "FINITE_EXTRAP1",
+    "FINITE_EXTRAP2",
+    "FINITE_EXTRAP3",
     "UNCERTAINTY1",
     "UNCERTAINTY2",
     "UNCERTAINTY3",

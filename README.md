@@ -37,6 +37,7 @@ energy = [-14.6661876127332, -14.6667402339119, -14.6672828224583, -14.667324918
 res = extrapolate(basis, energy, model="exponential")   # or model=1, 2, 3 as in Excel
 print(res.summary())
 print(res.value, res.uncertainty)
+print(res.predict(1500))             # the fitted curve at a larger basis, x = 1500
 
 fig = res.plot()                     # a Matplotlib figure
 fig.savefig("be_1se_fit.png", dpi=150)
@@ -87,6 +88,7 @@ together; `EXTRAPLUS_VERSION()` returns `extraplus.__version__`.
 |---|---|---|
 | `summary()` | a readable multi-line `str` (printing it is up to you) | |
 | `to_dict()` | a `dict` of the ten attributes above, as plain Python values | |
+| `predict(x)` | the fitted curve A·φ(x/x_max) + C at the basis size `x`, in the units of y: a `float` for a scalar, an array of the same shape for array-like `x`. Meant for `x` beyond the data; `x` must be a finite number > 0, otherwise `ValueError` | `FINITE_EXTRAP1`–`3` |
 | `plot()` | a Matplotlib `Figure`: all points (those beyond `n_fit` as open markers), the fitted curve to 1.5 x_max, and C ± uncertainty | `EXTRAP1_PLOT`–`3_PLOT` |
 | `plot_linearized()` | a Matplotlib `Figure`: ln\|y − C\| against the model's transformed x, with the fit and its 95% confidence band | `EXTRAP1_PLOT_LOG`–`3_PLOT_LOG` |
 
@@ -106,6 +108,8 @@ show after "Error: ":
 - `b_fixed must be a number.` / `b_fixed must be finite.` / `b_fixed must be greater than zero.`
 - `n_fit must be a number.` / `n_fit must be finite.` / `n_fit must be at least 3.`
 - `model must be 'exponential', 'sqrt_exponential', 'power_law', 1, 2 or 3.`
+- From `predict()` (`FINITE_EXTRAP1`–`3`): `target is required.` / `target must be a number.` /
+  `target must be finite.` / `target must be greater than zero.`
 
 When the uncertainty is not finite, `extrapolate()` and `compare()` issue a `RuntimeWarning`
 and still return the result. The functions never print.

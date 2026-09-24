@@ -31,6 +31,7 @@ the model: **1** exponential, **2** square-root exponential, **3** power law.
 | Function | Returns |
 |---|---|
 | `EXTRAP1(x, y, [b_fixed], [n_fit])` | extrapolated value C at infinite basis |
+| `FINITE_EXTRAP1(x, y, target, [b_fixed], [n_fit])` | the fitted curve's value at the finite basis size `target`, usually one beyond your data. Example: with x = 10000 to 14000 in `A2:A4`, `=FINITE_EXTRAP1(A2:A4, B2:B4, 15000)` gives the value expected at basis size 15000 |
 | `UNCERTAINTY1(x, y, [b_fixed], [n_fit])` | uncertainty of C |
 | `DECAY_RATE1(x, y, [b_fixed], [n_fit])` | decay parameter B |
 | `EXTRAP1_V(...)` / `EXTRAP1_H(...)` | C, uncertainty and B in 3 cells, down / across |

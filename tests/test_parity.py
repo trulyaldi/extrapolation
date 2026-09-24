@@ -45,6 +45,28 @@ def test_numeric_udfs_equal_the_api(n, args, data):
     assert getattr(extrapolation, f"EXTRAP{n}_H")(X, Y, *args).tolist() == [triple]
 
 
+@pytest.mark.parametrize("args", [(), (5.0,), (None, 6), (4.0, 7.9)], ids=["default", "b_fixed", "n_fit", "both"])
+@pytest.mark.parametrize("n", MODELS)
+def test_finite_udfs_equal_predict(n, args, data):
+    x, y = data
+    result = extrapolate(x, y, MODELS[n], *args)
+    udf = getattr(extrapolation, f"FINITE_EXTRAP{n}")
+    for target in (15000, 1300.0, 650, 1e300):
+        assert udf(column(x), column(y), target, *args) == result.predict(target)
+
+
+@pytest.mark.parametrize("target", [None, "", 0, -1500.0, "abc", float("inf"), float("nan")])
+@pytest.mark.parametrize("n", MODELS)
+def test_finite_udf_target_errors_equal_the_api_message(n, target, be_xy):
+    x, y = be_xy
+    with pytest.raises(ValueError) as info:
+        extrapolate(x, y, MODELS[n]).predict(target)
+    udf = getattr(extrapolation, f"FINITE_EXTRAP{n}")
+    assert udf(column(x), column(y), target) == f"Error: {info.value}"
+    if target is None:   # left out of the formula
+        assert udf(column(x), column(y)) == "Error: target is required."
+
+
 @pytest.mark.parametrize("x, y, args", [
     ([100, 200, 300], [1.0, 2.0], ()),
     ([100, 200], [1.0, 2.0], ()),
@@ -58,6 +80,7 @@ def test_error_texts_equal_the_api_message(n, x, y, args):
         extrapolate(x, y, MODELS[n], *args)
     for name in (f"EXTRAP{n}", f"UNCERTAINTY{n}", f"DECAY_RATE{n}", f"EXTRAP{n}_V", f"EXTRAP{n}_H"):
         assert getattr(extrapolation, name)(column(x), column(y), *args) == f"Error: {info.value}"
+    assert getattr(extrapolation, f"FINITE_EXTRAP{n}")(column(x), column(y), 1500, *args) == f"Error: {info.value}"
 
 
 class _Pictures:

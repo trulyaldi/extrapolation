@@ -11,9 +11,17 @@
     row per model.
   - `extraplus.Result` (frozen dataclass): `value`, `uncertainty`, `decay_rate`, `amplitude`,
     `r2`, `model`, `n_points`, `n_fit_used`, `x_max`, `b_fixed`, and `summary()`, `to_dict()`,
-    `plot()`, `plot_linearized()`.
+    `predict()`, `plot()`, `plot_linearized()`.
+  - `Result.predict(x)`: the fitted curve A·φ(x/x_max) + C at a finite basis size x, in the
+    units of y (a float, or an array for array-like x). `x` must be a finite number > 0;
+    otherwise it raises `ValueError` ("target is required.", "target must be a number.",
+    "target must be finite." or "target must be greater than zero.").
   - `extraplus.__version__`; the package is typed (`py.typed`).
   - The API never prints; a non-finite uncertainty gives a `RuntimeWarning`.
+- Excel functions `FINITE_EXTRAP1(x, y, target, [b_fixed], [n_fit])`, `FINITE_EXTRAP2` and
+  `FINITE_EXTRAP3`: the fitted value at the finite basis size `target` (`Result.predict(target)`),
+  with the same input handling as `EXTRAP1`-`3`. A missing or invalid target shows
+  "Error: <message>".
 - The `extraplus` research class stays importable as before (`from extraplus import extraplus`).
 
 ### Changed
@@ -37,4 +45,5 @@
   New (Python only): `model must be 'exponential', 'sqrt_exponential', 'power_law', 1, 2 or 3.`
 
 - `excel/extrapolation.py` changed, so the Excel add-in must be rebuilt
-  (`excel/build/build_addin.sh`) before the next release.
+  (`excel/build/build_addin.sh`) before the next release. `FINITE_EXTRAP1`-`3` appear in Excel
+  only after that rebuild.
