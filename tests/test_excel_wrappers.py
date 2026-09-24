@@ -159,6 +159,15 @@ def test_plot_udfs_draw_a_figure(name, n_fit, xy):
     fig.savefig(io.BytesIO(), format="png", bbox_inches="tight", dpi=50)   # as xlwings saves it
 
 
+@pytest.mark.parametrize("name", PLOT_UDFS)
+def test_plot_udfs_draw_rising_data(name, xy):
+    x, y = xy
+    rising = excel_column([-value for value in y.ravel()])
+    status, fig = run_plot_udf(name, x, rising)
+    assert status == f"{name} updated"
+    fig.savefig(io.BytesIO(), format="png", bbox_inches="tight", dpi=50)
+
+
 def test_plot_titles_show_each_model_formula(xy):
     for suffix in ("", "_LOG"):
         titles = [run_plot_udf(f"EXTRAP{n}_PLOT{suffix}", *xy)[1].axes[0].get_title().split("\n")[0]

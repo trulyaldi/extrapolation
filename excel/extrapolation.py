@@ -452,7 +452,7 @@ def _asinh_y_axis(ax, center: float, width: float, low: float, high: float) -> N
     Show the y axis on an asinh scale around ``center``: linear within about
     +-width, logarithmic in the distance from center beyond that.  This keeps
     the whole data range and a band of half-width ``width`` around center
-    readable in one plot.  Ticks sit at center and center +- 10^k.
+    readable in one plot.  Ticks sit at center and center +- 10^k (and 2, 5 x 10^k if few).
     """
     def forward(values):
         return np.arcsinh((np.asarray(values, dtype=float) - center) / width)
@@ -465,13 +465,17 @@ def _asinh_y_axis(ax, center: float, width: float, low: float, high: float) -> N
     pad = 0.05 * ((u_high - u_low) or 1.0)
     ax.set_ylim(float(inverse(u_low - pad)), float(inverse(u_high + pad)))
 
+    # At most 5 decades (a near-exact fit makes width tiny); with 2 or fewer,
+    # also 2 and 5 times 10^k so the axis keeps a few labels.
     k_max = int(np.floor(np.log10(max(high - center, center - low, width))))
-    k_min = min(int(np.ceil(np.log10(width))), k_max)
+    k_min = max(min(int(np.ceil(np.log10(width))), k_max), k_max - 4)
+    steps = (1.0,) if k_max - k_min >= 2 else (1.0, 2.0, 5.0)
     ticks = [center] + [
-        center + sign * 10.0**k
+        center + sign * step * 10.0**k
         for k in range(k_min, k_max + 1)
+        for step in steps
         for sign in (1.0, -1.0)
-        if low <= center + sign * 10.0**k <= high
+        if low <= center + sign * step * 10.0**k <= high
     ]
     decimals = max(0, 1 - k_min)
     ax.yaxis.set_major_locator(FixedLocator(sorted(ticks)))
