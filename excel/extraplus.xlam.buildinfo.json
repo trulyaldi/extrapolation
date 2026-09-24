@@ -1,8 +1,8 @@
 {
   "xlwings": "0.37.4",
   "extraplus": "0.2.0",
-  "extrapolation_py_sha256": "b01e58f35307ef7e1d073a301edb0376d81355c5d9ae55165407d7759c32add4",
-  "built": "2026-09-24T15:27:08",
+  "extrapolation_py_sha256": "863508b2dd268d1f5c7f0032a2f2e15627382a31887e334d093ccc53e6b442d5",
+  "built": "2026-09-24T20:33:40",
   "components": [
     "Dictionary",
     "Sheet2",
@@ -31,6 +31,9 @@
     "EXTRAP3_PLOT_LOG",
     "EXTRAP3_V",
     "EXTRAPLUS_VERSION",
+    "FINITE_EXTRAP1",
+    "FINITE_EXTRAP2",
+    "FINITE_EXTRAP3",
     "UNCERTAINTY1",
     "UNCERTAINTY2",
     "UNCERTAINTY3"
