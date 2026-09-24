@@ -1,8 +1,8 @@
 {
   "xlwings": "0.37.4",
-  "extraplus": "0.2.0",
+  "extraplus": "0.3.0.dev0",
   "extrapolation_py_sha256": "863508b2dd268d1f5c7f0032a2f2e15627382a31887e334d093ccc53e6b442d5",
-  "built": "2026-09-24T20:33:40",
+  "built": "2026-09-24T20:42:42",
   "components": [
     "Dictionary",
     "Sheet2",
