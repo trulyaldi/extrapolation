@@ -82,7 +82,7 @@ def test_wrapper_matches_extraplus_called_directly(n, xy):
     solver = extraplus(df=pd.DataFrame({"x": x, "y": y}), x_col="x", y_col="y",
                        err_df=None, inf_df=None, b_init=None, n_fit=None, use_energy_b=False)
     solver.fit_linearized(models=[MODELS[n]], verbose=False, compute_uq=False)
-    solver.compute_uncertainty(k_cov=1.0, q=0.84, use_PI=True, robust_scale=True)
+    extrapolation._run_uncertainty(solver)   # the wrappers' call, with the Excel defaults
     res = solver.results[MODELS[n]]
 
     assert getattr(extrapolation, f"EXTRAP{n}")(*xy) == solver.y_min + solver.y_range * res["C"]

@@ -53,6 +53,7 @@ from dataclasses import dataclass
 from functools import lru_cache, wraps
 from importlib.metadata import version as _package_version
 from io import StringIO
+import inspect
 from typing import Any, Optional
 
 import numpy as np
@@ -212,6 +213,38 @@ def _as_bool(value: Any, default: bool) -> bool:
 # Thin adapter around extraplus.extraplus
 # ---------------------------------------------------------------------------
 
+# Options the Excel functions pass to extraplus.compute_uncertainty() (the
+# UDFs' optional arguments override them). This is the place to adjust when
+# the uncertainty method changes.
+_UNCERTAINTY_DEFAULTS = {"k_cov": 1.0, "q": 0.84, "use_PI": True, "robust_scale": True}
+
+
+def _run_uncertainty(solver, **options):
+    """
+    Call ``solver.compute_uncertainty()`` with ``_UNCERTAINTY_DEFAULTS``,
+    overridden by ``options``.
+
+    Only the parameters the method accepts are passed (all of them if it takes
+    ``**kwargs``), read from its signature, so versions of extraplus with other
+    uncertainty parameters work too.  Errors raised inside the method are not
+    caught.
+    """
+    unknown = options.keys() - _UNCERTAINTY_DEFAULTS.keys()
+    if unknown:
+        raise TypeError(f"unknown uncertainty option(s): {', '.join(sorted(unknown))}")
+
+    method = solver.compute_uncertainty
+    kwargs = {**_UNCERTAINTY_DEFAULTS, **options}
+    parameters = inspect.signature(method).parameters.values()
+    if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters):
+        accepted = {
+            p.name
+            for p in parameters
+            if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        }
+        kwargs = {name: value for name, value in kwargs.items() if name in accepted}
+    return method(**kwargs)
+
 
 def _fit_with_extraplus(
     x_values: np.ndarray,
@@ -257,7 +290,8 @@ def _fit_with_extraplus(
         if model_type not in results:
             raise ValueError(f"extraplus did not return a result for '{model_type}'.")
 
-        solver.compute_uncertainty(
+        _run_uncertainty(
+            solver,
             k_cov=k_cov,
             q=q,
             use_PI=use_pi,
@@ -442,7 +476,8 @@ def _build_fitted_solver_for_plot(
         if model_type not in results:
             raise ValueError(f"extraplus did not return a result for '{model_type}'.")
 
-        solver.compute_uncertainty(
+        _run_uncertainty(
+            solver,
             k_cov=k_cov_value,
             q=q_value,
             use_PI=_as_bool(use_pi, True),
