@@ -58,7 +58,9 @@ from typing import Any, Optional
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.collections import PolyCollection
 from matplotlib.figure import Figure
+from matplotlib.ticker import FixedLocator, FuncFormatter, NullLocator
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +347,8 @@ def _build_fitted_solver_for_plot(
     n_fit: Any = None,
 ):
     """
-    Build an ``extraplus`` instance for exactly one model.
+    Build an ``extraplus`` instance for exactly one model; return it with the
+    cleaned x and y (all rows, including any beyond n_fit).
 
     The fitting itself still lives entirely in extrap.py.  This helper only
     prepares Excel input, runs the requested extraplus model, and computes the
@@ -382,20 +385,18 @@ def _build_fitted_solver_for_plot(
 
         solver.compute_uncertainty()
 
-    return solver
+    return solver, x, y
 
 
-def _get_figure_from_extraplus(solver, log_plot: bool) -> Figure:
+def _figures_from_extraplus(solver, log_plot: bool) -> list[Figure]:
     """
-    Call extrap.py's existing plot() or plot_log() method and recover the
-    Matplotlib Figure that it created.
+    Call extrap.py's existing plot() or plot_log() method and return every
+    Matplotlib Figure it created, oldest first.
 
-    This supports both styles of plotting method:
-      * returning a Figure explicitly, or
-      * creating a pyplot figure and returning None.
-
-    plt.show() is temporarily suppressed because Excel needs the Figure object
-    inserted into the worksheet rather than a separate GUI plot window.
+    This supports plotting methods that return a Figure (or an Axes) as well as
+    ones that only create pyplot figures and return None.  plt.show() is
+    suppressed and the printed summary table is discarded, because Excel needs
+    the Figure objects rather than a GUI window or console output.
     """
     plot_method = solver.plot_log if log_plot else solver.plot
 
@@ -404,33 +405,165 @@ def _get_figure_from_extraplus(solver, log_plot: bool) -> Figure:
 
     try:
         plt.show = lambda *args, **kwargs: None
-        returned = plot_method()
+        with redirect_stdout(StringIO()):
+            returned = plot_method()
     finally:
         plt.show = original_show
 
-    if isinstance(returned, Figure):
-        return returned
-
-    # Also support plotting helpers that return a Matplotlib Axes.
-    returned_figure = getattr(returned, "figure", None)
-    if isinstance(returned_figure, Figure):
-        return returned_figure
-
-    figures_after = list(plt.get_fignums())
-    new_figure_numbers = [
-        number for number in figures_after if number not in figures_before
+    figures = [
+        plt.figure(number) for number in plt.get_fignums() if number not in figures_before
     ]
+    for candidate in (returned, getattr(returned, "figure", None)):
+        if isinstance(candidate, Figure) and candidate not in figures:
+            figures.append(candidate)
 
-    if new_figure_numbers:
-        return plt.figure(new_figure_numbers[-1])
+    if not figures:
+        method_name = "plot_log()" if log_plot else "plot()"
+        raise RuntimeError(
+            f"extraplus.{method_name} did not return or create a Matplotlib Figure."
+        )
+    return figures
 
-    if figures_after:
-        return plt.gcf()
 
-    method_name = "plot_log()" if log_plot else "plot()"
-    raise RuntimeError(
-        f"extraplus.{method_name} did not return or create a Matplotlib Figure."
+# The fitted models as extraplus defines them: y = C + A * phi(t) with
+# t = x / x_max (extraplus._compute_basis), shown in the plot titles.
+_MODEL_FORMULAS = {
+    _EXPONENTIAL: r"$y = A\,e^{-B\,x/x_{\max}} + C$",
+    _SQRT_EXPONENTIAL: r"$y = A\,e^{-B\sqrt{x/x_{\max}}} + C$",
+    _POWER_LAW: r"$y = A\,(x/x_{\max})^{-B} + C$",
+}
+
+# Title marker of the full-range figure of extraplus.plot(), and the label
+# extraplus.plot_log() gives its prediction-interval band.
+_FULL_VIEW_TITLE = "Full View"
+_PI_BAND_LABEL = "95% PI Band"
+
+
+def _full_view_figure(figures: list[Figure]) -> Figure:
+    """The full-range figure among those extraplus.plot() created."""
+    for fig in figures:
+        if fig.axes and _FULL_VIEW_TITLE in fig.axes[0].get_title():
+            return fig
+    raise RuntimeError(f"extraplus.plot() did not create its '{_FULL_VIEW_TITLE}' figure.")
+
+
+def _asinh_y_axis(ax, center: float, width: float, low: float, high: float) -> None:
+    """
+    Show the y axis on an asinh scale around ``center``: linear within about
+    +-width, logarithmic in the distance from center beyond that.  This keeps
+    the whole data range and a band of half-width ``width`` around center
+    readable in one plot.  Ticks sit at center and center +- 10^k.
+    """
+    def forward(values):
+        return np.arcsinh((np.asarray(values, dtype=float) - center) / width)
+
+    def inverse(values):
+        return center + width * np.sinh(np.asarray(values, dtype=float))
+
+    ax.set_yscale("function", functions=(forward, inverse))
+    u_low, u_high = float(forward(low)), float(forward(high))
+    pad = 0.05 * ((u_high - u_low) or 1.0)
+    ax.set_ylim(float(inverse(u_low - pad)), float(inverse(u_high + pad)))
+
+    k_max = int(np.floor(np.log10(max(high - center, center - low, width))))
+    k_min = min(int(np.ceil(np.log10(width))), k_max)
+    ticks = [center] + [
+        center + sign * 10.0**k
+        for k in range(k_min, k_max + 1)
+        for sign in (1.0, -1.0)
+        if low <= center + sign * 10.0**k <= high
+    ]
+    decimals = max(0, 1 - k_min)
+    ax.yaxis.set_major_locator(FixedLocator(sorted(ticks)))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.{decimals}f}"))
+    ax.yaxis.set_minor_locator(NullLocator())
+
+
+def _style_fit_plot(fig: Figure, solver, model_type: str, x_all, y_all) -> None:
+    """
+    Turn extraplus.plot()'s full-range figure into the EXTRAP*_PLOT picture:
+    the model formula and fitted values as title, every input point (rows
+    beyond n_fit as open markers), and the C +- uncertainty band kept readable
+    next to the full data range with an asinh y axis around C.
+    """
+    ax = fig.axes[0]
+    result = solver.results[model_type]
+    A = solver.y_range * float(result["A"])
+    B = float(result["B"])
+    C = solver.y_min + solver.y_range * float(result["C"])
+    # The band extraplus.plot() draws uses sigma_mc.
+    sigma = solver.y_range * float(result.get("sigma_mc", 0.0))
+    sigma_ok = bool(np.isfinite(sigma) and sigma > 0.0)
+    n_fitted = len(solver.raw_x)
+
+    for line in ax.get_lines():
+        label = line.get_label()
+        if label == "Data":
+            if n_fitted < len(x_all):
+                line.set_label("Data (fitted)")
+        elif not label.startswith("_"):
+            line.set_label("Fit")
+    if n_fitted < len(x_all):
+        ax.plot(x_all[n_fitted:], y_all[n_fitted:], "o", mfc="none", mec="k",
+                markersize=6, zorder=5, label="Data (not fitted)")
+
+    for band in list(ax.collections):   # the C +- sigma band
+        if sigma_ok:
+            band.set_label("C ± uncertainty")
+        else:
+            band.remove()
+
+    curves = [np.asarray(line.get_ydata(), dtype=float)
+              for line in ax.get_lines() if line.get_label() == "Fit"]
+    values = np.concatenate([np.asarray(y_all, dtype=float), [C], *curves]
+                            + ([[C - sigma, C + sigma]] if sigma_ok else []))
+    values = values[np.isfinite(values)]
+    if sigma_ok:
+        width = sigma
+    else:
+        distances = np.abs(np.asarray(y_all, dtype=float) - C)
+        distances = distances[distances > 0.0]
+        width = float(distances.min()) if distances.size else 1e-3 * solver.y_range
+    _asinh_y_axis(ax, C, width, float(values.min()), float(values.max()))
+
+    ax.set_title(
+        f"{_MODEL_FORMULAS[model_type]}\n"
+        f"A = {A:.6g},  B = {B:.6g},  C = {C:.10g} ± {sigma:.2g},  "
+        f"x_max = {solver.x_max:g}"
     )
+    ax.legend()
+    fig.tight_layout()
+
+
+def _style_log_plot(fig: Figure, model_type: str) -> None:
+    """
+    Turn extraplus.plot_log()'s figure into the EXTRAP*_PLOT_LOG picture: the
+    model formula as title and no prediction-interval band (the confidence
+    band stays), with the y limits fitted to what remains.
+    """
+    ax = fig.axes[0]
+    for collection in list(ax.collections):
+        if collection.get_label() == _PI_BAND_LABEL:
+            collection.remove()
+
+    values = [np.asarray(line.get_ydata(), dtype=float) for line in ax.get_lines()]
+    for collection in ax.collections:
+        if isinstance(collection, PolyCollection):   # bands
+            values += [path.vertices[:, 1] for path in collection.get_paths()]
+        else:                                        # scatter points
+            values.append(np.asarray(collection.get_offsets(), dtype=float).reshape(-1, 2)[:, 1])
+    values = np.concatenate(values)
+    values = values[np.isfinite(values)]
+    if values.size:
+        low, high = float(values.min()), float(values.max())
+        pad = 0.05 * ((high - low) or 1.0)
+        ax.set_ylim(low - pad, high + pad)
+
+    linearization = ax.get_title().split(": ", 1)[-1]
+    ax.set_title(f"{_MODEL_FORMULAS[model_type]}\nlinearized: {linearization}", fontsize=11)
+    fig.suptitle("")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
 
 
 def _insert_plot_in_excel(
@@ -474,7 +607,7 @@ def _run_plot_udf(
     n_fit: Any = None,
 ) -> str:
     """Shared implementation for all six Excel plot UDFs."""
-    solver = _build_fitted_solver_for_plot(
+    solver, x, y = _build_fitted_solver_for_plot(
         x_range=x_range,
         y_range=y_range,
         model_type=model_type,
@@ -482,16 +615,23 @@ def _run_plot_udf(
         n_fit=n_fit,
     )
 
-    fig = _get_figure_from_extraplus(solver, log_plot=log_plot)
+    figures = _figures_from_extraplus(solver, log_plot=log_plot)
 
     try:
+        if log_plot:
+            fig = figures[-1]
+            _style_log_plot(fig, model_type)
+        else:
+            fig = _full_view_figure(figures)
+            _style_fit_plot(fig, solver, model_type, x, y)
         _insert_plot_in_excel(
             caller=caller,
             fig=fig,
             picture_name=picture_name,
         )
     finally:
-        plt.close(fig)
+        for figure in figures:
+            plt.close(figure)
 
     return f"{picture_name} updated"
 

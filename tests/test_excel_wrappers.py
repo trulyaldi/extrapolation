@@ -8,13 +8,22 @@ a change to the arguments of ``extraplus.compute_uncertainty()``.
 """
 
 import importlib.metadata
+import io
 import math
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
-import numpy as np
-import pandas as pd
-import pytest
+import matplotlib
+
+matplotlib.use("Agg")   # before extrapolation imports pyplot
+
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+import pytest  # noqa: E402
+from matplotlib.collections import PolyCollection  # noqa: E402
+from matplotlib.figure import Figure  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "excel"))
 
@@ -41,6 +50,7 @@ BE_1SE_ENERGY = [
 MODELS = {1: "exponential", 2: "sqrt_exponential", 3: "power_law"}
 SCALAR_UDFS = [f"{base}{n}" for base in ("EXTRAP", "UNCERTAINTY", "DECAY_RATE") for n in MODELS]
 SPILL_UDFS = [f"EXTRAP{n}{suffix}" for suffix in ("_V", "_H") for n in MODELS]
+PLOT_UDFS = [f"EXTRAP{n}_PLOT{suffix}" for suffix in ("", "_LOG") for n in MODELS]
 
 
 def excel_column(values):
@@ -116,3 +126,79 @@ def test_blank_and_text_cells_are_ignored(xy):
     padded_x = excel_column(["Basis Size", *x.ravel(), None, ""])
     padded_y = excel_column(["Energy", *y.ravel(), None, ""])
     assert extrapolation.EXTRAP1(padded_x, padded_y) == extrapolation.EXTRAP1(x, y)
+
+
+# ---------------------------------------------------------------------------
+# Plot UDFs
+# ---------------------------------------------------------------------------
+
+
+class _Pictures:
+    """Stands in for xlwings' sheet.pictures; keeps the figure it is given."""
+
+    def add(self, fig, **kwargs):
+        self.fig = fig
+
+
+def run_plot_udf(name, x, y, *args):
+    """Call a _PLOT UDF with a fake calling cell; return its status and figure."""
+    caller = SimpleNamespace(row=2, column=4, left=0.0, top=0.0, height=15.0,
+                             sheet=SimpleNamespace(pictures=_Pictures()))
+    figures_before = set(plt.get_fignums())
+    status = getattr(extrapolation, name)(x, y, caller, *args)
+    assert set(plt.get_fignums()) == figures_before, "the UDF left pyplot figures open"
+    return status, caller.sheet.pictures.fig
+
+
+@pytest.mark.parametrize("n_fit", [None, 5, 3])   # n_fit=3 has no residual dof: sigma = inf on dev
+@pytest.mark.parametrize("name", PLOT_UDFS)
+def test_plot_udfs_draw_a_figure(name, n_fit, xy):
+    status, fig = run_plot_udf(name, *xy, None, n_fit)
+    assert status == f"{name} updated"
+    assert isinstance(fig, Figure)
+    fig.savefig(io.BytesIO(), format="png", bbox_inches="tight", dpi=50)   # as xlwings saves it
+
+
+def test_plot_titles_show_each_model_formula(xy):
+    for suffix in ("", "_LOG"):
+        titles = [run_plot_udf(f"EXTRAP{n}_PLOT{suffix}", *xy)[1].axes[0].get_title().split("\n")[0]
+                  for n in MODELS]
+        assert titles == [extrapolation._MODEL_FORMULAS[MODELS[n]] for n in MODELS]
+        assert len(set(titles)) == 3
+
+
+@pytest.mark.parametrize("n", MODELS)
+def test_fit_plot_shows_all_data_and_the_extrapolation_range(n, xy):
+    x = np.asarray(xy[0], dtype=float).ravel()
+    for n_fit in (None, 5):
+        ax = run_plot_udf(f"EXTRAP{n}_PLOT", *xy, None, n_fit)[1].axes[0]
+        plotted_x = np.concatenate([line.get_xdata() for line in ax.get_lines()
+                                    if line.get_label().startswith("Data")])
+        assert sorted(plotted_x) == sorted(x)
+        low, high = ax.get_xlim()
+        assert low <= x.min() and high >= 1.5 * x.max()
+        assert "C ± uncertainty" in [t.get_text() for t in ax.get_legend().get_texts()]
+
+
+@pytest.mark.parametrize("n", MODELS)
+def test_log_plot_has_the_confidence_band_but_no_prediction_band(n, xy):
+    ax = run_plot_udf(f"EXTRAP{n}_PLOT_LOG", *xy)[1].axes[0]
+    labels = [c.get_label() for c in ax.collections]
+    assert "95% CI Band" in labels
+    assert not any("PI" in label for label in labels)
+    assert not any("PI" in t.get_text() for t in ax.get_legend().get_texts())
+
+    # The y range is fitted to what remains, not to extraplus' own PI band.
+    solver = extrapolation._build_fitted_solver_for_plot(*xy, MODELS[n])[0]
+    original = extrapolation._figures_from_extraplus(solver, log_plot=True)
+    try:
+        (pi,) = [c for c in original[-1].axes[0].collections if c.get_label() == "95% PI Band"]
+        pi_y = np.concatenate([path.vertices[:, 1] for path in pi.get_paths()])
+    finally:
+        for fig in original:
+            plt.close(fig)
+    low, high = ax.get_ylim()
+    assert low > pi_y.min() or high < pi_y.max()
+    bands = [c for c in ax.collections if isinstance(c, PolyCollection)]
+    band_y = np.concatenate([path.vertices[:, 1] for c in bands for path in c.get_paths()])
+    assert low <= band_y.min() and high >= band_y.max()
