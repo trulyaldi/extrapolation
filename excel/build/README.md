@@ -48,3 +48,25 @@ embeds the xlwings VBA) renamed to the `extraplus` project. Its hidden
 `%EXTRAPLUS_HOME%`, which `install.ps1` sets per user. A `Workbook_Open` handler
 copies `EXTRAPLUS_HOME` from `HKCU\Environment` into Excel's environment when Excel
 was started by a program that predates the install.
+
+## End-to-end test notes (v0.1.0)
+
+Excel 2021 (16.0.14332.20447, 64-bit) on Windows 10 21H2 (19044), with a global
+xlwings add-in in XLSTART; release zip extracted with Mark-of-the-Web on every file.
+
+| Check | Result |
+|---|---|
+| install.bat (fresh, and again as update) | SUCCESS; one `OPEN` value and one trusted location after each run and after each Excel quit |
+| EXTRAP1-3, UNCERTAINTY1-3, DECAY_RATE1-3 in a new .xlsx | bit-identical to extraplus in the installed venv and in the research .venv |
+| EXTRAPLUS_VERSION(), bad input | `0.1.0`; `Error: At least three paired numeric x/y observations are required.` |
+| Reopen the saved .xlsx (before and after the update) | recalculates, same values, no dialog |
+| UDF server | `%EXTRAPLUS_HOME%\venv\Scripts\pythonw.exe` (+ base `python\...\pythonw.exe`) only |
+| EXTRAPLUS_HOME missing from Excel's environment | picked up by the add-in's registry fallback |
+| EXTRAP1_V / EXTRAP1_H | legacy array output; dynamic-array spill not tested via COM (every `Range.Formula2` write and `HasSpill` read fails with 0x800A03EC on this Excel) |
+| Uninstall (the registered UninstallString) | exit code 0; `OPEN`, trusted location, EXTRAPLUS_HOME, Apps & features entry and folder removed; Excel then starts with no dialog |
+| Manual check: freshly started Excel inherits EXTRAPLUS_HOME | not required (covered by the registry fallback) |
+| Manual check: dynamic-array spill in the Excel UI | not required (spill is out of scope for v0.1.0) |
+
+Not tested: 32-bit Office, other Excel versions, the `_PLOT` functions, a second
+Windows account (saved workbooks link to the add-in's absolute path,
+`xl/externalLinks/`).

@@ -6,21 +6,42 @@ the same packages the add-in uses:
 
     %EXTRAPLUS_HOME%\\venv\\Scripts\\python.exe e2e_excel.py --book B.xlsx --results R.json [options]
 
-Excel is started the way a user starts it, by opening --book (a COM automation
-instance would not load add-ins), and then attached to:
+Excel is started the way a user starts it, by running EXCEL.EXE on --book (a COM
+automation instance would not load add-ins), and then attached to. It runs as a
+child of this process:
 
-    --launch explorer   through the Windows shell (Explorer), which has the
-                        current user environment including EXTRAPLUS_HOME
-    --launch direct     as a child of this process without EXTRAPLUS_HOME, to
-                        exercise the add-in's registry fallback
+    --launch inherit        with this process's environment unchanged
+    --launch without-home   without EXTRAPLUS_HOME, to exercise the add-in's
+                            registry fallback
+
+Whether an Excel started from the Windows shell picks up EXTRAPLUS_HOME is not
+tested here; that is checked by hand.
 
 --mode new (default) creates --book if needed, writes the test data and
 formulas, compares every cell with extraplus called directly, and saves the
 book. --mode reopen only recalculates an existing book and compares.
+--mode startup only opens --book, records the dialog boxes Excel shows and
+quits (for example after uninstalling: no "cannot find extraplus.xlam"); it
+does not need an Extraplus install.
+
+Formulas are written in two labelled steps, each write logged (cell, formula,
+property, outcome) after waiting for Application.Ready:
+
+    single-cell  functions returning one value, written with Range.Formula
+    spill        EXTRAP1_V / EXTRAP1_H (xlwings expand="table"), also written with
+                 Range.Formula: on Excel 2021 16.0.14332 every Range.Formula2
+                 write and HasSpill read fails with 0x800A03EC, even for =1+1.
+                 xlwings then fills the 3 cells as a legacy array formula, so
+                 this checks that output; dynamic-array spill is not tested
+                 via COM.
+
+A failure in the spill step is recorded as its own result and does not hide the
+single-cell results.
 """
 
 import argparse
 import ctypes
+import ctypes.wintypes
 import json
 import math
 import os
@@ -31,6 +52,7 @@ import traceback
 import winreg
 from pathlib import Path
 
+import pywintypes
 import xlwings as xw
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -46,7 +68,16 @@ CORE = {
     "D11": "=EXTRAPLUS_VERSION()",
     "D12": "=EXTRAP1(A2:A3,B2:B3)",   # too few points -> "Error: ..."
 }
-SPILL = {"F2": f"=EXTRAP1_V({X},{Y})"}   # best effort: F2:F4
+# [C, uncertainty, B] of EXTRAP1, down F2:F4 and across H2:J2.
+SPILL = {"F2": (f"=EXTRAP1_V({X},{Y})", ["F2", "F3", "F4"]),
+         "H2": (f"=EXTRAP1_H({X},{Y})", ["H2", "I2", "J2"])}
+
+# COM errors that mean "Excel is busy, try again", not "this call is wrong".
+BUSY_HRESULTS = {
+    -2147418111,  # RPC_E_CALL_REJECTED
+    -2147417846,  # RPC_E_SERVERCALL_RETRYLATER
+    -2146777998,  # VBA_E_IGNORE (0x800AC472)
+}
 
 
 def excel_exe():
@@ -70,6 +101,58 @@ def retry(fn, timeout=90, what="Excel"):
             time.sleep(1)
 
 
+def is_busy(exc):
+    if not isinstance(exc, pywintypes.com_error):
+        return False
+    hresult, _, excepinfo, _ = exc.args
+    return hresult in BUSY_HRESULTS or bool(excepinfo and excepinfo[5] in BUSY_HRESULTS)
+
+
+def wait_ready(app, timeout=60):
+    """Seconds waited until Application.Ready is True."""
+    started = time.time()
+    while True:
+        try:
+            if app.api.Ready:
+                return round(time.time() - started, 2)
+        except Exception as exc:
+            if not is_busy(exc):
+                raise
+        if time.time() - started > timeout:
+            raise RuntimeError(f"Application.Ready still False after {timeout} s")
+        time.sleep(0.25)
+
+
+class WriteFailed(RuntimeError):
+    pass
+
+
+def write(app, sheet, log, step, cell, prop, value, busy_timeout=15):
+    """Set Range(cell).<prop> = value once Excel is ready; log it; raise on failure."""
+    entry = {"step": step, "cell": cell, "property": prop,
+             "formula": value if isinstance(value, str) else f"<{len(value)} rows of data>"}
+    deadline = time.time() + busy_timeout
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            entry["ready_wait_s"] = wait_ready(app)
+            setattr(sheet.range(cell).api, prop, value)
+            entry["outcome"] = "ok"
+            break
+        except Exception as exc:
+            if is_busy(exc) and time.time() < deadline:
+                time.sleep(0.5)
+                continue
+            entry["outcome"] = f"error: {exc!r}"
+            break
+    entry["attempts"] = attempts
+    log.append(entry)
+    print("write " + json.dumps(entry, default=str), flush=True)
+    if entry["outcome"] != "ok":
+        raise WriteFailed(f"{step} write to {cell} failed: {entry['outcome']}")
+
+
 def excel_processes():
     cmd = ("Get-CimInstance Win32_Process -Filter \"Name='EXCEL.EXE'\" | "
            "Select-Object ProcessId, ParentProcessId | ConvertTo-Json")
@@ -88,12 +171,36 @@ def python_processes():
     return data if isinstance(data, list) else [data]
 
 
-def shell_pid():
-    """PID of the Explorer process that owns the taskbar (the user's shell)."""
-    hwnd = ctypes.windll.user32.FindWindowW("Shell_TrayWnd", None)
-    pid = ctypes.c_ulong()
-    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    return pid.value
+def dialogs():
+    """Visible dialog boxes (class #32770 or NUIDialog) of EXCEL.EXE, with their text."""
+    user32 = ctypes.windll.user32
+    pids = {p["ProcessId"] for p in excel_processes()}
+    enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+
+    def text(hwnd):
+        buf = ctypes.create_unicode_buffer(1024)
+        user32.GetWindowTextW(hwnd, buf, 1024)
+        return buf.value
+
+    def cls(hwnd):
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, buf, 256)
+        return buf.value
+
+    found = []
+
+    def top(hwnd, _):
+        pid = ctypes.wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value in pids and user32.IsWindowVisible(hwnd) and cls(hwnd) in ("#32770", "NUIDialog"):
+            children = []
+            user32.EnumChildWindows(hwnd, enum_proc(lambda h, _: children.append(text(h)) or True), 0)
+            found.append({"class": cls(hwnd), "title": text(hwnd),
+                          "text": [t for t in children if t]})
+        return True
+
+    user32.EnumWindows(enum_proc(top), 0)
+    return found
 
 
 def wait_excel_exit(timeout=90):
@@ -116,22 +223,23 @@ def make_blank_book(path):
     wait_excel_exit()
 
 
-def launch(mode, book_path):
+def start_excel(mode, book_path):
     if excel_processes():
         raise SystemExit("Close Excel before running the test.")
-    if mode == "explorer":
-        subprocess.Popen(["explorer.exe", str(book_path)])
-    else:
-        env = {k: v for k, v in os.environ.items() if k.upper() != "EXTRAPLUS_HOME"}
-        subprocess.Popen([excel_exe(), str(book_path)], env=env)
+    env = dict(os.environ)
+    if mode == "without-home":
+        env = {k: v for k, v in env.items() if k.upper() != "EXTRAPLUS_HOME"}
+    return subprocess.Popen([excel_exe(), str(book_path)], env=env)
 
-    def attach():
+
+def attach(book_path, timeout=90):
+    def find():
         for app in xw.apps:
             for book in app.books:
                 if Path(book.fullname).resolve() == book_path.resolve():
                     return app, book
         raise RuntimeError("workbook not open yet")
-    return retry(attach, what="Excel to open the workbook")
+    return retry(find, timeout=timeout, what="Excel to open the workbook")
 
 
 def addin_state(app):
@@ -173,54 +281,97 @@ def compare(values):
     return {"rows": rows, "max_abs_diff": max_abs, "bit_identical": all_equal}
 
 
-def test_book(app, book, results, mode):
+def single_cell_step(app, book, results, mode):
     sheet = book.sheets[0]
+    log = results["writes"]
     if mode == "new":
-        sheet.range("A1").value = [["Basis Size", "Energy"], *[[a, b] for a, b in DATA]]
-        for cell, formula in {**CORE, **SPILL}.items():
-            sheet.range(cell).api.Formula2 = formula
+        data = [["Basis Size", "Energy"], *[[a, b] for a, b in DATA]]
+        write(app, sheet, log, "data", f"A1:B{N + 1}", "Value", data)
+        for cell, formula in CORE.items():
+            write(app, sheet, log, "single-cell", cell, "Formula", formula)
     else:
         results["link_sources"] = list(book.api.LinkSources(1) or [])  # xlExcelLinks
+        wait_ready(app)
         app.api.CalculateFull()
-    results["formulas_as_stored"] = {c: sheet.range(c).api.Formula2 for c in {**CORE, **SPILL}}
+    results["formulas_as_stored"] = {c: sheet.range(c).api.Formula for c in CORE}
     started = time.time()
-    values = read_cells(sheet, [*CORE, "F2"], timeout=180)
+    values = read_cells(sheet, list(CORE), timeout=180)
     results["seconds_to_values"] = round(time.time() - started, 1)
     results["values"] = values
     results["version_cell"] = values["D11"]
     results["error_cell"] = values["D12"]
+    results["error_cell_ok"] = isinstance(values["D12"], str) and values["D12"].startswith("Error: ")
     results["comparison"] = compare(values)
-    try:
-        spill = list(read_cells(sheet, ["F2", "F3", "F4"], timeout=20).values())
-        results["spill_F2_F4"] = spill
-        results["spill_matches_D"] = spill == [values["D2"], values["D5"], values["D8"]]
-    except RuntimeError as exc:
-        results["spill_F2_F4"] = f"did not spill: {exc}"
-    if mode == "new":
-        book.save()
+
+
+def spill_step(app, book, results, mode):
+    """EXTRAP1_V / EXTRAP1_H: legacy array output (dynamic-array spill is not
+    tested via COM, see the module docstring). Recorded as observed."""
+    sheet = book.sheets[0]
+    out = results["spill"] = {"note": "legacy array output; dynamic-array spill not tested via COM"}
+    expected = [results["values"]["D2"], results["values"]["D5"], results["values"]["D8"]]
+    for anchor, (formula, cells) in SPILL.items():
+        r = out[anchor] = {"formula": formula, "cells": cells}
+        try:
+            if mode == "new":
+                write(app, sheet, results["writes"], "spill", anchor, "Formula", formula)
+            try:
+                r["values"] = list(read_cells(sheet, cells, timeout=30).values())
+            except RuntimeError as exc:
+                r["values"] = [sheet.range(c).value for c in cells]
+                r["read_error"] = str(exc)
+            r["matches_single_cell"] = r["values"] == expected
+            r["formula_stored"] = {c: sheet.range(c).api.Formula for c in cells}
+            r["has_array"] = {c: bool(sheet.range(c).api.HasArray) for c in cells}
+            if all(r["has_array"].values()):
+                r["array_range"] = sheet.range(anchor).api.CurrentArray.Address
+        except Exception:
+            r["exception"] = traceback.format_exc()
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--book", type=Path, required=True)
     parser.add_argument("--results", type=Path, required=True)
-    parser.add_argument("--launch", choices=["explorer", "direct"], default="explorer")
-    parser.add_argument("--mode", choices=["new", "reopen"], default="new")
+    parser.add_argument("--launch", choices=["inherit", "without-home"], default="inherit")
+    parser.add_argument("--mode", choices=["new", "reopen", "startup"], default="new")
     args = parser.parse_args()
     args.book = args.book.resolve()
 
-    results = {"launch": args.launch, "mode": args.mode, "book": str(args.book), "inputs": DATA}
+    results = {"launch": args.launch, "mode": args.mode, "book": str(args.book), "inputs": DATA,
+               "harness_pid": os.getpid(), "writes": []}
     app = None
     try:
         if args.mode == "new" and not args.book.exists():
             make_blank_book(args.book)
-        app, book = launch(args.launch, args.book)
-        app.display_alerts = False
-        results["excel_version"] = app.version
-        results["excel_parent_is_shell"] = [p["ParentProcessId"] == shell_pid() for p in excel_processes()]
-        results["addin"] = addin_state(app)
-        test_book(app, book, results, args.mode)
-        results["python_processes"] = python_processes()
+        proc = start_excel(args.launch, args.book)
+        results["launched_pid"] = proc.pid
+        if args.mode == "startup":
+            time.sleep(20)                       # let Excel load its add-ins
+            results["dialogs"] = dialogs()
+            try:
+                app, book = attach(args.book, timeout=30)
+                try:                             # add-ins are not listed when iterating Workbooks
+                    results["extraplus_loaded"] = app.api.Workbooks("extraplus.xlam").FullName
+                except Exception:
+                    results["extraplus_loaded"] = False
+            except RuntimeError as exc:          # a modal dialog blocks COM
+                results["attach_error"] = str(exc)
+                subprocess.run(["taskkill.exe", "/PID", str(proc.pid), "/F"], capture_output=True)
+        else:
+            app, book = attach(args.book)
+            app.display_alerts = False
+            results["excel_version"] = app.version
+            results["excel_build"] = app.api.Build
+            results["excel_processes"] = excel_processes()
+            results["addin"] = addin_state(app)
+            results["dialogs"] = dialogs()
+            single_cell_step(app, book, results, args.mode)
+            spill_step(app, book, results, args.mode)
+            results["python_processes"] = python_processes()
+            if args.mode == "new":
+                wait_ready(app)
+                book.save()
     except Exception:
         results["exception"] = traceback.format_exc()
     finally:
@@ -234,8 +385,9 @@ def main():
 
     c = results.get("comparison", {})
     print(json.dumps({k: results.get(k) for k in (
-        "addin", "excel_parent_is_shell", "version_cell", "error_cell", "seconds_to_values",
-        "spill_F2_F4", "link_sources", "excel_exited", "exception")}, indent=1, default=str))
+        "addin", "dialogs", "extraplus_loaded", "attach_error", "version_cell", "error_cell",
+        "error_cell_ok", "seconds_to_values", "spill", "link_sources", "excel_exited",
+        "exception")}, indent=1, default=str))
     print(f"bit_identical={c.get('bit_identical')} max_abs_diff={c.get('max_abs_diff')}")
 
 
