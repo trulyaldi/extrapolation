@@ -1,79 +1,72 @@
 # Extraplus for Excel
 
-Extraplus adds extrapolation functions to Microsoft Excel on Windows, for example
+THIS MARKDOWN FILE CONTAINS ALL THE NECESSARY INFORMATION. please, read it carefully. 
+
+Extraplus adds extrapolation functions to Excel on Windows:
 
 ```
 =EXTRAP1(A2:A20, B2:B20)
 ```
 
-They work in every workbook, including plain `.xlsx` files. You do not need Python,
-admin rights, or any Excel settings.
-
-**Requirements:** Windows 10 or 11, desktop Microsoft Excel (Microsoft 365, 2021,
-2019 or 2016; 32-bit Office has not been tested), and an internet connection while
-installing. Tested with Excel 2021 (16.0.14332, 64-bit) on Windows 10 21H2.
+The functions work in **macro-enabled workbooks (`.xlsm`)**. The workbook can
+be saved in any folder, and you can create new ones anywhere. You don't need
+Python, admin rights, or any Excel settings.
 
 ## Install
 
 1. Close Excel.
 2. Unzip `extraplus-excel-vX.Y.Z.zip` (right-click > Extract All).
-3. Double-click `install.bat` in the unzipped folder. If Windows shows
-   "Windows protected your PC", click **More info > Run anyway**.
+3. Double-click `install.bat`. If Windows says "Windows protected your PC",
+   click **More info > Run anyway**.
 4. Wait for `SUCCESS` (a few minutes the first time), then press Enter.
 
-Open Excel and type a formula. The first calculation after starting Excel takes a
-few seconds. You can delete the unzipped folder afterwards.
+You can delete the unzipped folder afterwards. The first calculation after
+starting Excel takes a few seconds.
 
 ## Functions
 
-`x` is the range of basis sizes, `y` the range of values (same number of cells;
-blank and text cells are skipped). The digit selects the model:
-**1** exponential, **2** square-root exponential, **3** power law.
+`x` is the range of basis sizes and `y` the range of values. The digit selects
+the model: **1** exponential, **2** square-root exponential, **3** power law.
 
 | Function | Returns |
 |---|---|
-| `EXTRAP1(x, y, [b_fixed], [n_fit])` (also 2, 3) | extrapolated value C at infinite basis |
-| `UNCERTAINTY1(x, y, [b_fixed], [n_fit])` (also 2, 3) | uncertainty of C, in the units of y |
-| `DECAY_RATE1(x, y, [b_fixed], [n_fit])` (also 2, 3) | fitted (or fixed) decay parameter B |
-| `EXTRAP1_V(x, y, [b_fixed], [n_fit])` / `EXTRAP1_H(x, y, [b_fixed], [n_fit])` (also 2, 3) | C, uncertainty and B in 3 cells, down / across |
-| `EXTRAPLUS_VERSION()` | installed Extraplus version |
+| `EXTRAP1(x, y, [b_fixed], [n_fit])` | extrapolated value C at infinite basis |
+| `UNCERTAINTY1(x, y, [b_fixed], [n_fit])` | uncertainty of C |
+| `DECAY_RATE1(x, y, [b_fixed], [n_fit])` | decay parameter B |
+| `EXTRAP1_V(...)` / `EXTRAP1_H(...)` | C, uncertainty and B in 3 cells, down / across |
+| `EXTRAP1_PLOT(...)` | plot of the data, fit and extrapolated value |
+| `EXTRAP1_PLOT_LOG(...)` | plot of the fit in linearized form |
+| `EXTRAPLUS_VERSION()` | installed version |
 
-`b_fixed` fixes B instead of fitting it; `n_fit` uses only the first `n_fit` points.
-Invalid input shows a message such as `Error: At least three paired numeric x/y
-observations are required.` The functions are listed under the **Extrapolation**
-category in Insert Function.
+Every function also exists for models 2 and 3 (`EXTRAP2`, `EXTRAP3`, ...).
+
+Optional arguments:
+- `b_fixed`: use this value for B instead of fitting it.
+- `n_fit`: fit only the first `n_fit` points. Useful for checking whether the
+  extrapolation is stable as more points are added.
+
+If the input is invalid, the cell shows a message such as
+`Error: At least three paired numeric x/y observations are required.`
 
 ## Update
 
-Download the new zip, close Excel, and run its `install.bat`. Your workbooks are not
+Close Excel and run `install.bat` from the new zip. Your workbooks are not
 affected.
 
 ## Uninstall
 
-Close Excel, then **Settings > Apps > Extraplus for Excel > Uninstall**. (Or run
-`uninstall.bat` from the unzipped folder, or from the install folder shown by the
-installer.) This removes all Extraplus files and settings.
-
-## Known issues
-
-- Workbooks store the add-in's path; opening a workbook created on another user's
-  machine may show a link prompt or `#NAME?` — not yet tested.
+Close Excel, then go to **Settings > Apps > Extraplus for Excel > Uninstall**.
 
 ## Troubleshooting
 
-- **"Microsoft Excel is running"**: close every Excel window. If none is open, end
-  `EXCEL.EXE` in Task Manager.
-- **`#NAME?`** in a cell: Excel did not load the add-in. Check that
-  **File > Options > Add-ins > Manage: Excel Add-ins > Go...** has **Extraplus**
-  ticked; if it is missing, run `install.bat` again.
-- **A cell shows `Error: ...`**: the input is not valid; the message says why.
-- **Functions stop working after an Anaconda or Python install**: if the
-  environment variables `PYTHONHOME` or `PYTHONPATH` are set for your account,
-  the installer warns about it; remove them (Settings > search "environment
-  variables") or ask your IT department.
-- **Blocked by company policy**: some organisations block macros from add-ins,
-  scripts, or programs in your user folder. Ask IT to allow `extraplus.xlam` and
-  the Extraplus install folder.
-- **Anything else**: run `install.bat` again (it repairs the installation). The
-  installer log is `%TEMP%\extraplus-setup.log`; include it when you report a
-  problem.
+- **"Microsoft Excel is running"**: close all Excel windows and try again.
+- **`#NAME?` in a cell**: the add-in isn't loaded. Check that **Extraplus** is
+  ticked under **File > Options > Add-ins > Manage: Excel Add-ins > Go**. If
+  it's missing, run `install.bat` again.
+- **Anything else**: run `install.bat` again, which repairs the installation.
+  If that doesn't help, send me the log file `%TEMP%\extraplus-setup.log`.
+
+## Known issue
+
+Opening a workbook made on someone else's computer may show a link prompt or
+`#NAME?`. This hasn't been tested yet.
