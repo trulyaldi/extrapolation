@@ -53,7 +53,6 @@ from dataclasses import dataclass
 from functools import lru_cache, wraps
 from importlib.metadata import version as _package_version
 from io import StringIO
-import inspect
 from typing import Any, Optional
 
 import numpy as np
@@ -194,56 +193,9 @@ def _optional_n_fit(value: Any, n_available: int) -> Optional[int]:
     return min(n_fit, n_available)
 
 
-def _as_bool(value: Any, default: bool) -> bool:
-    """Handle Excel TRUE/FALSE values as well as common string forms."""
-    if value is None or value == "":
-        return default
-
-    if isinstance(value, str):
-        text = value.strip().lower()
-        if text in {"true", "yes", "y", "1"}:
-            return True
-        if text in {"false", "no", "n", "0"}:
-            return False
-
-    return bool(value)
-
-
 # ---------------------------------------------------------------------------
 # Thin adapter around extraplus.extraplus
 # ---------------------------------------------------------------------------
-
-# Options the Excel functions pass to extraplus.compute_uncertainty() (the
-# UDFs' optional arguments override them). This is the place to adjust when
-# the uncertainty method changes.
-_UNCERTAINTY_DEFAULTS = {"k_cov": 1.0, "q": 0.84, "use_PI": True, "robust_scale": True}
-
-
-def _run_uncertainty(solver, **options):
-    """
-    Call ``solver.compute_uncertainty()`` with ``_UNCERTAINTY_DEFAULTS``,
-    overridden by ``options``.
-
-    Only the parameters the method accepts are passed (all of them if it takes
-    ``**kwargs``), read from its signature, so versions of extraplus with other
-    uncertainty parameters work too.  Errors raised inside the method are not
-    caught.
-    """
-    unknown = options.keys() - _UNCERTAINTY_DEFAULTS.keys()
-    if unknown:
-        raise TypeError(f"unknown uncertainty option(s): {', '.join(sorted(unknown))}")
-
-    method = solver.compute_uncertainty
-    kwargs = {**_UNCERTAINTY_DEFAULTS, **options}
-    parameters = inspect.signature(method).parameters.values()
-    if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters):
-        accepted = {
-            p.name
-            for p in parameters
-            if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-        }
-        kwargs = {name: value for name, value in kwargs.items() if name in accepted}
-    return method(**kwargs)
 
 
 def _fit_with_extraplus(
@@ -252,10 +204,6 @@ def _fit_with_extraplus(
     model_type: str,
     fixed_b: Optional[float],
     n_fit: Optional[int],
-    k_cov: float,
-    q: float,
-    use_pi: bool,
-    robust_scale: bool,
 ) -> _FitOutput:
     """
     Run one model through ``extraplus`` and convert its scaled outputs back to
@@ -280,7 +228,7 @@ def _fit_with_extraplus(
             use_energy_b=False,
         )
 
-        # Fit first without UQ so the Excel UQ options below are applied exactly.
+        # Fit first without UQ, then compute the uncertainty in its own call.
         results = solver.fit_linearized(
             models=[model_type],
             verbose=False,
@@ -290,13 +238,7 @@ def _fit_with_extraplus(
         if model_type not in results:
             raise ValueError(f"extraplus did not return a result for '{model_type}'.")
 
-        _run_uncertainty(
-            solver,
-            k_cov=k_cov,
-            q=q,
-            use_PI=use_pi,
-            robust_scale=robust_scale,
-        )
+        solver.compute_uncertainty()
 
     result = solver.results[model_type]
 
@@ -335,10 +277,6 @@ def _cached_fit(
     model_type: str,
     fixed_b: Optional[float],
     n_fit: Optional[int],
-    k_cov: float,
-    q: float,
-    use_pi: bool,
-    robust_scale: bool,
 ) -> _FitOutput:
     """Cache repeated Excel calls that use exactly the same inputs."""
     return _fit_with_extraplus(
@@ -347,10 +285,6 @@ def _cached_fit(
         model_type=model_type,
         fixed_b=fixed_b,
         n_fit=n_fit,
-        k_cov=k_cov,
-        q=q,
-        use_pi=use_pi,
-        robust_scale=robust_scale,
     )
 
 
@@ -360,10 +294,6 @@ def _run_udf(
     model_type: str,
     b_fixed: Any = None,
     n_fit: Any = None,
-    k_cov: Any = 1.0,
-    q: Any = 0.84,
-    use_pi: Any = True,
-    robust_scale: Any = True,
 ) -> _FitOutput:
     """Shared implementation used by every xlwings UDF below."""
     x, y = _clean_xy(x_range, y_range)
@@ -371,25 +301,12 @@ def _run_udf(
     fixed_b_value = _optional_float(b_fixed)
     n_fit_value = _optional_n_fit(n_fit, len(x))
 
-    k_cov_value = float(k_cov if k_cov not in (None, "") else 1.0)
-    q_value = float(q if q not in (None, "") else 0.84)
-
-    if not np.isfinite(k_cov_value) or k_cov_value < 0.0:
-        raise ValueError("k_cov must be a finite number greater than or equal to zero.")
-
-    if not np.isfinite(q_value) or not 0.0 < q_value < 1.0:
-        raise ValueError("q must be strictly between 0 and 1.")
-
     return _cached_fit(
         tuple(float(value) for value in x),
         tuple(float(value) for value in y),
         model_type,
         fixed_b_value,
         n_fit_value,
-        k_cov_value,
-        q_value,
-        _as_bool(use_pi, True),
-        _as_bool(robust_scale, True),
     )
 
 
@@ -426,10 +343,6 @@ def _build_fitted_solver_for_plot(
     model_type: str,
     b_fixed: Any = None,
     n_fit: Any = None,
-    k_cov: Any = 1.0,
-    q: Any = 0.84,
-    use_pi: Any = True,
-    robust_scale: Any = True,
 ):
     """
     Build an ``extraplus`` instance for exactly one model.
@@ -443,15 +356,6 @@ def _build_fitted_solver_for_plot(
 
     fixed_b_value = _optional_float(b_fixed)
     n_fit_value = _optional_n_fit(n_fit, len(x))
-
-    k_cov_value = float(k_cov if k_cov not in (None, "") else 1.0)
-    q_value = float(q if q not in (None, "") else 0.84)
-
-    if not np.isfinite(k_cov_value) or k_cov_value < 0.0:
-        raise ValueError("k_cov must be a finite number greater than or equal to zero.")
-
-    if not np.isfinite(q_value) or not 0.0 < q_value < 1.0:
-        raise ValueError("q must be strictly between 0 and 1.")
 
     df = pd.DataFrame({_X_COL: x, _Y_COL: y})
 
@@ -476,13 +380,7 @@ def _build_fitted_solver_for_plot(
         if model_type not in results:
             raise ValueError(f"extraplus did not return a result for '{model_type}'.")
 
-        _run_uncertainty(
-            solver,
-            k_cov=k_cov_value,
-            q=q_value,
-            use_PI=_as_bool(use_pi, True),
-            robust_scale=_as_bool(robust_scale, True),
-        )
+        solver.compute_uncertainty()
 
     return solver
 
@@ -574,10 +472,6 @@ def _run_plot_udf(
     log_plot: bool,
     b_fixed: Any = None,
     n_fit: Any = None,
-    k_cov: Any = 1.0,
-    q: Any = 0.84,
-    use_pi: Any = True,
-    robust_scale: Any = True,
 ) -> str:
     """Shared implementation for all six Excel plot UDFs."""
     solver = _build_fitted_solver_for_plot(
@@ -586,10 +480,6 @@ def _run_plot_udf(
         model_type=model_type,
         b_fixed=b_fixed,
         n_fit=n_fit,
-        k_cov=k_cov,
-        q=q,
-        use_pi=use_pi,
-        robust_scale=robust_scale,
     )
 
     fig = _get_figure_from_extraplus(solver, log_plot=log_plot)
@@ -658,10 +548,6 @@ def UNCERTAINTY1(
     y_range,
     b_fixed=None,
     n_fit=None,
-    k_cov=1.0,
-    q=0.84,
-    use_pi=True,
-    robust_scale=True,
 ):
     """Exponential asymptote uncertainty in the original y units."""
     return _run_udf(
@@ -670,10 +556,6 @@ def UNCERTAINTY1(
         _EXPONENTIAL,
         b_fixed,
         n_fit,
-        k_cov,
-        q,
-        use_pi,
-        robust_scale,
     ).uncertainty
 
 
@@ -686,10 +568,6 @@ def UNCERTAINTY2(
     y_range,
     b_fixed=None,
     n_fit=None,
-    k_cov=1.0,
-    q=0.84,
-    use_pi=True,
-    robust_scale=True,
 ):
     """Square-root-exponential asymptote uncertainty in original y units."""
     return _run_udf(
@@ -698,10 +576,6 @@ def UNCERTAINTY2(
         _SQRT_EXPONENTIAL,
         b_fixed,
         n_fit,
-        k_cov,
-        q,
-        use_pi,
-        robust_scale,
     ).uncertainty
 
 
@@ -714,10 +588,6 @@ def UNCERTAINTY3(
     y_range,
     b_fixed=None,
     n_fit=None,
-    k_cov=1.0,
-    q=0.84,
-    use_pi=True,
-    robust_scale=True,
 ):
     """Power-law asymptote uncertainty in the original y units."""
     return _run_udf(
@@ -726,10 +596,6 @@ def UNCERTAINTY3(
         _POWER_LAW,
         b_fixed,
         n_fit,
-        k_cov,
-        q,
-        use_pi,
-        robust_scale,
     ).uncertainty
 
 
@@ -800,10 +666,6 @@ def EXTRAP1_V(
     y_range,
     b_fixed=None,
     n_fit=None,
-    k_cov=1.0,
-    q=0.84,
-    use_pi=True,
-    robust_scale=True,
 ):
     """Exponential fit. Spills C, uncertainty, and B vertically."""
     result = _run_udf(
@@ -812,10 +674,6 @@ def EXTRAP1_V(
         _EXPONENTIAL,
         b_fixed,
         n_fit,
-        k_cov,
-        q,
-        use_pi,
-        robust_scale,
     )
     return _vertical_fit_output(result)
 
@@ -830,10 +688,6 @@ def EXTRAP2_V(
     y_range,
     b_fixed=None,
     n_fit=None,
-    k_cov=1.0,
-    q=0.84,
-    use_pi=True,
-    robust_scale=True,
 ):
     """Square-root-exponential fit. Spills C, uncertainty, and B vertically."""
     result = _run_udf(
@@ -842,10 +696,6 @@ def EXTRAP2_V(
         _SQRT_EXPONENTIAL,
         b_fixed,
         n_fit,
-        k_cov,
-        q,
-        use_pi,
-        robust_scale,
     )
     return _vertical_fit_output(result)
 
@@ -860,10 +710,6 @@ def EXTRAP3_V(
     y_range,
     b_fixed=None,
     n_fit=None,
-    k_cov=1.0,
-    q=0.84,
-    use_pi=True,
-    robust_scale=True,
 ):
     """Power-law fit. Spills C, uncertainty, and B vertically."""
     result = _run_udf(
@@ -872,10 +718,6 @@ def EXTRAP3_V(
         _POWER_LAW,
         b_fixed,
         n_fit,
-        k_cov,
-        q,
-        use_pi,
-        robust_scale,
     )
     return _vertical_fit_output(result)
 
@@ -890,10 +732,6 @@ def EXTRAP1_H(
     y_range,
     b_fixed=None,
     n_fit=None,
-    k_cov=1.0,
-    q=0.84,
-    use_pi=True,
-    robust_scale=True,
 ):
     """Exponential fit. Spills C, uncertainty, and B horizontally."""
     result = _run_udf(
@@ -902,10 +740,6 @@ def EXTRAP1_H(
         _EXPONENTIAL,
         b_fixed,
         n_fit,
-        k_cov,
-        q,
-        use_pi,
-        robust_scale,
     )
     return _horizontal_fit_output(result)
 
@@ -920,10 +754,6 @@ def EXTRAP2_H(
     y_range,
     b_fixed=None,
     n_fit=None,
-    k_cov=1.0,
-    q=0.84,
-    use_pi=True,
-    robust_scale=True,
 ):
     """Square-root-exponential fit. Spills C, uncertainty, and B horizontally."""
     result = _run_udf(
@@ -932,10 +762,6 @@ def EXTRAP2_H(
         _SQRT_EXPONENTIAL,
         b_fixed,
         n_fit,
-        k_cov,
-        q,
-        use_pi,
-        robust_scale,
     )
     return _horizontal_fit_output(result)
 
@@ -950,10 +776,6 @@ def EXTRAP3_H(
     y_range,
     b_fixed=None,
     n_fit=None,
-    k_cov=1.0,
-    q=0.84,
-    use_pi=True,
-    robust_scale=True,
 ):
     """Power-law fit. Spills C, uncertainty, and B horizontally."""
     result = _run_udf(
@@ -962,10 +784,6 @@ def EXTRAP3_H(
         _POWER_LAW,
         b_fixed,
         n_fit,
-        k_cov,
-        q,
-        use_pi,
-        robust_scale,
     )
     return _horizontal_fit_output(result)
 
@@ -998,10 +816,6 @@ def EXTRAP1_PLOT(
     caller,
     b_fixed=None,
     n_fit=None,
-    k_cov=1.0,
-    q=0.84,
-    use_pi=True,
-    robust_scale=True,
 ):
     """
     Fit the exponential model and insert extrap.py's standard Matplotlib plot
@@ -1016,10 +830,6 @@ def EXTRAP1_PLOT(
         log_plot=False,
         b_fixed=b_fixed,
         n_fit=n_fit,
-        k_cov=k_cov,
-        q=q,
-        use_pi=use_pi,
-        robust_scale=robust_scale,
     )
 
 
@@ -1034,10 +844,6 @@ def EXTRAP2_PLOT(
     caller,
     b_fixed=None,
     n_fit=None,
-    k_cov=1.0,
-    q=0.84,
-    use_pi=True,
-    robust_scale=True,
 ):
     """
     Fit the square-root-exponential model and insert extrap.py's standard
@@ -1052,10 +858,6 @@ def EXTRAP2_PLOT(
         log_plot=False,
         b_fixed=b_fixed,
         n_fit=n_fit,
-        k_cov=k_cov,
-        q=q,
-        use_pi=use_pi,
-        robust_scale=robust_scale,
     )
 
 
@@ -1070,10 +872,6 @@ def EXTRAP3_PLOT(
     caller,
     b_fixed=None,
     n_fit=None,
-    k_cov=1.0,
-    q=0.84,
-    use_pi=True,
-    robust_scale=True,
 ):
     """
     Fit the power-law model and insert extrap.py's standard Matplotlib plot
@@ -1088,10 +886,6 @@ def EXTRAP3_PLOT(
         log_plot=False,
         b_fixed=b_fixed,
         n_fit=n_fit,
-        k_cov=k_cov,
-        q=q,
-        use_pi=use_pi,
-        robust_scale=robust_scale,
     )
 
 
@@ -1106,10 +900,6 @@ def EXTRAP1_PLOT_LOG(
     caller,
     b_fixed=None,
     n_fit=None,
-    k_cov=1.0,
-    q=0.84,
-    use_pi=True,
-    robust_scale=True,
 ):
     """
     Fit the exponential model and insert extrap.py's logarithmic Matplotlib
@@ -1124,10 +914,6 @@ def EXTRAP1_PLOT_LOG(
         log_plot=True,
         b_fixed=b_fixed,
         n_fit=n_fit,
-        k_cov=k_cov,
-        q=q,
-        use_pi=use_pi,
-        robust_scale=robust_scale,
     )
 
 
@@ -1142,10 +928,6 @@ def EXTRAP2_PLOT_LOG(
     caller,
     b_fixed=None,
     n_fit=None,
-    k_cov=1.0,
-    q=0.84,
-    use_pi=True,
-    robust_scale=True,
 ):
     """
     Fit the square-root-exponential model and insert extrap.py's logarithmic
@@ -1160,10 +942,6 @@ def EXTRAP2_PLOT_LOG(
         log_plot=True,
         b_fixed=b_fixed,
         n_fit=n_fit,
-        k_cov=k_cov,
-        q=q,
-        use_pi=use_pi,
-        robust_scale=robust_scale,
     )
 
 
@@ -1178,10 +956,6 @@ def EXTRAP3_PLOT_LOG(
     caller,
     b_fixed=None,
     n_fit=None,
-    k_cov=1.0,
-    q=0.84,
-    use_pi=True,
-    robust_scale=True,
 ):
     """
     Fit the power-law model and insert extrap.py's logarithmic Matplotlib plot
@@ -1196,10 +970,6 @@ def EXTRAP3_PLOT_LOG(
         log_plot=True,
         b_fixed=b_fixed,
         n_fit=n_fit,
-        k_cov=k_cov,
-        q=q,
-        use_pi=use_pi,
-        robust_scale=robust_scale,
     )
 
 

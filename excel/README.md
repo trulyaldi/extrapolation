@@ -33,9 +33,9 @@ blank and text cells are skipped). The digit selects the model:
 | Function | Returns |
 |---|---|
 | `EXTRAP1(x, y, [b_fixed], [n_fit])` (also 2, 3) | extrapolated value C at infinite basis |
-| `UNCERTAINTY1(x, y, [b_fixed], [n_fit], ...)` (also 2, 3) | uncertainty of C, in the units of y |
+| `UNCERTAINTY1(x, y, [b_fixed], [n_fit])` (also 2, 3) | uncertainty of C, in the units of y |
 | `DECAY_RATE1(x, y, [b_fixed], [n_fit])` (also 2, 3) | fitted (or fixed) decay parameter B |
-| `EXTRAP1_V(x, y, ...)` / `EXTRAP1_H(x, y, ...)` (also 2, 3) | C, uncertainty and B in 3 cells, down / across |
+| `EXTRAP1_V(x, y, [b_fixed], [n_fit])` / `EXTRAP1_H(x, y, [b_fixed], [n_fit])` (also 2, 3) | C, uncertainty and B in 3 cells, down / across |
 | `EXTRAPLUS_VERSION()` | installed Extraplus version |
 
 `b_fixed` fixes B instead of fitting it; `n_fit` uses only the first `n_fit` points.
