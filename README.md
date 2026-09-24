@@ -22,11 +22,11 @@ Extrapolation of basis-set sequences to the complete-basis limit. The repository
 
 ## Python
 
-Requires Python 3.11 or later. Install the wheel from a release (or build it with
-`uv build --wheel`, which writes it to `dist/`):
+Requires Python 3.11 or later. Install the wheel from a release that includes this API
+(or build it with `uv build --wheel`, which writes it to `dist/`):
 
 ```bash
-pip install extraplus-0.2.0-py3-none-any.whl
+pip install extraplus-<version>-py3-none-any.whl
 ```
 
 ```python
