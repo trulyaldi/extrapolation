@@ -6,4 +6,4 @@ __pycache__/
 .codex
 *.egg-info/
 dist/
-build/
+/build/

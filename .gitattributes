@@ -1,4 +1,10 @@
 research/ export-ignore
 tests/ export-ignore
 legacy/ export-ignore
+excel/build/ export-ignore
 *.bat text eol=crlf
+*.ps1 text eol=crlf
+*.psd1 text eol=crlf
+*.xlam binary
+*.xlsm binary
+*.xlsx binary
