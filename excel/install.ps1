@@ -460,7 +460,7 @@ function Test-Excel {
     }
     $c2r = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' -ErrorAction SilentlyContinue
     if ($c2r -and ($c2r.PSObject.Properties.Name -contains 'Platform') -and ($c2r.Platform -eq 'x86')) {
-        Write-Warn '32-bit Office detected. Extraplus has only been tested with 64-bit Office.'
+        Write-Warn '32-bit Office detected. 32-bit Office has not been tested.'
     }
 }
 

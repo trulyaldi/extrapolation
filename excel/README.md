@@ -9,8 +9,9 @@ Extraplus adds extrapolation functions to Microsoft Excel on Windows, for exampl
 They work in every workbook, including plain `.xlsx` files. You do not need Python,
 admin rights, or any Excel settings.
 
-**Requirements:** Windows 10 or 11, 64-bit desktop Microsoft Excel (Microsoft 365, 2021,
-2019 or 2016; tested with Excel 2021), and an internet connection while installing.
+**Requirements:** Windows 10 or 11, desktop Microsoft Excel (Microsoft 365, 2021,
+2019 or 2016; 32-bit Office has not been tested), and an internet connection while
+installing.
 
 ## Install
 
@@ -42,10 +43,6 @@ Invalid input shows a message such as `Error: At least three paired numeric x/y
 observations are required.` The functions are listed under the **Extrapolation**
 category in Insert Function.
 
-Renamed functions: `UNCERTY1-3` is now `UNCERTAINTY1-3` and `PARAMETER_B1-3` is
-now `DECAY_RATE1-3`. Workbooks that use the old names show `#NAME?`; use
-Find & Replace to update them.
-
 ## Update
 
 Download the new zip, close Excel, and run its `install.bat`. Your workbooks are not
@@ -63,8 +60,7 @@ installer.) This removes all Extraplus files and settings.
   `EXCEL.EXE` in Task Manager.
 - **`#NAME?`** in a cell: Excel did not load the add-in. Check that
   **File > Options > Add-ins > Manage: Excel Add-ins > Go...** has **Extraplus**
-  ticked; if it is missing, run `install.bat` again. Workbooks made with an old
-  version may use the old function names (see above).
+  ticked; if it is missing, run `install.bat` again.
 - **A cell shows `Error: ...`**: the input is not valid; the message says why.
 - **Functions stop working after an Anaconda or Python install**: if the
   environment variables `PYTHONHOME` or `PYTHONPATH` are set for your account,

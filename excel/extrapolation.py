@@ -11,11 +11,9 @@ Excel functions:
 
     UNCERTAINTY1 / UNCERTAINTY2 / UNCERTAINTY3
         Return the uncertainty of C in the original y units.
-        (Called UNCERTY1 / UNCERTY2 / UNCERTY3 in older versions.)
 
     DECAY_RATE1 / DECAY_RATE2 / DECAY_RATE3
         Return the fitted/fixed B parameter.
-        (Called PARAMETER_B1 / PARAMETER_B2 / PARAMETER_B3 in older versions.)
 
     EXTRAP1_V / EXTRAP2_V / EXTRAP3_V
         Spill [C, uncertainty, B] vertically.
