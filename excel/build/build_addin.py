@@ -14,13 +14,17 @@ Steps:
      the "extraplus.conf" config sheet (both must change together);
   3. fill the config sheet with every key xlwings reads when it runs a UDF, so
      no lookup falls through to a workbook's folder or a user config file;
-  4. add the EXTRAPLUS_HOME fallback (see ENV_MODULE) and import the UDF
-     wrappers generated from extrapolation.py;
-  5. save and write extraplus.xlam.buildinfo.json for make_release.sh.
+  4. add the EXTRAPLUS_HOME fallback (ENV_MODULE), the relink-on-open and
+     pre-save guard (EVENTS_CLASS, EVENTS_MODULE) and the ribbon command
+     (COMMANDS_MODULE), and import the UDF wrappers generated from
+     extrapolation.py;
+  5. save, add the ribbon (CUSTOM_UI) to the saved file, reopen it to check
+     the result, and write extraplus.xlam.buildinfo.json for make_release.sh.
 """
 
 import argparse
 import hashlib
+import io
 import json
 import shutil
 import sys
@@ -86,12 +90,183 @@ Public Function ExtraplusEnvSource() As String
 End Function
 '''
 
-WORKBOOK_OPEN = '''Private Sub Workbook_Open()
-    EnsureExtraplusHome
+# Workbooks remember the add-in by its full path (xl/externalLinks/), and the
+# path is per user (%LOCALAPPDATA%\Extraplus). When a workbook opens whose
+# links point to an extraplus.xlam somewhere else, repoint them to this one;
+# otherwise its formulas become #NAME? on the next calculation.
+# ExtraplusLinkLog() reports what was done (used by the tests).
+EVENTS_CLASS = r'''Option Explicit
+
+Public WithEvents App As Application
+
+Private Sub App_WorkbookOpen(ByVal Wb As Workbook)
+    RelinkWorkbook Wb
+End Sub
+
+Private Sub App_WorkbookBeforeSave(ByVal Wb As Workbook, ByVal SaveAsUI As Boolean, Cancel As Boolean)
+    If Not ConfirmSave(Wb) Then Cancel = True
 End Sub
 '''
 
+EVENTS_MODULE = r'''Option Explicit
+Option Private Module
+
+' Warn before saving when at least this many cells with Extraplus formulas
+' show #NAME?, #REF! or #VALUE! (a missing add-in or a failed calculation).
+Private Const GUARD_MIN_ERRORS As Long = 1
+
+Private mEvents As ExtraplusEvents
+Private mLog As String
+
+Public Sub StartExtraplusEvents()
+    Dim wb As Workbook
+    Set mEvents = New ExtraplusEvents
+    Set mEvents.App = Application
+    For Each wb In Application.Workbooks   ' opened before the add-in was loaded
+        RelinkWorkbook wb
+    Next wb
+End Sub
+
+Private Function FileNameOf(ByVal path As String) As String
+    Dim i As Long
+    i = InStrRev(Replace(path, "/", "\"), "\")
+    FileNameOf = Mid$(path, i + 1)
+End Function
+
+Public Sub RelinkWorkbook(ByVal wb As Workbook)
+    Dim links As Variant, i As Long, link As String, target As String, changed As Long, failed As Long
+    On Error GoTo finish
+    If wb Is ThisWorkbook Then Exit Sub
+    If wb.IsAddin Then Exit Sub
+    links = wb.LinkSources(xlExcelLinks)
+    If IsEmpty(links) Then GoTo finish
+    target = ThisWorkbook.FullName
+    For i = LBound(links) To UBound(links)
+        link = CStr(links(i))
+        If StrComp(FileNameOf(link), ThisWorkbook.Name, vbTextCompare) = 0 And _
+           StrComp(link, target, vbTextCompare) <> 0 Then
+            On Error Resume Next
+            wb.ChangeLink link, target, xlLinkTypeExcelLinks
+            If Err.Number = 0 Then changed = changed + 1 Else failed = failed + 1
+            Err.Clear
+            On Error GoTo finish
+        End If
+    Next i
+finish:
+    mLog = mLog & wb.Name & ": relinked " & changed & ", failed " & failed & vbLf
+End Sub
+
+Public Function ExtraplusLinkLog() As String
+    ExtraplusLinkLog = mLog
+End Function
+
+Private Function AutoSaveIsOn(ByVal wb As Workbook) As Boolean
+    On Error Resume Next   ' the property does not exist in every Excel
+    AutoSaveIsOn = wb.AutoSaveOn
+End Function
+
+Private Function IsExtraplusFormula(ByVal formula As String) As Boolean
+    formula = UCase$(formula)
+    IsExtraplusFormula = InStr(formula, "EXTRAP") > 0 Or InStr(formula, "UNCERTAINTY") > 0 Or _
+                         InStr(formula, "DECAY_RATE") > 0
+End Function
+
+Public Function CountBrokenCells(ByVal wb As Workbook, ByRef example As String) As Long
+    Dim ws As Worksheet, found As Range, cell As Range, v As Variant
+    For Each ws In wb.Worksheets
+        Set found = Nothing
+        On Error Resume Next   ' no error cells, or a protected sheet
+        Set found = ws.UsedRange.SpecialCells(xlCellTypeFormulas, xlErrors)
+        On Error GoTo 0
+        If Not found Is Nothing Then
+            For Each cell In found.Cells
+                v = cell.Value
+                If IsError(v) Then
+                    If v = CVErr(xlErrName) Or v = CVErr(xlErrRef) Or v = CVErr(xlErrValue) Then
+                        If IsExtraplusFormula(cell.Formula) Then
+                            CountBrokenCells = CountBrokenCells + 1
+                            If example = "" Then example = "'" & ws.Name & "'!" & cell.Address(False, False)
+                        End If
+                    End If
+                End If
+            Next cell
+        End If
+    Next ws
+End Function
+
+' False only when the user, warned, chose not to save. Any problem here lets
+' the save go ahead.
+Public Function ConfirmSave(ByVal wb As Workbook) As Boolean
+    Dim n As Long, example As String
+    ConfirmSave = True
+    On Error GoTo finish
+    If wb Is ThisWorkbook Or wb.IsAddin Then Exit Function
+    If Not Application.DisplayAlerts Or AutoSaveIsOn(wb) Then Exit Function
+    n = CountBrokenCells(wb, example)
+    If n < GUARD_MIN_ERRORS Then Exit Function
+    ConfirmSave = (MsgBox(n & " cells with Extraplus formulas show #NAME?, #REF! or #VALUE! (for example " & _
+        example & ")." & vbLf & vbLf & _
+        "This usually means that the Extraplus add-in was not found or the calculation failed. " & _
+        "Saving now replaces the numbers stored in the file with these errors." & vbLf & vbLf & _
+        "Save anyway?", vbExclamation + vbYesNo + vbDefaultButton2, "Extraplus") = vbYes)
+finish:
+End Function
+'''
+
+# The ribbon button (CUSTOM_UI) calls this.
+COMMANDS_MODULE = r'''Option Explicit
+
+Public Sub ExtraplusWriteValues(Optional control As IRibbonControl)
+    Dim scope As String
+    If ActiveWorkbook Is Nothing Then Exit Sub
+    If TypeName(Selection) = "Range" Then
+        If Selection.CountLarge > 1 Then scope = "the selected cells"
+    End If
+    If scope = "" Then scope = "the sheet '" & ActiveSheet.Name & "'"
+    If ActiveWorkbook.Path = "" Then
+        MsgBox "Save the workbook first: a backup copy is saved next to it before any formula is replaced.", _
+               vbInformation, "Extraplus"
+        Exit Sub
+    End If
+    If MsgBox("Replace the Extraplus formulas in " & scope & " with the numbers they compute?" & vbLf & vbLf & _
+              "The numbers are computed again from the formulas' input cells. Before anything is replaced, " & _
+              "a copy of the workbook is saved next to it, and each replaced formula is listed on the " & _
+              "sheet 'Extraplus values'. Formulas that give an error are kept.", _
+              vbQuestion + vbOKCancel + vbDefaultButton2, "Extraplus") <> vbOK Then Exit Sub
+    RunPython "import extrapolation; extrapolation.write_values()"
+End Sub
+'''
+
+WORKBOOK_OPEN = '''Private Sub Workbook_Open()
+    EnsureExtraplusHome
+    StartExtraplusEvents
+End Sub
+'''
+
+# Office 2007 RibbonX (works in every later Excel), added to the saved file.
+CUSTOM_UI = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<customUI xmlns="http://schemas.microsoft.com/office/2006/01/customui">
+  <ribbon>
+    <tabs>
+      <tab id="extraplusTab" label="Extraplus">
+        <group id="extraplusResults" label="Results">
+          <button id="extraplusWriteValues" label="Write values" size="large" imageMso="PasteValues"
+                  onAction="ExtraplusWriteValues"
+                  screentip="Replace Extraplus formulas by their values"
+                  supertip="Computes the Extraplus formulas in the selection (or on the sheet) again and replaces them with the numbers, so the sheet no longer recalculates them. A backup copy of the workbook is saved first."/>
+        </group>
+      </tab>
+    </tabs>
+  </ribbon>
+</customUI>
+'''
+CUSTOM_UI_PART = "customUI/customUI.xml"
+CUSTOM_UI_REL = ('<Relationship Id="rIdExtraplusUI" '
+                 'Type="http://schemas.microsoft.com/office/2006/relationships/ui/extensibility" '
+                 f'Target="{CUSTOM_UI_PART}"/>')
+
 VBEXT_CT_STDMODULE = 1
+VBEXT_CT_CLASSMODULE = 2
 
 
 def sha256(path):
@@ -136,9 +311,13 @@ def build(out_dir, udf_dir):
                      'Public Const PROJECT_NAME As String = "myaddin"',
                      f'Public Const PROJECT_NAME As String = "{PROJECT}"')
         vbproject.VBComponents.Remove(components["Module1"])  # template's sample macro
-        env = vbproject.VBComponents.Add(VBEXT_CT_STDMODULE)
-        env.Name = "extraplus_env"
-        env.CodeModule.AddFromString(ENV_MODULE)
+        for kind, name, code in ((VBEXT_CT_STDMODULE, "extraplus_env", ENV_MODULE),
+                                 (VBEXT_CT_CLASSMODULE, "ExtraplusEvents", EVENTS_CLASS),
+                                 (VBEXT_CT_STDMODULE, "extraplus_events", EVENTS_MODULE),
+                                 (VBEXT_CT_STDMODULE, "extraplus_commands", COMMANDS_MODULE)):
+            component = vbproject.VBComponents.Add(kind)
+            component.Name = name
+            component.CodeModule.AddFromString(code)
         components["ThisWorkbook"].CodeModule.AddFromString(WORKBOOK_OPEN)
 
         sheet = book.sheets["_myaddin.conf"]
@@ -157,13 +336,34 @@ def build(out_dir, udf_dir):
         props("Title").Value = "Extraplus"
         props("Comments").Value = (
             f"Extraplus {version('extraplus')}: extrapolation functions EXTRAP1-3, "
-            "UNCERTAINTY1-3, DECAY_RATE1-3 and more (category Extrapolation)."
+            "UNCERTAINTY1-3, DECAY_RATE1-3, EXTRAP_ALL_V and more (category Extrapolation)."
         )
         book.save()
         book.close()
     finally:
         app.quit()
+    add_custom_ui(xlam)
     return xlam
+
+
+def add_custom_ui(xlam):
+    """Add the ribbon (CUSTOM_UI) to the saved add-in; Excel keeps it on later saves."""
+    import zipfile
+    data = Path(xlam).read_bytes()
+    temp = Path(xlam).with_suffix(".tmp")
+    with zipfile.ZipFile(io.BytesIO(data)) as src, zipfile.ZipFile(temp, "w", zipfile.ZIP_DEFLATED) as dst:
+        if CUSTOM_UI_PART in src.namelist():
+            raise RuntimeError("the add-in already has a ribbon part")
+        for item in src.infolist():
+            content = src.read(item.filename)
+            if item.filename == "_rels/.rels":
+                text = content.decode("utf-8")
+                if "</Relationships>" not in text:
+                    raise RuntimeError("unexpected _rels/.rels")
+                content = text.replace("</Relationships>", CUSTOM_UI_REL + "</Relationships>").encode("utf-8")
+            dst.writestr(item, content)
+        dst.writestr(CUSTOM_UI_PART, CUSTOM_UI.encode("utf-8"))
+    temp.replace(xlam)
 
 
 def inspect_xlam(xlam, out_dir):
@@ -195,11 +395,15 @@ def inspect_xlam(xlam, out_dir):
             "config": [[k, v if v is not None else ""] for k, v in config],
             "is_addin": bool(book.api.IsAddin),
             "has_workbook_open": "EnsureExtraplusHome" in workbook_code,
+            "starts_events": "StartExtraplusEvents" in workbook_code,
             "sheets": [s.name for s in book.sheets],
         }
         book.close()
     finally:
         app.quit()
+    import zipfile
+    with zipfile.ZipFile(xlam) as z:
+        info["custom_ui"] = CUSTOM_UI_PART in z.namelist() and CUSTOM_UI_REL in z.read("_rels/.rels").decode()
     return info
 
 
@@ -222,12 +426,17 @@ def main():
         problems.append(f"config sheet mismatch: {info['config']}")
     if info["project_name_line"] != f'Public Const PROJECT_NAME As String = "{PROJECT}"':
         problems.append(f"PROJECT_NAME not set: {info['project_name_line']}")
-    if "EXTRAPLUS_VERSION" not in info["functions"] or "EXTRAP1" not in info["functions"]:
+    if not {"EXTRAPLUS_VERSION", "EXTRAP1", "EXTRAP_ALL_V", "EXTRAPLUS_CACHE_STATS"} <= set(info["functions"]):
         problems.append(f"functions missing: {info['functions']}")
     if not info["is_addin"]:
         problems.append("the workbook is not saved as an add-in (IsAddin is False)")
     if "extraplus_env" not in info["components"] or not info["has_workbook_open"]:
         problems.append("the EXTRAPLUS_HOME fallback (extraplus_env / Workbook_Open) is missing")
+    if not {"ExtraplusEvents", "extraplus_events", "extraplus_commands"} <= set(info["components"]) \
+            or not info["starts_events"]:
+        problems.append("the relink / save guard / ribbon VBA is missing")
+    if not info["custom_ui"]:
+        problems.append("the ribbon part (customUI) is missing")
     if "Module1" in info["components"]:
         problems.append("the template's Module1 was not removed")
     if problems:
