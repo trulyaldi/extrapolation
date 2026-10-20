@@ -80,7 +80,8 @@ Returns one row per model, indexed by model name, with the columns `value`, `unc
 | `b_fixed` | float or None | the fixed B, or `None` when B was fitted | |
 
 `EXTRAP1_V`–`3_V` and `EXTRAP1_H`–`3_H` return `value`, `uncertainty` and `decay_rate`
-together; `EXTRAPLUS_VERSION()` returns `extraplus.__version__`.
+together; `EXTRAP_ALL_V` returns them for all three models (column n is `EXTRAPn_V`);
+`EXTRAPLUS_VERSION()` returns `extraplus.__version__`.
 
 ### `Result` methods
 
