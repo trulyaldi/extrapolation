@@ -99,6 +99,13 @@ def test_excel_errors_in_b_fixed_and_n_fit_are_read_as_text(registered):
         assert options["n_fit"].get("err_to_str") == "True", name
 
 
+def test_new_functions(registered):
+    assert [(a["name"], a["optional"]) for a in registered["EXTRAP_ALL_V"]["args"]] == [
+        ("x_range", False), ("y_range", False), ("b_fixed", True)]
+    assert registered["EXTRAP_ALL_V"]["args"][2]["options"]["err_to_str"] == "True"
+    assert registered["EXTRAPLUS_CACHE_STATS"]["args"] == []
+
+
 def test_plot_functions_are_unchanged(registered):
     for name in PLOTS:
         for arg in registered[name]["args"]:

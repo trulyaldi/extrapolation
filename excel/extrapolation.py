@@ -27,6 +27,9 @@ Excel functions:
     EXTRAP1_H / EXTRAP2_H / EXTRAP3_H
         Spill [C, uncertainty, B] horizontally.
 
+    EXTRAP_ALL_V
+        All three models in one 3 x 3 array: column n is EXTRAPn_V.
+
     EXTRAP1_PLOT / EXTRAP2_PLOT / EXTRAP3_PLOT
         Insert the fit plot (Result.plot()) below the cell.
 
@@ -947,6 +950,40 @@ def EXTRAP3_H(
 
 
 # ---------------------------------------------------------------------------
+# All three models in one call
+# ---------------------------------------------------------------------------
+
+
+def _b_fixed_per_model(b_fixed: Any) -> tuple:
+    """b_fixed of EXTRAP_ALL_V: blank (fit every B) or three cells, one B per model."""
+    if b_fixed is None:
+        return (None, None, None)
+    cells = _cells(b_fixed)
+    if len(cells) == 1 and (cells[0] is None or cells[0] == ""):
+        return (None, None, None)
+    if len(cells) != 3:
+        raise ValueError("b_fixed must be blank or 3 cells, one B for each model (1, 2, 3).")
+    return cells
+
+
+@xw.func(category="Extrapolation", volatile=False)
+@xw.arg("x_range", np.array, ndim=2, doc="Range containing basis-size x values.")
+@xw.arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
+@xw.arg("b_fixed", np.array, ndim=2, err_to_str=True,
+        doc="Optional: 3 cells with a fixed B for models 1, 2, 3 (a blank cell fits that B). Leave out to fit all.")
+@_excel_errors(shape=(3, 3))
+def EXTRAP_ALL_V(x_range, y_range, b_fixed=None):
+    """All three models: columns 1-3 are EXTRAP1_V-EXTRAP3_V (rows C, uncertainty, B)."""
+    columns = []
+    for model, b in zip((_EXPONENTIAL, _SQRT_EXPONENTIAL, _POWER_LAW), _b_fixed_per_model(b_fixed)):
+        try:
+            columns.append(_vertical_fit_output(_run_udf(x_range, y_range, model, b)))
+        except Exception as exc:   # this model only: the others are still shown
+            columns.append(np.full((3, 1), _error_text(exc), dtype=object))
+    return np.hstack(columns)
+
+
+# ---------------------------------------------------------------------------
 # Installed version
 # ---------------------------------------------------------------------------
 
@@ -1158,6 +1195,7 @@ __all__ = [
     "EXTRAP1_H",
     "EXTRAP2_H",
     "EXTRAP3_H",
+    "EXTRAP_ALL_V",
     "EXTRAPLUS_VERSION",
     "EXTRAPLUS_CACHE_STATS",
     "EXTRAP1_PLOT",
