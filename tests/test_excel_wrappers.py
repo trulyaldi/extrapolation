@@ -115,10 +115,33 @@ def test_version_udf():
     ],
 )
 def test_bad_input_returns_error_text(x, y, b_fixed, expected):
-    for name in SCALAR_UDFS + SPILL_UDFS:
+    for name in SCALAR_UDFS:
         result = getattr(extrapolation, name)(excel_column(x), excel_column(y), b_fixed)
         assert isinstance(result, str) and result.startswith("Error: "), f"{name}: {result!r}"
         assert expected in result, f"{name}: {result!r}"
+    # The spill functions keep their 3-cell shape: the text fills every cell, so
+    # xlwings does not shrink the array (and empty the B cell).
+    for name in SPILL_UDFS:
+        result = getattr(extrapolation, name)(excel_column(x), excel_column(y), b_fixed)
+        assert isinstance(result, np.ndarray), f"{name}: {result!r}"
+        assert result.shape == ((3, 1) if name.endswith("_V") else (1, 3))
+        text = getattr(extrapolation, SCALAR_UDFS[0])(excel_column(x), excel_column(y), b_fixed)
+        assert result.ravel().tolist() == [text] * 3, f"{name}: {result!r}"
+
+
+@pytest.mark.parametrize("error", ["#N/A", "#NAME?", "#VALUE!", "#REF!", "#DIV/0!", "#NUM!", "#NULL!"])
+def test_excel_error_in_b_fixed_or_n_fit_is_an_error_not_blank(error, xy):
+    """With err_to_str (see test_registration.py) an error cell arrives as its text, e.g. "#N/A"."""
+    for name in SCALAR_UDFS + SPILL_UDFS:
+        udf = getattr(extrapolation, name)
+        as_b = np.asarray(udf(*xy, error), dtype=object).ravel()
+        as_n = np.asarray(udf(*xy, None, error), dtype=object).ravel()
+        assert set(as_b) == {"Error: b_fixed must be a number."}, name
+        assert set(as_n) == {"Error: n_fit must be a number."}, name
+    for n in MODELS:
+        udf = getattr(extrapolation, f"FINITE_EXTRAP{n}")
+        assert udf(*xy, 15000, error) == "Error: b_fixed must be a number."
+        assert udf(*xy, 15000, None, error) == "Error: n_fit must be a number."
 
 
 def test_blank_and_text_cells_are_ignored(xy):

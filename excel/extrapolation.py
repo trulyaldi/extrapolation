@@ -491,25 +491,38 @@ class _ResultCache:
 _CACHE = _ResultCache()
 
 
-def _excel_errors(function):
+def _error_text(exc: Exception) -> str:
+    """ValueError messages come from the extraplus input checks and are shown as
+    they are; any other exception also shows its type."""
+    if isinstance(exc, ValueError):
+        return f"Error: {exc}"
+    return f"Error: {type(exc).__name__}: {exc}"
+
+
+def _excel_errors(function=None, *, shape=None):
     """
     Return a short "Error: ..." text to Excel instead of raising.
 
     Only the failure path changes: when the wrapped UDF succeeds, its value is
-    returned unchanged.  ValueError messages come from the extraplus input
-    checks and are shown as they are; any other exception also shows its type.
+    returned unchanged.  With ``shape`` the text fills an array of that shape,
+    the shape of the function's normal output: xlwings resizes an
+    expand="table" formula to whatever it returns, so a single text value
+    would clear the other cells of the array (and the B cell that other
+    formulas read as b_fixed).
     """
 
-    @wraps(function)
-    def wrapper(*args, **kwargs):
-        try:
-            return function(*args, **kwargs)
-        except ValueError as exc:
-            return f"Error: {exc}"
-        except Exception as exc:  # never hand a traceback to an Excel cell
-            return f"Error: {type(exc).__name__}: {exc}"
+    def decorate(function):
+        @wraps(function)
+        def wrapper(*args, **kwargs):
+            try:
+                return function(*args, **kwargs)
+            except Exception as exc:  # never hand a traceback to an Excel cell
+                text = _error_text(exc)
+                return text if shape is None else np.full(shape, text, dtype=object)
 
-    return wrapper
+        return wrapper
+
+    return decorate if function is None else decorate(function)
 
 
 # ---------------------------------------------------------------------------
@@ -581,8 +594,8 @@ def _run_plot_udf(
 @xw.func(category="Extrapolation", volatile=False)
 @xw.arg("x_range", np.array, ndim=2, doc="Range containing basis-size x values.")
 @xw.arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
-@xw.arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.")
-@xw.arg("n_fit", doc="Optional number of first numeric rows used in the fit.")
+@xw.arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.", err_to_str=True)
+@xw.arg("n_fit", doc="Optional number of first numeric rows used in the fit.", err_to_str=True)
 @_excel_errors
 def EXTRAP1(x_range, y_range, b_fixed=None, n_fit=None):
     """Exponential extrapolated value C at infinity."""
@@ -592,8 +605,8 @@ def EXTRAP1(x_range, y_range, b_fixed=None, n_fit=None):
 @xw.func(category="Extrapolation", volatile=False)
 @xw.arg("x_range", np.array, ndim=2, doc="Range containing basis-size x values.")
 @xw.arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
-@xw.arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.")
-@xw.arg("n_fit", doc="Optional number of first numeric rows used in the fit.")
+@xw.arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.", err_to_str=True)
+@xw.arg("n_fit", doc="Optional number of first numeric rows used in the fit.", err_to_str=True)
 @_excel_errors
 def EXTRAP2(x_range, y_range, b_fixed=None, n_fit=None):
     """Square-root-exponential extrapolated value C at infinity."""
@@ -603,8 +616,8 @@ def EXTRAP2(x_range, y_range, b_fixed=None, n_fit=None):
 @xw.func(category="Extrapolation", volatile=False)
 @xw.arg("x_range", np.array, ndim=2, doc="Range containing positive basis-size x values.")
 @xw.arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
-@xw.arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.")
-@xw.arg("n_fit", doc="Optional number of first numeric rows used in the fit.")
+@xw.arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.", err_to_str=True)
+@xw.arg("n_fit", doc="Optional number of first numeric rows used in the fit.", err_to_str=True)
 @_excel_errors
 def EXTRAP3(x_range, y_range, b_fixed=None, n_fit=None):
     """Power-law extrapolated value C at infinity."""
@@ -623,8 +636,8 @@ def EXTRAP3(x_range, y_range, b_fixed=None, n_fit=None):
 @xw.arg("x_range", np.array, ndim=2, doc="Range containing basis-size x values.")
 @xw.arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
 @xw.arg("target", doc="Basis size to evaluate the fit at, usually beyond the data (a number > 0).")
-@xw.arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.")
-@xw.arg("n_fit", doc="Optional number of first numeric rows used in the fit.")
+@xw.arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.", err_to_str=True)
+@xw.arg("n_fit", doc="Optional number of first numeric rows used in the fit.", err_to_str=True)
 @_excel_errors
 def FINITE_EXTRAP1(x_range, y_range, target=None, b_fixed=None, n_fit=None):
     """Exponential fit evaluated at the basis size target."""
@@ -635,8 +648,8 @@ def FINITE_EXTRAP1(x_range, y_range, target=None, b_fixed=None, n_fit=None):
 @xw.arg("x_range", np.array, ndim=2, doc="Range containing basis-size x values.")
 @xw.arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
 @xw.arg("target", doc="Basis size to evaluate the fit at, usually beyond the data (a number > 0).")
-@xw.arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.")
-@xw.arg("n_fit", doc="Optional number of first numeric rows used in the fit.")
+@xw.arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.", err_to_str=True)
+@xw.arg("n_fit", doc="Optional number of first numeric rows used in the fit.", err_to_str=True)
 @_excel_errors
 def FINITE_EXTRAP2(x_range, y_range, target=None, b_fixed=None, n_fit=None):
     """Square-root-exponential fit evaluated at the basis size target."""
@@ -647,8 +660,8 @@ def FINITE_EXTRAP2(x_range, y_range, target=None, b_fixed=None, n_fit=None):
 @xw.arg("x_range", np.array, ndim=2, doc="Range containing positive basis-size x values.")
 @xw.arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
 @xw.arg("target", doc="Basis size to evaluate the fit at, usually beyond the data (a number > 0).")
-@xw.arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.")
-@xw.arg("n_fit", doc="Optional number of first numeric rows used in the fit.")
+@xw.arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.", err_to_str=True)
+@xw.arg("n_fit", doc="Optional number of first numeric rows used in the fit.", err_to_str=True)
 @_excel_errors
 def FINITE_EXTRAP3(x_range, y_range, target=None, b_fixed=None, n_fit=None):
     """Power-law fit evaluated at the basis size target."""
@@ -663,6 +676,8 @@ def FINITE_EXTRAP3(x_range, y_range, target=None, b_fixed=None, n_fit=None):
 @xw.func(category="Extrapolation", volatile=False)
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
+@xw.arg("b_fixed", err_to_str=True)
+@xw.arg("n_fit", err_to_str=True)
 @_excel_errors
 def UNCERTAINTY1(
     x_range,
@@ -683,6 +698,8 @@ def UNCERTAINTY1(
 @xw.func(category="Extrapolation", volatile=False)
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
+@xw.arg("b_fixed", err_to_str=True)
+@xw.arg("n_fit", err_to_str=True)
 @_excel_errors
 def UNCERTAINTY2(
     x_range,
@@ -703,6 +720,8 @@ def UNCERTAINTY2(
 @xw.func(category="Extrapolation", volatile=False)
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
+@xw.arg("b_fixed", err_to_str=True)
+@xw.arg("n_fit", err_to_str=True)
 @_excel_errors
 def UNCERTAINTY3(
     x_range,
@@ -728,6 +747,8 @@ def UNCERTAINTY3(
 @xw.func(category="Extrapolation", volatile=False)
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
+@xw.arg("b_fixed", err_to_str=True)
+@xw.arg("n_fit", err_to_str=True)
 @_excel_errors
 def DECAY_RATE1(x_range, y_range, b_fixed=None, n_fit=None):
     """Exponential B for the normalized variable x/x_max."""
@@ -737,6 +758,8 @@ def DECAY_RATE1(x_range, y_range, b_fixed=None, n_fit=None):
 @xw.func(category="Extrapolation", volatile=False)
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
+@xw.arg("b_fixed", err_to_str=True)
+@xw.arg("n_fit", err_to_str=True)
 @_excel_errors
 def DECAY_RATE2(x_range, y_range, b_fixed=None, n_fit=None):
     """Square-root-exponential B for sqrt(x/x_max)."""
@@ -746,6 +769,8 @@ def DECAY_RATE2(x_range, y_range, b_fixed=None, n_fit=None):
 @xw.func(category="Extrapolation", volatile=False)
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
+@xw.arg("b_fixed", err_to_str=True)
+@xw.arg("n_fit", err_to_str=True)
 @_excel_errors
 def DECAY_RATE3(x_range, y_range, b_fixed=None, n_fit=None):
     """Power-law B for (x/x_max)^(-B)."""
@@ -781,7 +806,9 @@ def _horizontal_fit_output(result: Result):
 @xw.ret(expand="table")
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
-@_excel_errors
+@xw.arg("b_fixed", err_to_str=True)
+@xw.arg("n_fit", err_to_str=True)
+@_excel_errors(shape=(3, 1))
 def EXTRAP1_V(
     x_range,
     y_range,
@@ -803,7 +830,9 @@ def EXTRAP1_V(
 @xw.ret(expand="table")
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
-@_excel_errors
+@xw.arg("b_fixed", err_to_str=True)
+@xw.arg("n_fit", err_to_str=True)
+@_excel_errors(shape=(3, 1))
 def EXTRAP2_V(
     x_range,
     y_range,
@@ -825,7 +854,9 @@ def EXTRAP2_V(
 @xw.ret(expand="table")
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
-@_excel_errors
+@xw.arg("b_fixed", err_to_str=True)
+@xw.arg("n_fit", err_to_str=True)
+@_excel_errors(shape=(3, 1))
 def EXTRAP3_V(
     x_range,
     y_range,
@@ -847,7 +878,9 @@ def EXTRAP3_V(
 @xw.ret(expand="table")
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
-@_excel_errors
+@xw.arg("b_fixed", err_to_str=True)
+@xw.arg("n_fit", err_to_str=True)
+@_excel_errors(shape=(1, 3))
 def EXTRAP1_H(
     x_range,
     y_range,
@@ -869,7 +902,9 @@ def EXTRAP1_H(
 @xw.ret(expand="table")
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
-@_excel_errors
+@xw.arg("b_fixed", err_to_str=True)
+@xw.arg("n_fit", err_to_str=True)
+@_excel_errors(shape=(1, 3))
 def EXTRAP2_H(
     x_range,
     y_range,
@@ -891,7 +926,9 @@ def EXTRAP2_H(
 @xw.ret(expand="table")
 @xw.arg("x_range", np.array, ndim=2)
 @xw.arg("y_range", np.array, ndim=2)
-@_excel_errors
+@xw.arg("b_fixed", err_to_str=True)
+@xw.arg("n_fit", err_to_str=True)
+@_excel_errors(shape=(1, 3))
 def EXTRAP3_H(
     x_range,
     y_range,

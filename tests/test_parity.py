@@ -78,8 +78,13 @@ def test_finite_udf_target_errors_equal_the_api_message(n, target, be_xy):
 def test_error_texts_equal_the_api_message(n, x, y, args):
     with pytest.raises(ValueError) as info:
         extrapolate(x, y, MODELS[n], *args)
-    for name in (f"EXTRAP{n}", f"UNCERTAINTY{n}", f"DECAY_RATE{n}", f"EXTRAP{n}_V", f"EXTRAP{n}_H"):
+    for name in (f"EXTRAP{n}", f"UNCERTAINTY{n}", f"DECAY_RATE{n}"):
         assert getattr(extrapolation, name)(column(x), column(y), *args) == f"Error: {info.value}"
+    # The spill functions put the same text in each of their 3 cells.
+    assert getattr(extrapolation, f"EXTRAP{n}_V")(column(x), column(y), *args).tolist() == \
+        [[f"Error: {info.value}"]] * 3
+    assert getattr(extrapolation, f"EXTRAP{n}_H")(column(x), column(y), *args).tolist() == \
+        [[f"Error: {info.value}"] * 3]
     assert getattr(extrapolation, f"FINITE_EXTRAP{n}")(column(x), column(y), 1500, *args) == f"Error: {info.value}"
 
 
