@@ -13,6 +13,7 @@
       <install folder>\udf\              the Excel UDF module (extrapolation.py)
       <install folder>\extraplus.xlam    the Excel add-in
       <install folder>\cache\            uv download cache
+      <install folder>\resultcache\      Excel result cache (created by the add-in)
 
     HKCU\Environment\EXTRAPLUS_HOME       install folder, read by the add-in
     Excel\Options\OPENn                   loads the add-in when Excel starts
