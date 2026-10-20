@@ -30,6 +30,8 @@ DATASETS = {
     "be_n_fit": (BE_1SE_X, BE_1SE_Y, None, 6),
     "be_both": (BE_1SE_X, BE_1SE_Y, 4.0, 7.9),
     "be_padded": (["Basis Size", *BE_1SE_X, None, ""], ["Energy", *BE_1SE_Y, None, 1.0], None, None),
+    # As the np.array converter reads them: blank cells are NaN, text stays text.
+    "be_padded_excel": (["Basis Size", *BE_1SE_X, NAN], ["Energy", *BE_1SE_Y, NAN], None, None),
     "be_rising": (BE_1SE_X, [-v for v in BE_1SE_Y], None, None),
     "li_8": (LI_2SE_X, LI_2SE_Y, None, None),
     "li_blank_b": (LI_2SE_X, LI_2SE_Y, "", ""),

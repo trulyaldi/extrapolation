@@ -39,12 +39,15 @@ DUMP = """
             "args": [{"name": a["name"], "optional": "optional" in a, "doc": a["doc"],
                       "options": {k: repr(v) for k, v in a["options"].items()}} for a in f["args"]],
         }
+    out["_fallback"] = {name: [{"name": n, "options": {k: repr(v) for k, v in o.items()}}
+                              for n, o in extrapolation._fallback_arg_options(name)]
+                       for name in extrapolation._VALUE_FUNCTIONS}
     print(json.dumps(out))
 """
 
 
 @pytest.fixture(scope="module")
-def registered():
+def dump():
     env = {k: v for k, v in os.environ.items() if not k.startswith("EXTRAPLUS_")}
     env.update(PYTHONPATH=str(TESTS.parent / "excel"), PYTHONDONTWRITEBYTECODE="1", MPLBACKEND="Agg",
                EXTRAPLUS_CACHE="off")
@@ -52,6 +55,11 @@ def registered():
                           capture_output=True, text=True, timeout=300)
     assert done.returncode == 0, done.stderr
     return json.loads(done.stdout.strip().splitlines()[-1])
+
+
+@pytest.fixture(scope="module")
+def registered(dump):
+    return {name: info for name, info in dump.items() if not name.startswith("_")}
 
 
 MODELS = (1, 2, 3)
@@ -102,7 +110,7 @@ def test_excel_errors_in_b_fixed_and_n_fit_are_read_as_text(registered):
 def test_new_functions(registered):
     assert [(a["name"], a["optional"]) for a in registered["EXTRAP_ALL_V"]["args"]] == [
         ("x_range", False), ("y_range", False), ("b_fixed", True)]
-    assert registered["EXTRAP_ALL_V"]["args"][2]["options"]["err_to_str"] == "True"
+    assert registered["EXTRAP_ALL_V"]["args"][2]["options"] == {"ndim": "2", "err_to_str": "True"}
     assert registered["EXTRAPLUS_CACHE_STATS"]["args"] == []
 
 
@@ -111,3 +119,9 @@ def test_plot_functions_are_unchanged(registered):
         for arg in registered[name]["args"]:
             assert "err_to_str" not in arg["options"], name
         assert registered[name]["ret"] == {}, name
+
+
+def test_write_values_reads_arguments_with_the_registered_options(dump, registered):
+    """_fallback_arg_options (used without xlwings) must match the registration."""
+    for name, fallback in dump["_fallback"].items():
+        assert fallback == [{"name": a["name"], "options": a["options"]} for a in registered[name]["args"]], name

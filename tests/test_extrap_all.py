@@ -33,7 +33,7 @@ def test_b_fixed_per_model_from_another_call(shape, be_xy):
     """The chain: the B row of the energy's EXTRAP_ALL_V fixes B for a property."""
     X, Y = column(be_xy[0]), column(be_xy[1])
     energy = extrapolation.EXTRAP_ALL_V(X, Y)
-    b_row = energy[2:3, :].astype(object).reshape(shape)
+    b_row = energy[2:3, :].reshape(shape).tolist()   # as xlwings reads 3 cells with ndim=2
     prop_y = column([v * 1.5 + 0.1 for v in be_xy[1]])
     result = extrapolation.EXTRAP_ALL_V(X, prop_y, b_row)
     for n, single in zip(MODELS, singles(X, prop_y, energy[2])):
@@ -43,20 +43,19 @@ def test_b_fixed_per_model_from_another_call(shape, be_xy):
 
 def test_a_blank_cell_fits_that_models_b(be_xy):
     X, Y = column(be_xy[0]), column(be_xy[1])
-    b = np.asarray([[5.0, None, 2.0]], dtype=object)
+    b = [[5.0, None, 2.0]]   # a blank cell is None in a raw (not np.array) read
     result = extrapolation.EXTRAP_ALL_V(X, Y, b)
     for n, single in zip(MODELS, singles(X, Y, (5.0, None, 2.0))):
         assert bits(result[:, n - 1:n].copy()) == bits(single)
 
 
-@pytest.mark.parametrize("blank", [None, np.asarray([[None]], dtype=object), np.asarray([[""]], dtype=object)])
+@pytest.mark.parametrize("blank", [None, [[None]], [[""]]])
 def test_blank_b_fixed_fits_all(blank, be_xy):
     X, Y = column(be_xy[0]), column(be_xy[1])
     assert bits(extrapolation.EXTRAP_ALL_V(X, Y, blank)) == bits(extrapolation.EXTRAP_ALL_V(X, Y))
 
 
-@pytest.mark.parametrize("b", [np.asarray([[2.0]], dtype=object), np.asarray([[1.0, 2.0]], dtype=object),
-                               np.asarray([[1.0, 2.0, 3.0, 4.0]], dtype=object)])
+@pytest.mark.parametrize("b", [[[2.0]], [[1.0, 2.0]], [[1.0, 2.0, 3.0, 4.0]]])
 def test_b_fixed_of_another_size_is_an_error_in_every_cell(b, be_xy):
     result = extrapolation.EXTRAP_ALL_V(column(be_xy[0]), column(be_xy[1]), b)
     assert result.shape == (3, 3)
@@ -77,7 +76,7 @@ def test_input_errors_fill_every_cell_with_the_single_functions_text(name):
 
 def test_one_failing_model_does_not_hide_the_others(be_xy):
     X, Y = column(be_xy[0]), column(be_xy[1])
-    b = np.asarray([[5.0, "#N/A", None]], dtype=object)   # an Excel error in model 2's B cell
+    b = [[5.0, "#N/A", None]]   # an Excel error in model 2's B cell (err_to_str)
     result = extrapolation.EXTRAP_ALL_V(X, Y, b)
     assert result[:, 1].tolist() == ["Error: b_fixed must be a number."] * 3
     for n, b_n in ((1, 5.0), (3, None)):

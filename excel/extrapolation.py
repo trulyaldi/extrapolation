@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sqlite3
 import struct
 import sys
@@ -969,7 +970,7 @@ def _b_fixed_per_model(b_fixed: Any) -> tuple:
 @xw.func(category="Extrapolation", volatile=False)
 @xw.arg("x_range", np.array, ndim=2, doc="Range containing basis-size x values.")
 @xw.arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
-@xw.arg("b_fixed", np.array, ndim=2, err_to_str=True,
+@xw.arg("b_fixed", ndim=2, err_to_str=True,   # not np.array: it reads blank cells as NaN
         doc="Optional: 3 cells with a fixed B for models 1, 2, 3 (a blank cell fits that B). Leave out to fit all.")
 @_excel_errors(shape=(3, 3))
 def EXTRAP_ALL_V(x_range, y_range, b_fixed=None):
@@ -1000,6 +1001,458 @@ def EXTRAPLUS_VERSION():
 def EXTRAPLUS_CACHE_STATS():
     """State of the result cache: mode, file, hits and misses (Ctrl+Alt+F9 refreshes it)."""
     return _CACHE.stats()
+
+
+# ---------------------------------------------------------------------------
+# Write values: replace Extraplus formulas by the numbers they compute
+# ---------------------------------------------------------------------------
+#
+# Run from the add-in's ribbon button (RunPython in the UDF server):
+#
+#     extrapolation.write_values("'Sheet'!$A$1:$Z$99")
+#
+# For every Extraplus formula in the range (or on the whole sheet), whose
+# whole text is one call such as =EXTRAP1_V($A$2:$A$13,B2:B13,BV4):
+#   - the arguments are read from the sheet with the same xlwings options the
+#     function itself gets, and the same Python function computes the result,
+#     so the numbers are those the formula gives;
+#   - a b_fixed (or other) argument inside another such formula's cells is
+#     handled after that formula has been written, from the written numbers;
+#     if that formula is not written, neither is this one;
+#   - the numbers replace the formula only if they fill exactly the formula's
+#     cells and are not an "Error: ..." result.
+# Before the first write a copy of the workbook is saved next to it, and each
+# written block is recorded on the sheet "Extraplus values" (formula, inputs
+# digest, version).  Anything else (nested formulas, names, other workbooks)
+# is left as it is and listed.  Calculation, events and screen updating are
+# set for the run and restored afterwards.
+
+_VALUE_FUNCTIONS = frozenset(
+    [f"{base}{n}" for base in ("EXTRAP", "UNCERTAINTY", "DECAY_RATE", "FINITE_EXTRAP") for n in (1, 2, 3)]
+    + [f"EXTRAP{n}{suffix}" for suffix in ("_V", "_H") for n in (1, 2, 3)]
+    + ["EXTRAP_ALL_V"]
+)
+_RECORD_SHEET = "Extraplus values"
+
+# The read options of each argument, as registered with xlwings (checked
+# against the registration by tests/test_registration.py).  On Windows the
+# registered options themselves are used.
+_RANGE = {"convert": np.array, "ndim": 2}
+_ERRORS_AS_TEXT = {"err_to_str": True}
+
+
+def _fallback_arg_options(func_name: str) -> list:
+    if func_name == "EXTRAP_ALL_V":
+        return [("x_range", _RANGE), ("y_range", _RANGE), ("b_fixed", {"ndim": 2, **_ERRORS_AS_TEXT})]
+    args = [("x_range", _RANGE), ("y_range", _RANGE)]
+    if func_name.startswith("FINITE_"):
+        args.append(("target", {}))
+    return args + [("b_fixed", _ERRORS_AS_TEXT), ("n_fit", _ERRORS_AS_TEXT)]
+
+
+def _arg_options(func_name: str) -> list:
+    """[(name, xlwings read options)] for the function's arguments, in order."""
+    info = getattr(globals()[func_name], "__xlfunc__", None)
+    if info is None:
+        return _fallback_arg_options(func_name)
+    return [(arg["name"], dict(arg["options"])) for arg in info["args"]]
+
+
+_COL = r"\$?[A-Za-z]{1,3}"
+_ROW = r"\$?[0-9]{1,7}"
+_CELL = _COL + _ROW
+_AREA = rf"(?:{_CELL}(?::{_CELL})?|{_COL}:{_COL}|{_ROW}:{_ROW})"
+_SHEET = r"(?:'(?:[^']|'')+'|[A-Za-z_][\w.]*)"
+_REF_RE = re.compile(rf"^(?:(?P<sheet>{_SHEET})!)?(?P<area>{_AREA})$")
+_NUMBER_RE = re.compile(r"^[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$")
+_CALL_RE = re.compile(
+    r"^=\s*(?:'[^']*extraplus\.xlam'!|extraplus\.xlam!)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\((?P<args>.*)\)\s*$",
+    re.IGNORECASE | re.DOTALL)
+
+
+def _split_args(text: str) -> Optional[list]:
+    """Split a formula's argument text at top-level commas; None if it has nested calls or strings."""
+    args, current, quoted = [], [], False
+    for char in text:
+        if quoted:
+            current.append(char)
+            if char == "'":
+                quoted = False   # '' re-enters the quote on the next character
+        elif char == "'":
+            quoted = True
+            current.append(char)
+        elif char in '("{}':
+            return None
+        elif char == ",":
+            args.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    if quoted:
+        return None
+    args.append("".join(current).strip())
+    return args
+
+
+def _column_number(letters: str) -> int:
+    number = 0
+    for char in letters.upper():
+        number = number * 26 + ord(char) - 64
+    return number
+
+
+def _area_box(area: str) -> tuple:
+    """(row1, col1, row2, col2) of an A1 area; whole rows/columns use 1..max."""
+    parts = area.replace("$", "").split(":")
+    boxes = []
+    for part in parts:
+        letters = "".join(c for c in part if c.isalpha())
+        digits = "".join(c for c in part if c.isdigit())
+        boxes.append((int(digits) if digits else None, _column_number(letters) if letters else None))
+    (r1, c1), (r2, c2) = boxes[0], boxes[-1]
+    return (r1 or 1, c1 or 1, r2 or 1_048_576, c2 or 16_384)
+
+
+def _sheet_name(text: Optional[str], default: str) -> str:
+    if not text:
+        return default
+    return text[1:-1].replace("''", "'") if text.startswith("'") else text
+
+
+def _parse_call(formula: str, sheet: str) -> Optional[tuple]:
+    """(function name, [argument]) for a formula that is exactly one Extraplus call, else None.
+
+    An argument is ("missing",), ("number", text) or ("ref", sheet, area, box).
+    """
+    match = _CALL_RE.match(formula or "")
+    if not match or match.group("name").upper() not in _VALUE_FUNCTIONS:
+        return None
+    name = match.group("name").upper()
+    texts = _split_args(match.group("args"))
+    if texts is None or len(texts) > len(_fallback_arg_options(name)):
+        return None
+    args = []
+    for text in texts:
+        if text == "":
+            args.append(("missing",))
+        elif _NUMBER_RE.match(text):
+            args.append(("number", text))
+        else:
+            ref = _REF_RE.match(text)
+            if not ref:
+                return None
+            ref_sheet = _sheet_name(ref.group("sheet"), sheet)
+            args.append(("ref", ref_sheet, ref.group("area"), _area_box(ref.group("area"))))
+    if len(args) < 2 or any(a[0] != "ref" for a in args[:2]):
+        return None
+    return name, args
+
+
+def _overlaps(a: tuple, b: tuple) -> bool:
+    return a[0] <= b[2] and b[0] <= a[2] and a[1] <= b[3] and b[1] <= a[3]
+
+
+def _result_shape(value: Any) -> tuple:
+    return value.shape if isinstance(value, np.ndarray) else (1, 1)
+
+
+def _is_error_result(value: Any) -> bool:
+    cells = value.ravel() if isinstance(value, np.ndarray) else [value]
+    return any(isinstance(v, str) and v.startswith("Error: ") for v in cells)
+
+
+def _same_number(a: Any, b: Any) -> bool:
+    if isinstance(a, (float, int, np.floating)) and isinstance(b, (float, int, np.floating)):
+        return struct.pack("<d", float(a)) == struct.pack("<d", float(b))
+    return a == b
+
+
+def _values_pass(book, module=None) -> dict:
+    """
+    The write-values logic on a workbook adapter (see _XlwingsBook for the
+    real one and tests/test_write_values.py for a fake).  Returns the report.
+    """
+    module = module or sys.modules[__name__]
+    blocks, unrecognized = [], []
+    covered = set()
+    for sheet, row, col, formula in book.formula_cells():
+        if (sheet, row, col) in covered:
+            continue
+        box = book.block_of(sheet, row, col)
+        covered.update((sheet, r, c) for r in range(box[0], box[2] + 1) for c in range(box[1], box[3] + 1))
+        call = _parse_call(formula, sheet)
+        if call is None:
+            unrecognized.append((sheet, box, formula))
+            continue
+        blocks.append({"sheet": sheet, "box": box, "formula": formula, "name": call[0], "args": call[1],
+                       "deps": set(), "status": None, "reason": ""})
+
+    # Order: a block that reads cells of another block comes after it.
+    for i, block in enumerate(blocks):
+        for arg in block["args"]:
+            if arg[0] != "ref":
+                continue
+            for j, other in enumerate(blocks):
+                if j != i and other["sheet"] == arg[1] and _overlaps(other["box"], arg[3]):
+                    block["deps"].add(j)
+    order, done, visiting = [], set(), set()
+
+    def visit(i):
+        if i in done:
+            return True
+        if i in visiting:
+            return False
+        visiting.add(i)
+        ok = all(visit(j) for j in blocks[i]["deps"])
+        visiting.discard(i)
+        if ok:
+            done.add(i)
+            order.append(i)
+        else:
+            blocks[i]["status"], blocks[i]["reason"] = "skipped", "circular reference"
+        return ok
+
+    for i in range(len(blocks)):
+        visit(i)
+
+    report = {"written": 0, "failed": 0, "skipped": 0, "unrecognized": len(unrecognized),
+              "changed": 0, "backup": None, "problems": [], "stopped": None}
+    records = []
+    try:
+        with book.calculation_paused():
+            _write_blocks(book, module, blocks, order, report, records)
+    except Exception as exc:   # Excel refused a read or write: keep what is done, say so
+        report["stopped"] = _error_text(exc)
+    for block in blocks:
+        report[block["status"] or "skipped"] += 1
+        if block["status"] != "written":
+            report["problems"].append((book.address(block["sheet"], block["box"]), block["status"] or "skipped",
+                                       block["reason"] or "not reached"))
+    for sheet, box, formula in unrecognized:
+        report["problems"].append((book.address(sheet, box), "left as formula",
+                                   "not a single Extraplus call with plain cell references"))
+    if records:
+        book.record(records, report)
+    return report
+
+
+def _write_blocks(book, module, blocks, order, report, records) -> None:
+    for i in order:
+        block = blocks[i]
+        if block["status"]:
+            continue
+        blocked = [blocks[j] for j in block["deps"] if blocks[j]["status"] != "written"]
+        if blocked:
+            block["status"] = "skipped"
+            block["reason"] = f"uses {book.address(blocked[0]['sheet'], blocked[0]['box'])}, which was not written"
+            continue
+        values = []
+        for (_name, options), arg in zip(_arg_options(block["name"]), block["args"]):
+            if arg[0] == "missing":
+                values.append(None)
+            elif arg[0] == "number":
+                values.append(book.convert(book.evaluate(arg[1]), options))
+            else:
+                values.append(book.read(arg[1], arg[2], options))
+        result = getattr(module, block["name"])(*values)
+        shape = (block["box"][2] - block["box"][0] + 1, block["box"][3] - block["box"][1] + 1)
+        if _is_error_result(result):
+            block["status"] = "failed"
+            block["reason"] = str(result.ravel()[0] if isinstance(result, np.ndarray) else result)
+            continue
+        if _result_shape(result) != shape:
+            block["status"], block["reason"] = "skipped", (
+                f"its result is {_result_shape(result)[0]} x {_result_shape(result)[1]} cells, "
+                f"the formula fills {shape[0]} x {shape[1]}")
+            continue
+        if report["backup"] is None:
+            report["backup"] = book.backup()
+        before = np.asarray(book.values(block["sheet"], block["box"]), dtype=object).ravel()
+        after = np.asarray(result, dtype=object).reshape(shape)
+        if not all(_same_number(a, b) for a, b in zip(before, after.ravel())):
+            report["changed"] += 1
+        book.write(block["sheet"], block["box"], result)
+        block["status"] = "written"
+        records.append((book.address(block["sheet"], block["box"]), block["formula"], block["name"],
+                        _inputs_digest(values),
+                        ", ".join(repr(float(v)) if isinstance(v, (float, np.floating)) else repr(v)
+                                  for v in after.ravel())))
+
+
+def _inputs_digest(values: list) -> str:
+    """A short SHA-256 of the exact argument values, to tell later whether the inputs changed."""
+    out = bytearray(_CACHE_SCHEMA)
+    for value in values:
+        try:
+            _encode(None if value is None else tuple(_cells(value)), out)
+        except _Uncacheable:
+            out += repr(value).encode()
+    return hashlib.sha256(out).hexdigest()[:16]
+
+def _summary(report: dict) -> str:
+    lines = [f"Written: {report['written']} formulas replaced by their values."]
+    if report["stopped"]:
+        lines.insert(0, f"Stopped early: {report['stopped']}")
+    if report["changed"]:
+        lines.append(f"{report['changed']} of them showed different values before (e.g. errors or "
+                     "values not recalculated).")
+    for key, label in (("failed", "kept (the function returns an error)"),
+                       ("skipped", "kept (see the list)"), ("unrecognized", "kept (formula not recognized)")):
+        if report[key]:
+            lines.append(f"{report[key]} {label}.")
+    if report["backup"]:
+        lines.append(f"Backup of the workbook before the change: {report['backup']}")
+    if report["problems"]:
+        lines.append("")
+        lines += [f"{where}: {status} - {why}" for where, status, why in report["problems"][:15]]
+        if len(report["problems"]) > 15:
+            lines.append(f"... and {len(report['problems']) - 15} more (see the sheet '{_RECORD_SHEET}').")
+    return "\n".join(lines)
+
+
+_XL_CALCULATION_MANUAL = -4135
+_XL_CELL_TYPE_FORMULAS = -4123
+_MENTIONS_RE = re.compile(r"\b(?:" + "|".join(sorted(_VALUE_FUNCTIONS, key=len, reverse=True)) + r")\s*\(",
+                          re.IGNORECASE)
+
+
+def _column_letters(number: int) -> str:
+    letters = ""
+    while number:
+        number, rest = divmod(number - 1, 26)
+        letters = chr(65 + rest) + letters
+    return letters
+
+
+class _XlwingsBook:
+    """The workbook side of _values_pass, through xlwings (Windows, inside Excel)."""
+
+    def __init__(self, book, scope):
+        self.book, self.app, self.scope = book, book.app, scope
+
+    def formula_cells(self):
+        name = self.scope.sheet.name
+        try:
+            found = self.scope.api.SpecialCells(_XL_CELL_TYPE_FORMULAS)
+        except Exception:   # Excel raises when there are no formula cells
+            return
+        for area in found.Areas:
+            row0, col0, formulas = area.Row, area.Column, area.Formula
+            rows = formulas if isinstance(formulas, tuple) else ((formulas,),)
+            for i, row in enumerate(rows):
+                for j, text in enumerate(row):
+                    if isinstance(text, str) and _MENTIONS_RE.search(text):
+                        yield name, row0 + i, col0 + j, text
+
+    def block_of(self, sheet, row, col):
+        cell = self.book.sheets[sheet].api.Cells(row, col)
+        block = None
+        if cell.HasArray:
+            block = cell.CurrentArray
+        else:
+            try:
+                if cell.HasSpill:
+                    block = cell.SpillingToRange
+            except Exception:   # no dynamic arrays in this Excel
+                pass
+        if block is None:
+            return (row, col, row, col)
+        return (block.Row, block.Column, block.Row + block.Rows.Count - 1, block.Column + block.Columns.Count - 1)
+
+    def _range(self, sheet, box):
+        return self.book.sheets[sheet].range((box[0], box[1]), (box[2], box[3]))
+
+    def address(self, sheet, box):
+        first = f"{_column_letters(box[1])}{box[0]}"
+        last = f"{_column_letters(box[3])}{box[2]}"
+        return f"'{sheet}'!{first}" + ("" if first == last else f":{last}")
+
+    def read(self, sheet, area, options):
+        # What xlwings does for a range argument: conversion.read(range, None, options).
+        return self.book.sheets[sheet].range(area).options(**options).value
+
+    def evaluate(self, text):
+        return self.app.api.Evaluate(text)
+
+    def convert(self, value, options):
+        # What xlwings does for a value argument (a number typed in the formula).
+        from xlwings import conversion
+        return conversion.read(None, value, options)
+
+    def values(self, sheet, box):
+        return self._range(sheet, box).options(ndim=2).value
+
+    def write(self, sheet, box, result):
+        target = self._range(sheet, box)
+        try:
+            target.value = result
+        except Exception:   # e.g. Excel refuses to overwrite an array formula cell by cell
+            target.api.ClearContents()
+            target.value = result
+
+    def backup(self):
+        full = self.book.fullname
+        if not self.book.api.Path or "://" in full:
+            raise RuntimeError("the workbook must be saved in a local folder first (a backup copy is made next to it)")
+        path = Path(full)
+        stamp = time.strftime("%Y-%m-%d %H%M%S")
+        copy = path.with_name(f"{path.stem} (before Extraplus values {stamp}){path.suffix}")
+        self.book.api.SaveCopyAs(str(copy))
+        return str(copy)
+
+    def calculation_paused(self):
+        app = self.app.api
+
+        class _Paused:
+            def __enter__(inner):
+                inner.saved = (app.Calculation, app.EnableEvents, app.ScreenUpdating)
+                app.Calculation = _XL_CALCULATION_MANUAL
+                app.EnableEvents = False
+                app.ScreenUpdating = False
+
+            def __exit__(inner, *exc):
+                for name, value in zip(("Calculation", "EnableEvents", "ScreenUpdating"), inner.saved):
+                    try:
+                        if getattr(app, name) != value:
+                            setattr(app, name, value)
+                    except Exception:
+                        pass
+                return False
+
+        return _Paused()
+
+    def record(self, records, report):
+        sheets = self.book.sheets
+        if _RECORD_SHEET in [s.name for s in sheets]:
+            sheet = sheets[_RECORD_SHEET]
+        else:
+            sheet = sheets.add(_RECORD_SHEET, after=sheets[-1])
+            sheet.range("A1").value = [["Time", "Range", "Formula (as it was)", "Function",
+                                        "Inputs SHA-256", "Values written / note"]]
+        used = sheet.api.UsedRange
+        next_row = used.Row + used.Rows.Count
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        fingerprint = _code_fingerprint().hex()[:12]
+        rows = [["run", "", f"extraplus {extraplus.__version__} ({fingerprint})", "",
+                 _summary({**report, "problems": []}).replace("\n", " ")]]
+        rows += [[where, formula, name, digest, written] for where, formula, name, digest, written in records]
+        rows += [[where, "", status, "", why] for where, status, why in report["problems"]]
+        # "'" keeps every entry as text: formulas, addresses starting with ', digits.
+        sheet.range((next_row, 1)).value = [[stamp] + ["'" + str(v) if v else "" for v in row] for row in rows]
+
+
+def write_values() -> None:
+    """The ribbon command: Extraplus formulas of the selection (or of the active sheet) to values."""
+    book = xw.Book.caller()
+    title = "Extraplus: write values"
+    try:
+        selection = book.app.selection
+        scope = selection if selection is not None and selection.count > 1 else book.sheets.active.used_range
+        report = _values_pass(_XlwingsBook(book, scope))
+    except Exception as exc:
+        book.app.alert(f"Nothing was written: {_error_text(exc)}", title=title, mode="critical")
+        return
+    book.app.alert(_summary(report), title=title, mode="critical" if report["stopped"] else "info")
 
 
 # ---------------------------------------------------------------------------
