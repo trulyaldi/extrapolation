@@ -36,6 +36,9 @@ Excel functions:
     EXTRAPLUS_VERSION
         Return the installed extraplus package version.
 
+    EXTRAPLUS_CACHE_STATS
+        Return the state of the result cache (see "Result cache" below).
+
 Model mapping:
 
     1 -> exponential
@@ -54,9 +57,20 @@ the workbook. See excel/README.md.
 
 from __future__ import annotations
 
+import hashlib
+import os
+import sqlite3
+import struct
+import sys
+import threading
+import time
 import warnings
-from functools import lru_cache, wraps
-from typing import Any
+from collections import OrderedDict
+from dataclasses import fields
+from functools import wraps
+from importlib.metadata import PackageNotFoundError, version as _package_version
+from pathlib import Path
+from typing import Any, Optional
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -118,13 +132,6 @@ def _extrapolate_quietly(x, y, model_type, b_fixed, n_fit) -> Result:
         return extrapolate(x, y, model=model_type, b_fixed=b_fixed, n_fit=n_fit)
 
 
-@lru_cache(maxsize=256)
-def _cached_extrapolate(x_cells: tuple, y_cells: tuple, model_type: str,
-                        b_fixed: Any, n_fit: Any) -> Result:
-    """Cache repeated Excel calls that use exactly the same cell values."""
-    return _extrapolate_quietly(x_cells, y_cells, model_type, b_fixed, n_fit)
-
-
 def _run_udf(
     x_range: Any,
     y_range: Any,
@@ -133,12 +140,355 @@ def _run_udf(
     n_fit: Any = None,
 ) -> Result:
     """Shared implementation used by every numeric xlwings UDF below."""
-    key = (_cells(x_range), _cells(y_range), model_type, b_fixed, n_fit)
-    try:
-        hash(key)
-    except TypeError:   # e.g. a range passed as b_fixed: nothing to cache on
-        return _extrapolate_quietly(*key)
-    return _cached_extrapolate(*key)
+    return _CACHE.extrapolate(_cells(x_range), _cells(y_range), model_type, b_fixed, n_fit)
+
+
+# ---------------------------------------------------------------------------
+# Result cache
+# ---------------------------------------------------------------------------
+#
+# Every numeric function is a function of one fit, extrapolate(x, y, model,
+# b_fixed, n_fit), so the fit's Result is cached and each function formats it
+# as before.  Two levels: an in-memory LRU in the UDF server process, and an
+# SQLite file shared by every Excel instance of this install.
+#
+# Key: SHA-256 of the schema tag, the code fingerprint (extraplus version and
+# source, numpy/scipy/pandas and Python versions), the model, and the exact
+# cell values: each value is tagged with its type and floats are their 8
+# IEEE-754 bytes, so 0.0 and -0.0, every NaN payload, 1 and 1.0, True and 1,
+# "1" and 1 all give different keys.  Values of any other type (dates, ranges
+# passed as b_fixed, ...) are not cached.  Only successful fits are stored: a
+# failure (ValueError or anything else) is recomputed every time.
+#
+# Switches (environment of the Excel process, read when the module loads):
+#   EXTRAPLUS_CACHE      "off" (also 0/false/no): no cache; "memory": no file;
+#                        anything else (default): memory and file
+#   EXTRAPLUS_CACHE_DIR  folder for the file (default %EXTRAPLUS_HOME%\resultcache;
+#                        without either variable the cache is memory only)
+#
+# The file never breaks a function: when it is locked by another Excel for
+# longer than _DISK_BUSY_TIMEOUT_S the call computes without it, a corrupt
+# file is renamed to *.corrupt-<time> and replaced, and after
+# _DISK_ERROR_LIMIT unexplained errors the process stops using it.
+
+_CACHE_SCHEMA = b"extraplus-udf-cache/1"
+_MEMORY_ENTRIES = 20_000          # Results kept in memory (LRU)
+_DISK_ENTRIES = 100_000           # rows kept in the file (oldest written are deleted first)
+_DISK_EVICT_EVERY = 1_000         # check the row count after this many writes
+_DISK_BUSY_TIMEOUT_S = 0.25
+_DISK_ERROR_LIMIT = 3
+_DISK_FILE = "results.sqlite3"
+_RESULT_FIELDS = tuple(f.name for f in fields(Result))
+
+
+class _Uncacheable(Exception):
+    """A value the cache key or the stored Result cannot represent exactly."""
+
+
+def _encode(value: Any, out: bytearray) -> None:
+    """Append the exact, type-tagged bytes of one cell value (or Result field)."""
+    if value is None:
+        out += b"n"
+    elif isinstance(value, (bool, np.bool_)):
+        out += b"b1" if value else b"b0"
+    elif isinstance(value, (float, np.floating)):
+        out += b"f" + struct.pack("<d", float(value))
+    elif isinstance(value, (int, np.integer)):
+        text = str(int(value)).encode()
+        out += b"i" + struct.pack("<I", len(text)) + text
+    elif isinstance(value, str):
+        text = value.encode("utf-8", "surrogatepass")
+        out += b"s" + struct.pack("<I", len(text)) + text
+    elif isinstance(value, tuple):
+        out += b"t" + struct.pack("<I", len(value))
+        for item in value:
+            _encode(item, out)
+    else:
+        raise _Uncacheable(type(value).__name__)
+
+
+def _decode(data: bytes, pos: int) -> tuple[Any, int]:
+    tag = data[pos:pos + 1]
+    pos += 1
+    if tag == b"n":
+        return None, pos
+    if tag == b"b":
+        return data[pos:pos + 1] == b"1", pos + 1
+    if tag == b"f":
+        return struct.unpack_from("<d", data, pos)[0], pos + 8
+    if tag in (b"i", b"s"):
+        (size,) = struct.unpack_from("<I", data, pos)
+        text = data[pos + 4:pos + 4 + size]
+        if len(text) != size:
+            raise _Uncacheable("truncated")
+        pos += 4 + size
+        return (int(text) if tag == b"i" else text.decode("utf-8", "surrogatepass")), pos
+    if tag == b"t":
+        (size,) = struct.unpack_from("<I", data, pos)
+        pos += 4
+        items = []
+        for _ in range(size):
+            item, pos = _decode(data, pos)
+            items.append(item)
+        return tuple(items), pos
+    raise _Uncacheable(f"tag {tag!r}")
+
+
+def _encode_result(result: Result) -> bytes:
+    out = bytearray()
+    _encode(tuple(getattr(result, name) for name in _RESULT_FIELDS), out)
+    return bytes(out) + hashlib.sha256(out).digest()[:8]
+
+
+def _decode_result(blob: bytes) -> Result:
+    payload, checksum = blob[:-8], blob[-8:]
+    if hashlib.sha256(payload).digest()[:8] != checksum:
+        raise _Uncacheable("checksum")
+    values, end = _decode(payload, 0)
+    if end != len(payload) or not isinstance(values, tuple) or len(values) != len(_RESULT_FIELDS):
+        raise _Uncacheable("layout")
+    return Result(**dict(zip(_RESULT_FIELDS, values)))
+
+
+def _code_fingerprint() -> bytes:
+    """What the cached Results depend on besides the input: the fitting code and its libraries."""
+    h = hashlib.sha256()
+    h.update(f"extraplus {extraplus.__version__}\n".encode())
+    package = Path(extraplus.__file__).resolve().parent
+    for path in sorted(package.glob("*.py")):
+        h.update(path.name.encode() + b"\n" + path.read_bytes())
+    for name in ("numpy", "scipy", "pandas"):
+        try:
+            h.update(f"{name} {_package_version(name)}\n".encode())
+        except PackageNotFoundError:
+            h.update(f"{name} ?\n".encode())
+    h.update(sys.version.encode())
+    return h.digest()
+
+
+class _DiskCache:
+    """The SQLite level.  Every method returns quietly instead of raising."""
+
+    def __init__(self, path: Path, fingerprint: bytes):
+        self.path = path
+        self.fingerprint = fingerprint[:8]
+        self.state = "not opened"
+        self.lock = threading.Lock()
+        self._con: Optional[sqlite3.Connection] = None
+        self._errors = 0
+        self._writes = 0
+
+    def _connect(self) -> sqlite3.Connection:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(str(self.path), timeout=_DISK_BUSY_TIMEOUT_S,
+                              isolation_level=None, check_same_thread=False)
+        try:
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute("PRAGMA synchronous=NORMAL")
+            con.execute("CREATE TABLE IF NOT EXISTS results ("
+                        "key BLOB PRIMARY KEY, fingerprint BLOB NOT NULL, value BLOB NOT NULL)")
+        except BaseException:
+            con.close()
+            raise
+        try:   # rows from other versions can never match again; skipped if another Excel is busy
+            con.execute("DELETE FROM results WHERE fingerprint <> ?", (self.fingerprint,))
+        except sqlite3.OperationalError as exc:
+            if not self._is_busy(exc):
+                con.close()
+                raise
+        return con
+
+    def _open(self) -> Optional[sqlite3.Connection]:
+        if self._con is not None or self.state.startswith(("disabled", "failed")):
+            return self._con
+        try:
+            self._con, self.state = self._connect(), "open"
+        except Exception as exc:
+            self._failed(exc)
+        return self._con
+
+    @staticmethod
+    def _is_corrupt(exc: Exception) -> bool:
+        return isinstance(exc, sqlite3.DatabaseError) and (
+            getattr(exc, "sqlite_errorname", "") in ("SQLITE_CORRUPT", "SQLITE_NOTADB")
+            or "not a database" in str(exc) or "malformed" in str(exc))
+
+    @staticmethod
+    def _is_busy(exc: Exception) -> bool:
+        return isinstance(exc, sqlite3.OperationalError) and (
+            getattr(exc, "sqlite_errorname", "") in ("SQLITE_BUSY", "SQLITE_LOCKED")
+            or "locked" in str(exc) or "busy" in str(exc))
+
+    def _quarantine(self) -> bool:
+        """Move a corrupt file aside so that the next open starts a new one."""
+        if self._con is not None:
+            try:
+                self._con.close()
+            except Exception:
+                pass
+            self._con = None
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        try:
+            self.path.replace(self.path.with_name(f"{self.path.name}.corrupt-{stamp}"))
+            for suffix in ("-wal", "-shm"):
+                side = self.path.with_name(self.path.name + suffix)
+                if side.exists():
+                    side.unlink()
+            return True
+        except OSError:   # e.g. still open in another Excel
+            return False
+
+    def _failed(self, exc: Exception) -> None:
+        if self._is_busy(exc):
+            return   # another Excel holds the file: do without it this time
+        if self._is_corrupt(exc) and self._quarantine():
+            self.state = "not opened"   # the next call starts a new file
+            return
+        self.close()
+        self._errors += 1
+        self.state = (f"disabled after {self._errors} errors: {exc}" if self._errors >= _DISK_ERROR_LIMIT
+                      else f"error: {exc}")
+
+    def get(self, key: bytes) -> Optional[Result]:
+        with self.lock:
+            con = self._open()
+            if con is None:
+                return None
+            try:
+                row = con.execute("SELECT value FROM results WHERE key = ?", (key,)).fetchone()
+            except Exception as exc:
+                self._failed(exc)
+                return None
+            if row is None:
+                return None
+            try:
+                return _decode_result(bytes(row[0]))
+            except Exception:   # a damaged row: recompute, and drop it
+                try:
+                    con.execute("DELETE FROM results WHERE key = ?", (key,))
+                except Exception as exc:
+                    self._failed(exc)
+                return None
+
+    def put(self, key: bytes, result: Result) -> None:
+        with self.lock:
+            con = self._open()
+            if con is None:
+                return
+            try:
+                con.execute("INSERT OR IGNORE INTO results (key, fingerprint, value) VALUES (?, ?, ?)",
+                            (key, self.fingerprint, _encode_result(result)))
+                self._writes += 1
+                if self._writes % _DISK_EVICT_EVERY == 0:
+                    self._evict(con)
+            except Exception as exc:
+                self._failed(exc)
+
+    def _evict(self, con: sqlite3.Connection) -> None:
+        (count,) = con.execute("SELECT count(*) FROM results").fetchone()
+        if count > _DISK_ENTRIES:
+            excess = count - int(0.9 * _DISK_ENTRIES)
+            con.execute("DELETE FROM results WHERE rowid IN "
+                        "(SELECT rowid FROM results ORDER BY rowid LIMIT ?)", (excess,))
+
+    def count(self) -> Optional[int]:
+        with self.lock:
+            con = self._open()
+            if con is None:
+                return None
+            try:
+                return con.execute("SELECT count(*) FROM results").fetchone()[0]
+            except Exception as exc:
+                self._failed(exc)
+                return None
+
+    def close(self) -> None:
+        if self._con is not None:
+            try:
+                self._con.close()
+            except Exception:
+                pass
+        self._con = None
+
+
+class _ResultCache:
+    def __init__(self, environ=os.environ):
+        mode = environ.get("EXTRAPLUS_CACHE", "on").strip().lower()
+        self.mode = ("off" if mode in ("off", "0", "false", "no")
+                     else "memory" if mode == "memory" else "on")
+        self._lock = threading.Lock()
+        self._memory: OrderedDict = OrderedDict()
+        self.hits_memory = self.hits_disk = self.misses = self.uncacheable = 0
+        self._prefix: Optional[bytes] = None
+        self._fingerprint: Optional[bytes] = None
+        self.disk: Optional[_DiskCache] = None
+        folder = environ.get("EXTRAPLUS_CACHE_DIR") or (
+            str(Path(environ["EXTRAPLUS_HOME"]) / "resultcache") if environ.get("EXTRAPLUS_HOME") else "")
+        self._disk_path = Path(folder) / _DISK_FILE if (folder and self.mode == "on") else None
+
+    def _key(self, x_cells, y_cells, model_type, b_fixed, n_fit) -> bytes:
+        if self._prefix is None:
+            self._fingerprint = _code_fingerprint()
+            self._prefix = _CACHE_SCHEMA + self._fingerprint
+            if self._disk_path is not None:
+                self.disk = _DiskCache(self._disk_path, self._fingerprint)
+        out = bytearray(self._prefix)
+        _encode(model_type, out)
+        for cells in (x_cells, y_cells):
+            _encode(tuple(cells), out)
+        _encode(b_fixed, out)
+        _encode(n_fit, out)
+        return hashlib.sha256(out).digest()
+
+    def extrapolate(self, x_cells: tuple, y_cells: tuple, model_type: str,
+                    b_fixed: Any, n_fit: Any) -> Result:
+        """extrapolate() through the cache; the fit's own exceptions pass through unchanged."""
+        key = None
+        if self.mode != "off":
+            try:
+                key = self._key(x_cells, y_cells, model_type, b_fixed, n_fit)
+            except Exception:   # _Uncacheable, or a fingerprint problem
+                self.uncacheable += 1
+        if key is None:
+            return _extrapolate_quietly(x_cells, y_cells, model_type, b_fixed, n_fit)
+
+        with self._lock:
+            result = self._memory.get(key)
+            if result is not None:
+                self._memory.move_to_end(key)
+                self.hits_memory += 1
+                return result
+        result = self.disk.get(key) if self.disk is not None else None
+        if result is not None:
+            self.hits_disk += 1
+        else:
+            self.misses += 1
+            result = _extrapolate_quietly(x_cells, y_cells, model_type, b_fixed, n_fit)
+            if self.disk is not None:
+                self.disk.put(key, result)
+        with self._lock:
+            self._memory[key] = result
+            while len(self._memory) > _MEMORY_ENTRIES:
+                self._memory.popitem(last=False)
+        return result
+
+    def stats(self) -> str:
+        if self.mode == "off":
+            return "cache off (EXTRAPLUS_CACHE=off)"
+        if self.disk is not None:
+            rows = self.disk.count()
+            disk = f"file {self.disk.path} ({rows} results, {self.disk.state})" if rows is not None \
+                else f"file {self.disk.path} ({self.disk.state})"
+        elif self._disk_path is not None:
+            disk = f"file {self._disk_path} (not opened yet)"
+        else:
+            disk = "no file"
+        return (f"cache {self.mode}; memory {len(self._memory)} results; {disk}; "
+                f"hits {self.hits_memory} memory + {self.hits_disk} file, "
+                f"misses {self.misses}, not cacheable {self.uncacheable}")
+
+
+_CACHE = _ResultCache()
 
 
 def _excel_errors(function):
@@ -571,6 +921,13 @@ def EXTRAPLUS_VERSION():
     return extraplus.__version__
 
 
+@xw.func(category="Extrapolation", volatile=False)
+@_excel_errors
+def EXTRAPLUS_CACHE_STATS():
+    """State of the result cache: mode, file, hits and misses (Ctrl+Alt+F9 refreshes it)."""
+    return _CACHE.stats()
+
+
 # ---------------------------------------------------------------------------
 # Matplotlib plots in Excel
 # ---------------------------------------------------------------------------
@@ -765,6 +1122,7 @@ __all__ = [
     "EXTRAP2_H",
     "EXTRAP3_H",
     "EXTRAPLUS_VERSION",
+    "EXTRAPLUS_CACHE_STATS",
     "EXTRAP1_PLOT",
     "EXTRAP2_PLOT",
     "EXTRAP3_PLOT",
