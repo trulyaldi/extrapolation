@@ -240,6 +240,20 @@ def test_a_result_that_does_not_fit_the_formulas_cells_is_kept():
     assert "3 x 1" in report["problems"][0][2]
 
 
+def test_a_nan_result_read_as_b_fixed_skips_the_dependent():
+    """NaN is written as an empty cell, and an empty b_fixed would mean "fit B"."""
+    book = energy_sheet()
+    book.column(4, [1.7e308, -1.7e308, 1e308, 0.0], row=20)       # C = nan for these
+    book.column(1, [1.0, 2.0, 3.0, 4.0], row=20)
+    book.formula(20, 5, "=EXTRAP1_V(A20:A23,D20:D23)", rows=3)    # E20 (C) is NaN
+    book.formula(2, 6, "=EXTRAP1_V(A2:A13,C2:C13,E20)", rows=3)   # uses that C as b_fixed
+    report = extrapolation._values_pass(book)
+    assert report["written"] == 1 and report["skipped"] == 1
+    assert book.cells[("2P", 20, 5)] is None                       # the NaN, as Excel shows it
+    assert report["problems"] == [("2P!R2C6:R4C6", "skipped", "uses an empty (NaN) result of 2P!R20C5:R22C5")]
+    assert ("2P", 2, 6) in book.formulas
+
+
 def test_excel_error_in_b_cell_is_an_error_not_a_free_fit():
     book = energy_sheet()
     book.cells[("2P", 2, 9)] = "#N/A"

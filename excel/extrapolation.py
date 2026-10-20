@@ -1246,6 +1246,12 @@ def _write_blocks(book, module, blocks, order, report, records) -> None:
             block["status"] = "skipped"
             block["reason"] = f"uses {book.address(blocked[0]['sheet'], blocked[0]['box'])}, which was not written"
             continue
+        # A NaN result is written as an empty cell, and an empty b_fixed means "fit B".
+        empty = [blocks[j] for j in block["deps"] if _reads_empty_output(block, blocks[j])]
+        if empty:
+            block["status"] = "skipped"
+            block["reason"] = f"uses an empty (NaN) result of {book.address(empty[0]['sheet'], empty[0]['box'])}"
+            continue
         values = []
         for (_name, options), arg in zip(_arg_options(block["name"]), block["args"]):
             if arg[0] == "missing":
@@ -1272,11 +1278,25 @@ def _write_blocks(book, module, blocks, order, report, records) -> None:
         if not all(_same_number(a, b) for a, b in zip(before, after.ravel())):
             report["changed"] += 1
         book.write(block["sheet"], block["box"], result)
-        block["status"] = "written"
+        block["status"], block["written"] = "written", after
         records.append((book.address(block["sheet"], block["box"]), block["formula"], block["name"],
                         _inputs_digest(values),
                         ", ".join(repr(float(v)) if isinstance(v, (float, np.floating)) else repr(v)
                                   for v in after.ravel())))
+
+
+def _reads_empty_output(block: dict, upstream: dict) -> bool:
+    """Whether an argument of block reads a cell of upstream's written result that is NaN or None."""
+    top, left = upstream["box"][0], upstream["box"][1]
+    for arg in block["args"]:
+        if arg[0] != "ref" or arg[1] != upstream["sheet"] or not _overlaps(arg[3], upstream["box"]):
+            continue
+        for r in range(max(arg[3][0], upstream["box"][0]), min(arg[3][2], upstream["box"][2]) + 1):
+            for c in range(max(arg[3][1], upstream["box"][1]), min(arg[3][3], upstream["box"][3]) + 1):
+                v = upstream["written"][r - top, c - left]
+                if v is None or (isinstance(v, (float, np.floating)) and np.isnan(v)):
+                    return True
+    return False
 
 
 def _inputs_digest(values: list) -> str:

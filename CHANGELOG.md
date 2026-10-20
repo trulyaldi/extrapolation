@@ -42,7 +42,10 @@ numbers. The Python API and the numeric results are unchanged.
 - `EXTRAP1`–`3_V` and `EXTRAP1`–`3_H` show their "Error: ..." text in each of their 3 cells.
   Before, they returned a single text, and xlwings' resizing (`expand="table"`) then cleared
   the 3-cell array and re-entered the formula as one cell; the emptied B cell made every
-  formula using it as `b_fixed` silently fit B instead.
+  formula using it as `b_fixed` silently fit B instead. Side effect: a `_V`/`_H` formula that
+  occupies one cell (just typed, or shrunk by the old behaviour) now also resizes itself to 3
+  cells when it shows an error, as it already did on success, writing over the 2 cells next
+  to it.
 - An Excel error value (`#N/A`, `#NAME?`, ...) in the `b_fixed` or `n_fit` argument of the
   numeric functions now gives "Error: b_fixed must be a number." / "Error: n_fit must be a
   number.". Before, it was read as a blank cell, so B was fitted / all points were used.
