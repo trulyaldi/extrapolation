@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 (unreleased)
+## 0.4.0 (2026-10-20)
 
 Makes large Excel workbooks robust: results no longer get lost when a workbook is opened
 on another computer, recalculation is cached, and finished sheets can be turned into plain
@@ -51,6 +51,16 @@ numbers. The Python API and the numeric results are unchanged.
   number.". Before, it was read as a blank cell, so B was fitted / all points were used.
 - Successful results of every existing function are unchanged (bit for bit), and no
   function was renamed or changed its arguments. The `_PLOT` functions are unchanged.
+
+### Not yet verified in a real Excel
+
+Tested in Python (360 tests; outputs bit-identical to 0.3.0 on 152 datasets with the cache
+off, cold and warm), but not yet in Excel: the relink on open (including when it fires
+relative to Excel's link prompt, and whether `ChangeLink` recalculates), the save warning,
+the ribbon button and the Write values message boxes, the file cache shared by two Excel
+instances, and `EXTRAP_ALL_V` entered from a single cell. The VBA was not run before the
+build. The checklist is `excel/build/manual-tests-0.4.0.md`. Not done: re-running
+`install.bat` over an existing install.
 
 ### Upgrading
 

@@ -52,9 +52,9 @@ Optional arguments:
   extrapolation is stable as more points are added.
 
 `EXTRAP_ALL_V` replaces three `EXTRAPn_V` formulas with one, which makes big
-sheets calculate faster. In Excel 365/2021 type it in one cell and it fills
-3 × 3 cells; in older Excel select 3 × 3 cells, type it and press
-Ctrl+Shift+Enter.
+sheets calculate faster. Select 3 × 3 cells, type the formula and press
+Ctrl+Shift+Enter. (Excel with dynamic arrays may also fill the 3 × 3 cells
+from a single cell; this has not been tested.)
 
 Don't put `EXTRAP1_V` or `EXTRAP1_H` inside another formula (for example
 `=INDEX(EXTRAP1_V(...), 3)`): they resize their own cells and would
@@ -74,8 +74,8 @@ Each fit is remembered, so recalculating a sheet (after inserting a column,
 reopening the file, pressing F9) does not fit unchanged data again. The
 cache is kept in memory while Excel runs and in the file
 `resultcache\results.sqlite3` in the install folder (usually
-`%LOCALAPPDATA%\Extraplus`), which every Excel
-window on this PC shares and which survives restarts. A result is reused
+`%LOCALAPPDATA%\Extraplus`), which is meant to be shared by all Excel
+windows on this PC and survives restarts. A result is reused
 only for exactly the same input values and the same Extraplus version, so
 the numbers are identical to computing them again. The file holds at most
 100,000 results (the oldest are removed first) and can be deleted at any
@@ -112,14 +112,24 @@ that copy, or type the formula from the list again.
 A workbook remembers where the add-in was installed on the computer that
 saved it (for example `C:\Users\Anna\AppData\Local\Extraplus\extraplus.xlam`).
 When such a workbook is opened, Extraplus points those links to the add-in
-on this computer, so its formulas keep working. Excel then asks whether to
-save the changes when you close the workbook; saving keeps the new links.
+on this computer, so its formulas keep working. Excel may then ask whether
+to save the changes when you close the workbook; saving keeps the new links.
 
 Before you save a workbook in which cells with Extraplus formulas show
 `#NAME?`, `#REF!` or `#VALUE!`, Extraplus asks whether you really want to
 save: saving would replace the numbers stored in the file with those errors.
 If the add-in is not installed at all, none of this happens: don't save
 such a workbook; install Extraplus first.
+
+## Not yet tested in Excel (0.4.0)
+
+The result cache, `EXTRAP_ALL_V`, **Write values** and the error shapes are
+tested in Python. These parts run inside Excel and have **not** been tested
+in a real Excel yet: repointing links when a workbook is opened (and whether
+Excel recalculates while doing so), the warning before saving, the ribbon
+button, two Excel windows sharing the cache file, and entering `EXTRAP_ALL_V`
+from a single cell. Test them on copies of your workbooks first; the checklist
+is in `excel/build/manual-tests-0.4.0.md` in the source repository.
 
 ## Update
 
