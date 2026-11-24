@@ -9,16 +9,24 @@
 
       <install folder>\bin\uv.exe        pinned uv (checksum-verified)
       <install folder>\python\           uv-managed Python
-      <install folder>\venv\             Python environment with extraplus
-      <install folder>\udf\              the Excel UDF module (extrapolation.py)
-      <install folder>\extraplus.xlam    the Excel add-in
+      <install folder>\venv\             Python environment with extraplus and xlOil
+      <install folder>\udf\              the Excel function modules (extrapolation.py,
+                                         extraplus_xloil.py, extraplus_xlcompat.py,
+                                         extraplus_migrate.py)
+      <install folder>\extraplus.xll     the Excel add-in (xlOil.xll from the venv)
+      <install folder>\extraplus.ini     its settings: the venv's Python, the udf folder
       <install folder>\cache\            uv download cache
       <install folder>\resultcache\      Excel result cache (created by the add-in)
 
     HKCU\Environment\EXTRAPLUS_HOME       install folder, read by the add-in
     Excel\Options\OPENn                   loads the add-in when Excel starts
-    Excel\Security\Trusted Locations      trusts the install folder
+    Excel\Security\Trusted Locations      trusts the install folder (Excel only loads
+                                          an XLL from a trusted location)
     ...\CurrentVersion\Uninstall\Extraplus  "Apps & features" entry
+
+    Up to 0.4.0 the add-in was extraplus.xlam (xlwings). An update replaces its
+    OPENn entry by the XLL's and deletes the old file; workbooks made with it
+    are converted when they are opened (extraplus_migrate.py).
 
     The install folder is %LOCALAPPDATA%\Extraplus. xlwings passes paths to
     Windows as ANSI text, so if that path contains non-ASCII characters (for
@@ -46,7 +54,10 @@ $AppName = 'Extraplus'
 $AppDisplayName = 'Extraplus for Excel'
 $EnvVarName = 'EXTRAPLUS_HOME'
 $MarkerFile = 'install-info.json'
-$AddInFile = 'extraplus.xlam'
+$AddInFile = 'extraplus.xll'
+$AddInIni = 'extraplus.ini'
+$LegacyAddInFile = 'extraplus.xlam'   # the xlwings add-in of 0.4.0 and earlier
+$UdfModules = @('extrapolation.py', 'extraplus_xloil.py', 'extraplus_xlcompat.py', 'extraplus_migrate.py')
 $ExcelSubKey = 'Software\Microsoft\Office\16.0\Excel'
 $UninstallSubKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\Extraplus'
 $SourceDir = $PSScriptRoot
@@ -282,11 +293,15 @@ function Open-UserKey([string]$SubKey, [switch]$Create) {
 }
 
 function Test-OurAddIn([string]$Value) {
-    # OPENn values look like:  /R "C:\path\extraplus.xlam"  or  "C:\path\x.xlam"
+    # OPENn values look like:  /R "C:\path\extraplus.xll"  or  "C:\path\x.xlam"
+    # Both the XLL and the old xlwings add-in count as ours, so an update replaces the old entry.
     $path = $Value.Trim()
     while ($path -match '^/\w+\s+(.*)$') { $path = $Matches[1].Trim() }
     $path = $path.Trim('"')
-    return ($path -like "*\$AddInFile") -or ($path -ieq $AddInFile)
+    foreach ($file in $AddInFile, $LegacyAddInFile) {
+        if (($path -like "*\$file") -or ($path -ieq $file)) { return $true }
+    }
+    return $false
 }
 
 function Get-OpenEntries($Key) {
@@ -461,8 +476,61 @@ function Test-Excel {
     }
     $c2r = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' -ErrorAction SilentlyContinue
     if ($c2r -and ($c2r.PSObject.Properties.Name -contains 'Platform') -and ($c2r.Platform -eq 'x86')) {
-        Write-Warn '32-bit Office detected. 32-bit Office has not been tested.'
+        throw '32-bit Office detected. The Extraplus add-in is 64-bit (an XLL must match Excel); install 64-bit Office.'
     }
+    # Only one xlOil can run in an Excel; a separate xlOil installation's settings take precedence.
+    $globalIni = Join-Path $env:APPDATA 'xlOil\xlOil.ini'
+    $xlstart = Join-Path $env:APPDATA 'Microsoft\Excel\XLSTART\xlOil.xll'
+    if ((Test-Path -LiteralPath $globalIni) -or (Test-Path -LiteralPath $xlstart)) {
+        Write-Warn "A separate xlOil installation was found ($globalIni or $xlstart). Excel can host only one xlOil; if Extraplus functions show #NAME?, remove that xlOil (xloil remove)."
+    }
+}
+
+function Set-IniValue([string]$Text, [string]$Pattern, [string]$Line) {
+    # Replace the one line matching Pattern (multiline regex) by Line; fail if not exactly one matches.
+    $regex = New-Object Text.RegularExpressions.Regex($Pattern, [Text.RegularExpressions.RegexOptions]::Multiline)
+    $count = $regex.Matches($Text).Count
+    if ($count -ne 1) { throw "The xlOil settings template has $count lines matching $Pattern (expected 1)." }
+    return $regex.Replace($Text, [Text.RegularExpressions.MatchEvaluator] { param($m) $Line })
+}
+
+function Install-XllAddIn([string]$Root, [string]$Venv) {
+    # extraplus.xll is xlOil.xll from the xlOil wheel; extraplus.ini (read by it, same name) is the
+    # wheel's xlOil.ini with the settings below. This is what "xloil create" does, plus our settings.
+    $bin = Join-Path $Venv 'share\xloil'
+    foreach ($file in 'xlOil.xll', 'xlOil.ini', 'xlOil.dll', 'xlOil_Python.dll') {
+        if (-not (Test-Path -LiteralPath (Join-Path $bin $file))) { throw "$file is missing from $bin; the xlOil package did not install correctly." }
+    }
+    $xll = Join-Path $Root $AddInFile
+    Copy-Item -LiteralPath (Join-Path $bin 'xlOil.xll') -Destination $xll -Force
+    Unblock-File -LiteralPath $xll
+    $utf8 = New-Object Text.UTF8Encoding($false)   # TOML: UTF-8 without a byte order mark
+
+    # The xlOil core (xlOil.dll) first loads the plugins listed in the xlOil.ini next to it, with that
+    # file's (empty) Python settings, and that Python plugin then fails. Load no plugins there; the
+    # Python plugin is loaded from extraplus.ini below.
+    # Read before it is changed: it is also the template for extraplus.ini, whose values are all set below.
+    $coreIni = Join-Path $bin 'xlOil.ini'
+    $text = [IO.File]::ReadAllText($coreIni)
+    [IO.File]::WriteAllText($coreIni, (Set-IniValue $text '^\s*Plugins\s*=.*$' 'Plugins=[]'), $utf8)
+
+    $text = Set-IniValue $text '^\s*Plugins\s*=.*$' 'Plugins=["xlOil_Python"]'
+    $text = Set-IniValue $text '^\s*XLOIL_PATH\s*=.*$' ("XLOIL_PATH='''" + $bin + "'''")
+    $text = Set-IniValue $text '^\s*PYTHONEXECUTABLE\s*=.*$' ("PYTHONEXECUTABLE='''" + (Join-Path $Venv 'Scripts\python.exe') + "'''")
+    $text = Set-IniValue $text '^\s*XLOIL_PYTHON_PATH\s*=.*$' ("XLOIL_PYTHON_PATH='''" + (Join-Path $Root 'udf') + "'''")
+    $text = Set-IniValue $text '^\s*LoadModules\s*=.*$' 'LoadModules=["extraplus_xloil"]'
+    # Never import a .py file that happens to sit next to a workbook.
+    $text = Set-IniValue $text '^\s*WorkbookModule\s*=.*$' 'WorkbookModule=""'
+    # Register the functions before Excel calculates a workbook opened with it (no #NAME?).
+    $text = Set-IniValue $text '^\s*#?\s*UseLoaderThread\s*=.*$' 'UseLoaderThread=false'
+    # Error cells reach the functions (as under xlwings), not returned as the function's result.
+    $text = Set-IniValue $text '^\s*#?\s*ErrorPropagation\s*=.*$' 'ErrorPropagation=false'
+    # Only our folders on sys.path: no user PYTHONPATH, no literal "%PYTHONPATH%" when it is unset.
+    $text = Set-IniValue $text '^\s*PYTHONPATH\s*=.*$' "`tPYTHONPATH='''%XLOIL_PYTHON_PATH%'''"
+    # Never reload modules when files change: nothing in the install folder is edited while in use.
+    $text = Set-IniValue $text '^\s*#?\s*AutoReloadExcludePaths\s*=.*$' ("AutoReloadExcludePaths=['''" + $Root + "''']")
+    [IO.File]::WriteAllText((Join-Path $Root $AddInIni), $text, $utf8)
+    return $xll
 }
 
 function Install-Extraplus {
@@ -498,43 +566,47 @@ function Install-Extraplus {
         $udf = Join-Path $root 'udf'
         New-Item -ItemType Directory -Force -Path $udf | Out-Null
         $copies = @(
-            @{ From = 'extrapolation.py'; To = (Join-Path $udf 'extrapolation.py') },
-            @{ From = $AddInFile; To = (Join-Path $root $AddInFile) },
             @{ From = 'install.ps1'; To = (Join-Path $root 'install.ps1') },
             @{ From = 'uninstall.ps1'; To = (Join-Path $root 'uninstall.ps1') },
             @{ From = 'uninstall.bat'; To = (Join-Path $root 'uninstall.bat') }
         )
+        foreach ($module in $UdfModules) { $copies += @{ From = $module; To = (Join-Path $udf $module) } }
         foreach ($copy in $copies) {
             Copy-Item -LiteralPath (Join-Path $SourceDir $copy.From) -Destination $copy.To -Force
             Unblock-File -LiteralPath $copy.To   # remove the "downloaded from the internet" mark
         }
-        Write-Info "Copied the add-in and the UDF module to $root"
+        $xll = Install-XllAddIn $root $venv
+        $legacy = Join-Path $root $LegacyAddInFile
+        if (Test-Path -LiteralPath $legacy) {
+            Remove-Item -LiteralPath $legacy -Force
+            Write-Info "Removed the old add-in $LegacyAddInFile (workbooks made with it are converted when opened)."
+        }
+        Write-Info "Installed $xll and the function modules in $udf"
 
         Write-Step 'Checking the installation'
         $venvPython = Join-Path $venv 'Scripts\python.exe'
-        $dll = Join-Path $venv "xlwings64-$($manifest.xlwings).dll"
-        if (-not (Test-Path -LiteralPath $dll)) { throw "$dll is missing; the add-in needs xlwings $($manifest.xlwings)." }
         $env:PYTHONPATH = $udf
         try {
-            $check = Get-NativeOutput $venvPython @('-c', "import importlib.metadata as m, extrapolation; print(extrapolation.EXTRAPLUS_VERSION(), m.version('xlwings'))")
+            # extraplus_xloil.py itself only imports inside Excel; compile it, import the rest.
+            $check = Get-NativeOutput $venvPython @('-c', "import importlib.metadata as m, py_compile, extrapolation, extraplus_xlcompat, extraplus_migrate; py_compile.compile(r'$udf\extraplus_xloil.py', doraise=True); print(extrapolation.EXTRAPLUS_VERSION(), m.version('xloil'))")
         } finally {
             Remove-Item -LiteralPath 'Env:PYTHONPATH' -ErrorAction SilentlyContinue
         }
-        $expected = "$($manifest.version) $($manifest.xlwings)"
+        $expected = "$($manifest.version) $($manifest.xloil)"
         if ($check -ne $expected) { throw "Installed versions '$check' do not match '$expected'." }
-        Write-Info "extraplus $($manifest.version) and xlwings $($manifest.xlwings) import correctly."
+        Write-Info "extraplus $($manifest.version) and xlOil $($manifest.xloil) import correctly."
 
         Write-Step 'Registering with Excel'
         [Environment]::SetEnvironmentVariable($EnvVarName, $root, 'User')   # also notifies running programs
         $env:EXTRAPLUS_HOME = $root
         Write-Info "$EnvVarName = $root"
-        Register-AddIn (Join-Path $root $AddInFile)
+        Register-AddIn $xll
         Register-TrustedLocation $root
         Register-UninstallEntry $root $manifest.version
 
         $info = [ordered]@{
             version   = $manifest.version
-            xlwings   = $manifest.xlwings
+            xloil     = $manifest.xloil
             python    = $pins.PythonVersion
             uv        = $pins.UvVersion
             installed = (Get-Date).ToString('s')
@@ -548,7 +620,8 @@ function Install-Extraplus {
     Write-Host "SUCCESS: $AppDisplayName $($manifest.version) is installed." -ForegroundColor Green
     Write-Host '    Open Excel (any workbook, .xlsx is fine) and type for example'
     Write-Host '        =EXTRAP1(A2:A20, B2:B20)'
-    Write-Host '    The first calculation in each Excel session takes a few seconds.'
+    Write-Host '    Excel takes a few seconds longer to start: it loads Python with the add-in.'
+    Write-Host '    Workbooks made with an earlier Extraplus (extraplus.xlam) are offered a conversion when opened.'
     Write-Host "    You can delete the folder you unzipped. To uninstall, use Settings > Apps > $AppDisplayName."
 }
 
