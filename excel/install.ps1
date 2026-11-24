@@ -504,8 +504,16 @@ function Install-XllAddIn([string]$Root, [string]$Venv) {
     $xll = Join-Path $Root $AddInFile
     Copy-Item -LiteralPath (Join-Path $bin 'xlOil.xll') -Destination $xll -Force
     Unblock-File -LiteralPath $xll
+    $utf8 = New-Object Text.UTF8Encoding($false)   # TOML: UTF-8 without a byte order mark
 
-    $text = [IO.File]::ReadAllText((Join-Path $bin 'xlOil.ini'))
+    # The xlOil core (xlOil.dll) first loads the plugins listed in the xlOil.ini next to it, with that
+    # file's (empty) Python settings, and that Python plugin then fails. Load no plugins there; the
+    # Python plugin is loaded from extraplus.ini below.
+    # Read before it is changed: it is also the template for extraplus.ini, whose values are all set below.
+    $coreIni = Join-Path $bin 'xlOil.ini'
+    $text = [IO.File]::ReadAllText($coreIni)
+    [IO.File]::WriteAllText($coreIni, (Set-IniValue $text '^\s*Plugins\s*=.*$' 'Plugins=[]'), $utf8)
+
     $text = Set-IniValue $text '^\s*Plugins\s*=.*$' 'Plugins=["xlOil_Python"]'
     $text = Set-IniValue $text '^\s*XLOIL_PATH\s*=.*$' ("XLOIL_PATH='''" + $bin + "'''")
     $text = Set-IniValue $text '^\s*PYTHONEXECUTABLE\s*=.*$' ("PYTHONEXECUTABLE='''" + (Join-Path $Venv 'Scripts\python.exe') + "'''")
@@ -515,8 +523,13 @@ function Install-XllAddIn([string]$Root, [string]$Venv) {
     $text = Set-IniValue $text '^\s*WorkbookModule\s*=.*$' 'WorkbookModule=""'
     # Register the functions before Excel calculates a workbook opened with it (no #NAME?).
     $text = Set-IniValue $text '^\s*#?\s*UseLoaderThread\s*=.*$' 'UseLoaderThread=false'
-    # TOML: UTF-8 without a byte order mark.
-    [IO.File]::WriteAllText((Join-Path $Root $AddInIni), $text, (New-Object Text.UTF8Encoding($false)))
+    # Error cells reach the functions (as under xlwings), not returned as the function's result.
+    $text = Set-IniValue $text '^\s*#?\s*ErrorPropagation\s*=.*$' 'ErrorPropagation=false'
+    # Only our folders on sys.path: no user PYTHONPATH, no literal "%PYTHONPATH%" when it is unset.
+    $text = Set-IniValue $text '^\s*PYTHONPATH\s*=.*$' "`tPYTHONPATH='''%XLOIL_PYTHON_PATH%'''"
+    # Never reload modules when files change: nothing in the install folder is edited while in use.
+    $text = Set-IniValue $text '^\s*#?\s*AutoReloadExcludePaths\s*=.*$' ("AutoReloadExcludePaths=['''" + $Root + "''']")
+    [IO.File]::WriteAllText((Join-Path $Root $AddInIni), $text, $utf8)
     return $xll
 }
 

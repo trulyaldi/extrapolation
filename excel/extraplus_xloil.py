@@ -62,9 +62,10 @@ def _make(name: str, call):
     original = getattr(_x, name)
     worksheet_function.__doc__ = original.__doc__
     help_text = inspect.cleandoc(original.__doc__ or "").split("\n\n")[0].replace("\n", " ")
+    # Error cells are passed to the function as xlwings does (ErrorPropagation=false in extraplus.ini).
     xlo.func(worksheet_function, name=name, help=help_text, group=_CATEGORY,
              args={arg: h for arg, _opt, h, _req in spec if h},
-             macro=name.endswith(("_PLOT", "_PLOT_LOG")), errors="accept")
+             macro=name.endswith(("_PLOT", "_PLOT_LOG")))
     return worksheet_function
 
 
