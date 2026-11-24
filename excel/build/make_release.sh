@@ -7,13 +7,16 @@
 #
 #   extraplus-excel-vX.Y.Z/
 #       install.bat  uninstall.bat  README.md
-#       files/  install.ps1 uninstall.ps1 uninstall.bat extraplus.xlam
-#               extrapolation.py requirements-windows.txt pins.psd1
+#       files/  install.ps1 uninstall.ps1 uninstall.bat
+#               extrapolation.py extraplus_xloil.py extraplus_xlcompat.py extraplus_migrate.py
+#               requirements-windows.txt pins.psd1
 #               extraplus-X.Y.Z-py3-none-any.whl manifest.json
 #
+# The Excel add-in (extraplus.xll) is not in the zip: install.ps1 takes it from the
+# xlOil package it installs from the lock (its hash is pinned there).
+#
 # Usage: excel/build/make_release.sh [--dry-run]
-#   --dry-run  allow a missing/stale extraplus.xlam (a placeholder is packed)
-#              and write dist/extraplus-excel-vX.Y.Z-DRYRUN.zip.
+#   --dry-run  allow uncommitted changes and write dist/extraplus-excel-vX.Y.Z-DRYRUN.zip.
 # Needs uv in WSL (UV=/path/to/uv if it is not on PATH).
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -38,40 +41,6 @@ git archive --format=tar HEAD | tar -x -C "$WORK/src"
 SRC="$WORK/src"
 echo "==> $NAME from $(git rev-parse --short HEAD)"
 
-# The add-in must match the UDF module and the pinned xlwings (its VBA loads
-# xlwings64-<version>.dll by name).
-if ! python3 - "$SRC" <<'PY'
-import hashlib, json, re, sys
-from pathlib import Path
-src = Path(sys.argv[1]) / "excel"
-problems = []
-if not (src / "extraplus.xlam").exists():
-    problems.append("excel/extraplus.xlam is not committed")
-info_file = src / "extraplus.xlam.buildinfo.json"
-if info_file.exists():
-    info = json.loads(info_file.read_text())
-    sha = hashlib.sha256((src / "extrapolation.py").read_bytes()).hexdigest()
-    lock = re.search(r"^xlwings==(\S+)", (src / "requirements-windows.txt").read_text(), re.M).group(1)
-    if info["extrapolation_py_sha256"] != sha:
-        problems.append("excel/extrapolation.py changed after extraplus.xlam was built")
-    if info["xlwings"] != lock:
-        problems.append(f"extraplus.xlam was built with xlwings {info['xlwings']}, the lock pins {lock}")
-else:
-    problems.append("excel/extraplus.xlam.buildinfo.json is missing")
-if problems:
-    print("\n".join("    " + p for p in problems), file=sys.stderr)
-    sys.exit(1)
-PY
-then
-    if [ "$DRY_RUN" = 1 ]; then
-        echo "    (dry run: packing a placeholder extraplus.xlam)"
-        [ -f "$SRC/excel/extraplus.xlam" ] || : > "$SRC/excel/extraplus.xlam"
-    else
-        echo "Rebuild the add-in with excel/build/build_addin.sh and commit it." >&2
-        exit 1
-    fi
-fi
-
 "$UV" build --quiet --wheel --out-dir "$WORK/wheel" "$SRC"
 WHEEL="$WORK/wheel/extraplus-$VERSION-py3-none-any.whl"
 [ -f "$WHEEL" ] || { echo "Expected wheel $WHEEL was not built." >&2; exit 1; }
@@ -80,7 +49,7 @@ STAGE="$WORK/stage/$NAME"
 mkdir -p "$STAGE/files"
 cp "$SRC"/excel/{install.bat,uninstall.bat} "$STAGE/"
 cp "$SRC/excel/README.md" "$STAGE/README.md"
-cp "$SRC"/excel/{install.ps1,uninstall.ps1,uninstall.bat,extraplus.xlam,extrapolation.py,requirements-windows.txt,pins.psd1} \
+cp "$SRC"/excel/{install.ps1,uninstall.ps1,uninstall.bat,extrapolation.py,extraplus_xloil.py,extraplus_xlcompat.py,extraplus_migrate.py,requirements-windows.txt,pins.psd1} \
    "$WHEEL" "$STAGE/files/"
 python3 "$REPO/excel/build/write_manifest.py" "$STAGE/files/$(basename "$WHEEL")" \
     "$STAGE/files/requirements-windows.txt" "$STAGE/files/manifest.json" >/dev/null
@@ -99,8 +68,8 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
 names = zipfile.ZipFile(out).namelist()
 inner = [n.split("/", 1)[1] for n in names]
 required = ["install.bat", "uninstall.bat", "README.md"] + [f"files/{f}" for f in (
-    "install.ps1", "uninstall.ps1", "uninstall.bat", "extraplus.xlam", "extrapolation.py",
-    "requirements-windows.txt", "pins.psd1", "manifest.json")]
+    "install.ps1", "uninstall.ps1", "uninstall.bat", "extrapolation.py", "extraplus_xloil.py",
+    "extraplus_xlcompat.py", "extraplus_migrate.py", "requirements-windows.txt", "pins.psd1", "manifest.json")]
 missing = [r for r in required if r not in inner]
 forbidden = [n for n in inner if n.split("/")[0] in {"research", "tests", "legacy", "dist", "build", "src"}]
 not_crlf = []

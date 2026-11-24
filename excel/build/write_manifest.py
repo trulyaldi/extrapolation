@@ -1,6 +1,6 @@
 """Write manifest.json for install.ps1: package version, wheel file + SHA256,
-and the xlwings version pinned in requirements-windows.txt (the add-in's VBA
-only works with exactly that xlwings)."""
+and the xlOil version pinned in requirements-windows.txt (install.ps1 checks
+that exactly that xlOil, which provides extraplus.xll, was installed)."""
 
 import hashlib
 import json
@@ -9,10 +9,10 @@ import sys
 from pathlib import Path
 
 
-def locked_xlwings(lock):
-    match = re.search(r"^xlwings==(\S+)", Path(lock).read_text(), re.MULTILINE)
+def locked_xloil(lock):
+    match = re.search(r"^xloil==(\S+)", Path(lock).read_text(), re.MULTILINE | re.IGNORECASE)
     if not match:
-        raise SystemExit(f"xlwings is not pinned in {lock}")
+        raise SystemExit(f"xlOil is not pinned in {lock}")
     return match.group(1)
 
 
@@ -23,7 +23,7 @@ def main(wheel, lock, out):
         "version": version,
         "wheel": wheel.name,
         "wheel_sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
-        "xlwings": locked_xlwings(lock),
+        "xloil": locked_xloil(lock),
     }
     Path(out).write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"manifest: {manifest}")

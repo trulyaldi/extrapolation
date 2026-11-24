@@ -11,4 +11,6 @@ dependencies = ["numpy", "scipy", "pandas", "matplotlib"]
 
 [project.optional-dependencies]
 excel = ["xlwings"]
+# The Windows Excel add-in (extraplus.xll): xlOil hosts Python inside Excel; pywin32 gives it COM.
+xloil = ["xlOil", "pywin32; sys_platform == 'win32'"]
 dev = ["pytest", "jupyter"]

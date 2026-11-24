@@ -4,3 +4,5 @@ numpy==2.3.3
 scipy==1.16.2
 pandas==2.3.2
 matplotlib==3.10.6
+# The Excel add-in host (extraplus.xll is xlOil.xll from this wheel).
+xlOil==0.22.1

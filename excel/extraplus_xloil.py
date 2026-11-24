@@ -35,6 +35,7 @@ import numpy as np
 import xloil as xlo
 
 import extrapolation as _x
+import extraplus_migrate as _m
 import extraplus_xlcompat as _c
 
 _ARRAY = xlo.Array(object, dims=2, trim=False)
@@ -156,10 +157,6 @@ for _n, _model in _MODELS.items():
 # ---------------------------------------------------------------------------
 # Write values: extrapolation._values_pass on a COM workbook adapter
 # ---------------------------------------------------------------------------
-
-
-class _ComRange:
-    """The few xlwings Range members _XlwingsBook-style code needs, on a COM Range."""
 
 
 class _ComBook(_x._XlwingsBook):
@@ -292,14 +289,14 @@ def write_values() -> None:
     book = app.ActiveWorkbook
     if book is None:
         return
+    # As the add-in's VBA did: the selection counts only if it is a Range of more than one cell.
     selection = app.Selection
     scope = ""
-    if type(selection).__name__ != "NoneType":
-        try:
-            if selection.CountLarge > 1:
-                scope = "the selected cells"
-        except Exception:   # not a Range (a shape, a chart ...)
-            selection = None
+    try:
+        if selection is not None and selection.CountLarge > 1:
+            scope = "the selected cells"
+    except Exception:   # not a Range (a shape, a chart ...)
+        selection = None
     if scope == "":
         scope = f"the sheet '{app.ActiveSheet.Name}'"
     if book.Path == "":
@@ -331,6 +328,10 @@ _RIBBON = '''<customUI xmlns="http://schemas.microsoft.com/office/2009/07/custom
                   onAction="writeValues"
                   screentip="Replace Extraplus formulas by their values"
                   supertip="Computes the Extraplus formulas in the selection (or on the sheet) again and replaces them with the numbers, so the sheet no longer recalculates them. A backup copy of the workbook is saved first."/>
+          <button id="extraplusConvert" label="Convert old formulas" size="large" imageMso="Refresh"
+                  onAction="convertWorkbook"
+                  screentip="Use the new add-in in this workbook"
+                  supertip="Formulas made with the earlier Extraplus add-in (extraplus.xlam) refer to it by its file. This removes that reference so the formulas use the installed add-in. The formulas and their numbers stay the same; save the workbook afterwards."/>
         </group>
       </tab>
     </tabs>
@@ -342,4 +343,85 @@ def _on_write_values(ctrl):
     write_values()
 
 
-_GUI = xlo.ExcelGUI(ribbon=_RIBBON, funcmap={"writeValues": _on_write_values}, name="Extraplus")
+# ---------------------------------------------------------------------------
+# Workbooks made with the xlwings add-in (extraplus.xlam)
+# ---------------------------------------------------------------------------
+
+_TITLE_CONVERT = "Extraplus: convert old formulas"
+_MB_YESNO, _IDYES = 0x4, 6
+
+
+def convert_workbook(book, ask: bool) -> None:
+    """Convert a workbook from extraplus.xlam to this add-in (extraplus_migrate), asking first if ask."""
+    links = _m.legacy_links(book)
+    if not links and not ask:
+        return
+    if ask:
+        if not links:
+            _message("This workbook does not use the earlier Extraplus add-in (extraplus.xlam).",
+                     _TITLE_CONVERT, _MB_OK | _MB_ICONINFO)
+            return
+    report = _m.convert_workbook(book)
+    _message(_m.summary(report), _TITLE_CONVERT,
+             _MB_OK | (_MB_ICONERROR if report["failed"] else _MB_ICONINFO))
+
+
+def _offer_conversion(name: str) -> None:
+    """When a workbook that uses extraplus.xlam opens in an interactive Excel, offer to convert it."""
+    app = xlo.app()
+    try:
+        if not (app.Visible and app.UserControl):
+            return   # Excel driven by a program: never show a dialog
+        book = app.Workbooks(name)
+    except Exception:
+        return
+    links = _m.legacy_links(book)
+    if not links:
+        return
+    answer = _message(
+        f"'{name}' was made with the earlier Extraplus add-in (extraplus.xlam), which is no longer "
+        "installed.\n\nConvert its Extraplus formulas to the installed add-in now? The formulas and "
+        "their numbers stay the same; save the workbook afterwards to keep the change.\n\n"
+        "(You can also do this later: Extraplus tab > Convert old formulas.)",
+        _TITLE_CONVERT, _MB_YESNO | _MB_ICONQUESTION)
+    if answer == _IDYES:
+        convert_workbook(book, ask=False)
+
+
+def _on_workbook_open(*args):
+    name = args[-1] if args else None
+    if name:
+        xlo.excel_callback(lambda: _offer_conversion(name))
+
+
+def _on_convert(ctrl):
+    book = xlo.app().ActiveWorkbook
+    if book is not None:
+        convert_workbook(book, ask=True)
+
+
+def ExtraplusConvertWorkbook():
+    """Command (Application.Run "ExtraplusConvertWorkbook"): convert the active workbook without dialogs."""
+    book = xlo.app().ActiveWorkbook
+    if book is not None:
+        report = _m.convert_workbook(book)
+        xlo.app().StatusBar = _m.summary(report).replace("\n", " ")[:250]
+
+
+xlo.func(ExtraplusConvertWorkbook, command=True)
+xlo.event.WorkbookOpen += _on_workbook_open
+
+
+def _check_open_workbooks():
+    # Workbooks already open when the add-in loads (opened before it, or with Excel's start).
+    try:
+        for book in xlo.app().Workbooks:
+            _offer_conversion(book.Name)
+    except Exception:
+        pass
+
+
+xlo.excel_callback(_check_open_workbooks)
+
+_GUI = xlo.ExcelGUI(ribbon=_RIBBON, funcmap={"writeValues": _on_write_values, "convertWorkbook": _on_convert},
+                    name="Extraplus")
