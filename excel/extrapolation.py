@@ -1678,3 +1678,14 @@ __all__ = [
     "EXTRAP2_PLOT_LOG",
     "EXTRAP3_PLOT_LOG",
 ]
+
+
+# Performance investigation only: off unless EXTRAPLUS_PROFILE is set in Excel's
+# environment. It wraps references to time the UDF path; results are unchanged.
+if os.environ.get("EXTRAPLUS_PROFILE"):
+    try:
+        import extraplus_profile
+    except ImportError:   # profiling module not shipped with this install: run unprofiled
+        extraplus_profile = None
+    if extraplus_profile is not None:
+        extraplus_profile.install(sys.modules[__name__])
