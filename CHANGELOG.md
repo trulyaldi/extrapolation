@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 (2026-10-20)
+## 0.4.5 (2026-11-24)
 
 Makes large Excel workbooks robust: results no longer get lost when a workbook is opened
 on another computer, recalculation is cached, and finished sheets can be turned into plain
