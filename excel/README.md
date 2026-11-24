@@ -8,9 +8,9 @@ Extraplus adds extrapolation functions to Excel on Windows:
 =EXTRAP1(A2:A20, B2:B20)
 ```
 
-The functions work in **macro-enabled workbooks (`.xlsm`)**. The workbook can
-be saved in any folder, and you can create new ones anywhere. You don't need
-Python, admin rights, or any Excel settings.
+The functions work in any workbook (`.xlsx` or `.xlsm`), saved in any folder.
+You don't need Python, admin rights, or any Excel settings. Extraplus needs
+64-bit Excel.
 
 ## Install
 
@@ -20,8 +20,8 @@ Python, admin rights, or any Excel settings.
    click **More info > Run anyway**.
 4. Wait for `SUCCESS` (a few minutes the first time), then press Enter.
 
-You can delete the unzipped folder afterwards. The first calculation after
-starting Excel takes a few seconds.
+You can delete the unzipped folder afterwards. Excel takes a few seconds
+longer to start, because the add-in loads Python with it.
 
 ## Functions
 
@@ -51,14 +51,13 @@ Optional arguments:
 - `n_fit`: fit only the first `n_fit` points. Useful for checking whether the
   extrapolation is stable as more points are added.
 
-`EXTRAP_ALL_V` replaces three `EXTRAPn_V` formulas with one, which makes big
-sheets calculate faster. Select 3 × 3 cells, type the formula and press
-Ctrl+Shift+Enter. (Excel with dynamic arrays may also fill the 3 × 3 cells
-from a single cell; this has not been tested.)
+`EXTRAP_ALL_V` replaces three `EXTRAPn_V` formulas with one. Select 3 × 3
+cells, type the formula and press Ctrl+Shift+Enter (Excel with dynamic arrays
+also fills the 3 × 3 cells from a single cell).
 
-Don't put `EXTRAP1_V` or `EXTRAP1_H` inside another formula (for example
-`=INDEX(EXTRAP1_V(...), 3)`): they resize their own cells and would
-overwrite the cells next to them. Use `DECAY_RATE1` etc. for a single value.
+`EXTRAP1_V`, `EXTRAP1_H` and `EXTRAP_ALL_V` fill the cells they are entered
+in, like any Excel array function: entered in more cells than they return,
+the extra cells show `#N/A`.
 
 If the input is invalid, the cell shows a message such as
 `Error: At least three paired numeric x/y observations are required.`
@@ -107,13 +106,21 @@ and every replaced formula is listed on the sheet **Extraplus values** with
 the version and a fingerprint of its inputs. To get the formulas back, open
 that copy, or type the formula from the list again.
 
-### Workbooks from other computers
+### Workbooks made with Extraplus 0.4.0 or earlier
 
-A workbook remembers where the add-in was installed on the computer that
-saved it (for example `C:\Users\Anna\AppData\Local\Extraplus\extraplus.xlam`).
-When such a workbook is opened, Extraplus points those links to the add-in
-on this computer, so its formulas keep working. Excel may then ask whether
-to save the changes when you close the workbook; saving keeps the new links.
+Earlier versions used an add-in file, `extraplus.xlam`, and their formulas
+refer to it by its location, for example
+`='C:\Users\Anna\AppData\Local\Extraplus\extraplus.xlam'!EXTRAP1_V(A2:A6,B2:B6)`.
+When you open such a workbook, Extraplus offers to convert it: it removes that
+reference, so the formula becomes `=EXTRAP1_V(A2:A6,B2:B6)`, and removes the
+link to the old file. Nothing else in the formulas changes, and the numbers
+are computed by the same functions. Save the workbook afterwards to keep the
+change. You can also convert later with **Extraplus > Convert old formulas**.
+
+Converted workbooks no longer depend on where Extraplus is installed, so they
+work on any computer with Extraplus.
+
+### Saving a workbook with errors
 
 Before you save a workbook in which cells with Extraplus formulas show
 `#NAME?`, `#REF!` or `#VALUE!`, Extraplus asks whether you really want to
@@ -143,8 +150,11 @@ Close Excel, then go to **Settings > Apps > Extraplus for Excel > Uninstall**.
 ## Troubleshooting
 
 - **"Microsoft Excel is running"**: close all Excel windows and try again.
-- **`#NAME?` in a cell**: the add-in isn't loaded. Check that **Extraplus** is
-  ticked under **File > Options > Add-ins > Manage: Excel Add-ins > Go**. If
-  it's missing, run `install.bat` again.
+- **`#NAME?` in a cell**: the add-in isn't loaded. Check that **extraplus**
+  (`extraplus.xll`) is ticked under **File > Options > Add-ins > Manage: Excel
+  Add-ins > Go**. If it's missing, run `install.bat` again. A formula that
+  still starts with `'...\extraplus.xlam'!` was made with an earlier version:
+  use **Extraplus > Convert old formulas**.
 - **Anything else**: run `install.bat` again, which repairs the installation.
-  If that doesn't help, send me the log file `%TEMP%\extraplus-setup.log`.
+  If that doesn't help, send me the log files `%TEMP%\extraplus-setup.log` and
+  `extraplus.log` from the install folder (usually `%LOCALAPPDATA%\Extraplus`).

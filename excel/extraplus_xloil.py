@@ -413,6 +413,71 @@ xlo.func(ExtraplusConvertWorkbook, command=True)
 xlo.event.WorkbookOpen += _on_workbook_open
 
 
+# ---------------------------------------------------------------------------
+# Save guard (the add-in's ConfirmSave / CountBrokenCells VBA, unchanged in behaviour)
+# ---------------------------------------------------------------------------
+
+_GUARD_MIN_ERRORS = 1           # warn before saving when at least this many Extraplus cells show an error
+_XL_ERRORS = 16                 # xlErrors (SpecialCells value type)
+_BROKEN = {-2146826259, -2146826265, -2146826273}   # #NAME?, #REF!, #VALUE! (COM error codes)
+
+
+def _is_extraplus_formula(formula: str) -> bool:
+    formula = formula.upper()
+    return "EXTRAP" in formula or "UNCERTAINTY" in formula or "DECAY_RATE" in formula
+
+
+def _count_broken_cells(book):
+    count, example = 0, ""
+    for ws in book.Worksheets:
+        try:
+            found = ws.UsedRange.SpecialCells(_x._XL_CELL_TYPE_FORMULAS, _XL_ERRORS)
+        except Exception:   # no error cells, or a protected sheet
+            continue
+        for area in found.Areas:
+            for cell in area.Cells:
+                if cell.Value2 in _BROKEN and _is_extraplus_formula(cell.Formula):
+                    count += 1
+                    if not example:
+                        example = f"'{ws.Name}'!{cell.Address.replace('$', '')}"
+    return count, example
+
+
+def _confirm_save(book) -> bool:
+    """False only when the user, warned, chose not to save. Any problem lets the save go ahead."""
+    try:
+        app = xlo.app()
+        if book.IsAddin or not app.DisplayAlerts:
+            return True
+        try:
+            if book.AutoSaveOn:
+                return True
+        except Exception:   # the property does not exist in every Excel
+            pass
+        n, example = _count_broken_cells(book)
+        if n < _GUARD_MIN_ERRORS:
+            return True
+        return _message(
+            f"{n} cells with Extraplus formulas show #NAME?, #REF! or #VALUE! (for example {example}).\n\n"
+            "This usually means that the Extraplus add-in was not found or the calculation failed. "
+            "Saving now replaces the numbers stored in the file with these errors.\n\nSave anyway?",
+            "Extraplus", _MB_YESNO | 0x30 | _MB_DEFBUTTON2) == _IDYES   # 0x30 = exclamation icon
+    except Exception:
+        return True
+
+
+def _on_before_save(name, save_as_ui, cancel):
+    try:
+        book = xlo.app().Workbooks(name)
+    except Exception:
+        return
+    if not _confirm_save(book):
+        cancel.value = True
+
+
+xlo.event.WorkbookBeforeSave += _on_before_save
+
+
 def _check_open_workbooks():
     # Workbooks already open when the add-in loads (opened before it, or with Excel's start).
     try:
