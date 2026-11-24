@@ -10,6 +10,9 @@ Levels (value of EXTRAPLUS_PROFILE):
   2  as 1, plus the caller's sheet!address per call, to count calls per formula
      (costs extra COM calls per UDF call; measure it before trusting level-2 timings)
 
+The first UDF call of a server is not profiled at the CallUDF level: xlwings imports
+extrapolation.py (and so installs this profiler) inside that call.
+
 Output: EXTRAPLUS_PROFILE_DIR (default: %TEMP%) / extraplus-profile-<pid>.json,
 rewritten at most every 0.5 s while counters change. Counters are cumulative for
 the life of the UDF server, so a run is measured as the difference between two
@@ -22,7 +25,6 @@ What is wrapped (references only; arguments and return values pass through untou
   xlwings.conversion.read / write       argument and return conversion (COM reads of .Value etc.)
   xlwings.udfs.get_cache_key            expand="table" cache key (COM reads of the caller)
   xlwings.udfs.delayed_resize_dynamic_array_formula   counts resizes
-  xlwings._xlwindows COMRetry*          counts COM operations made through xlwings wrappers
   extrapolation._cells, _run_udf, _CACHE.extrapolate, _extrapolate_quietly
 """
 
@@ -127,7 +129,6 @@ def _install_xlwings(level: int) -> None:
         import xlwings.com_server as com_server
         import xlwings.udfs as udfs
         import xlwings.conversion as conversion
-        import xlwings._xlwindows as xlwindows
     except Exception:          # not on Windows, or xlwings missing: profile our code only
         return
 
@@ -135,7 +136,6 @@ def _install_xlwings(level: int) -> None:
 
     def CallUDF(self, script, fname, args, this_workbook=None, caller=None):
         t0 = _perf()
-        _local.com_ops = 0
         with _lock:
             last = _last_exit[0]
             if last is not None:
@@ -164,15 +164,24 @@ def _install_xlwings(level: int) -> None:
                 _time["CallUDF"] += t_end - t0
                 _count["CallUDF"] += 1
                 _count["CallUDF:" + str(fname)] += 1
-                _count["com_ops_in_calls"] += getattr(_local, "com_ops", 0)
                 if address is not None:
                     _per_address[address] += 1
                 _last_exit[0] = _perf()
                 _version[0] += 1
-            _local.com_ops = None
 
     CallUDF._extraplus_profiled = True
     com_server.XLPython.CallUDF = CallUDF
+    # The UDF server may run xlwings' COM server module as __main__ (a separate module
+    # object with its own XLPython class); patch that class too.
+    main = sys.modules.get("__main__")
+    main_cls = getattr(main, "XLPython", None)
+    if main_cls is not None and main_cls is not com_server.XLPython:
+        main_cls.CallUDF = CallUDF
+    _state["server"] = {"argv": list(sys.argv), "main_has_XLPython": main_cls is not None,
+                        "main_file": getattr(main, "__file__", None),
+                        "modules_with_XLPython": [n for n, m in list(sys.modules.items())
+                                                  if getattr(m, "XLPython", None) is not None],
+                        "patched_CallUDF": com_server.XLPython.CallUDF is CallUDF}
 
     udfs.get_udf_module = _timed("xlwings.get_udf_module", udfs.get_udf_module)
     udfs.get_cache_key = _timed("xlwings.get_cache_key", udfs.get_cache_key)
@@ -180,24 +189,6 @@ def _install_xlwings(level: int) -> None:
         "xlwings.resize_scheduled", udfs.delayed_resize_dynamic_array_formula)
     conversion.read = _timed("xlwings.conversion.read", conversion.read)
     conversion.write = _timed("xlwings.conversion.write", conversion.write)
-
-    def _count_com(cls, attr):
-        original = getattr(cls, attr)
-
-        def wrapper(*args, **kwargs):
-            n = getattr(_local, "com_ops", None)
-            if n is not None:
-                _local.com_ops = n + 1
-            else:
-                with _lock:
-                    _count["com_ops_outside_calls"] += 1
-            return original(*args, **kwargs)
-
-        setattr(cls, attr, wrapper)
-
-    _count_com(xlwindows.COMRetryObjectWrapper, "__getattr__")
-    _count_com(xlwindows.COMRetryObjectWrapper, "__setattr__")
-    _count_com(xlwindows.COMRetryMethodWrapper, "__call__")
     _state["installed_xlwings"] = True
 
 
@@ -250,6 +241,7 @@ def snapshot() -> dict:
             "b_fixed_kind": dict(_b_kind),
             "gaps": dict(_gaps),
             "per_address": dict(_per_address),
+            "server": _state.get("server"),
         }
     module = _state["module"]
     if module is not None:
