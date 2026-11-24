@@ -1,21 +1,31 @@
 """
 Extraplus Excel functions through xlOil (an in-process XLL) instead of xlwings.
 
-The functions are those of extrapolation.py, unchanged: each registered
-worksheet function converts its arguments exactly as xlwings 0.37.4 would
-(extraplus_xlcompat.read), calls the function object from extrapolation.py,
-and hands Excel the result exactly as xlwings writes it
-(extraplus_xlcompat.written).  So the names, arguments, help texts, numbers,
-"Error: ..." texts, plots and the "Write values" command are the same; only
-the bridge to Excel changes.
+The worksheet functions below are those of extrapolation.py, copied as they are:
+the same names, decorators (func / arg / ret, with xlwings' arguments), bodies,
+argument options and docs.  Only the decorators differ: here they register the
+function with xlOil, and the registered function
+
+  - reads each argument as xlwings 0.37.4 would (extraplus_xlcompat.read on the
+    cell values xlOil passes), so the function gets the same Python values;
+  - hands Excel the result as xlwings writes it (extraplus_xlcompat.written);
+  - for ret(expand="table") (EXTRAPn_V / _H, EXTRAP_ALL_V), re-enters the formula
+    as an array formula of the result's size after the calculation, when the
+    formula's cells have another size (xlwings' delayed resize).  Without that,
+    an Excel without dynamic arrays shows only the first value of a formula
+    typed in one cell.
+
+The helpers (_run_udf, _excel_errors, _vertical_fit_output, _run_plot_udf,
+the result cache ...) are imported from extrapolation.py, so both add-ins
+compute with the same code.
+
+Without xlOil (tests on Linux), the decorators only record the registration and
+the functions stay plain Python functions.
 
 Differences that remain (the bridge, not the logic):
   - Cells formatted as dates or currency: xlwings (COM Range.Value) reads them
     as datetime / Decimal, xlOil passes the cell's number.  extraplus rejects
     dates, so such inputs gave "Error: ..." under xlwings and are fitted here.
-  - expand="table": xlwings re-entered a formula at the size of its result
-    when the formula's range had another size.  Here Excel shows the result in
-    the formula's cells as it does for any array function (#N/A in extra cells).
   - An exception inside a _PLOT function (they do not catch errors) shows
     xlOil's error text instead of xlwings' traceback text.
 
@@ -29,57 +39,195 @@ import inspect
 import os
 import sys
 import time
+from functools import wraps
 from pathlib import Path
 
 import numpy as np
-import xloil as xlo
+
+try:
+    import xloil as xlo
+except ImportError:   # not inside Excel (tests): nothing is registered
+    xlo = None
 
 import extrapolation as _x
 import extraplus_migrate as _m
 import extraplus_xlcompat as _c
+from extrapolation import (  # noqa: F401  (used by the functions copied below)
+    _CACHE,
+    _EXPONENTIAL,
+    _POWER_LAW,
+    _SQRT_EXPONENTIAL,
+    _b_fixed_per_model,
+    _error_text,
+    _excel_errors,
+    _horizontal_fit_output,
+    _run_plot_udf,
+    _run_udf,
+    _vertical_fit_output,
+    extraplus,
+)
 
-_ARRAY = xlo.Array(object, dims=2, trim=False)
-_CATEGORY = "Extrapolation"
-_NUM = xlo.CellError.NUM
+if xlo is not None:
+    _ARRAY = xlo.Array(object, dims=2, trim=False)
+    _NUM = xlo.CellError.NUM
+else:
+    _ARRAY = None
+    _NUM = "#NUM!"
+
+# name -> {"args": [(name, read options, help, required)], "ret": {...}, "category": ..., "volatile": ...}
+REGISTERED = {}
 
 
-def _make(name: str, call):
-    """Register `name` with the arguments in _c.SIGNATURES[name]; call(*converted) -> result."""
-    spec = _c.SIGNATURES[name]
-    options = [opt for _arg, opt, _help, _req in spec]
+# ---------------------------------------------------------------------------
+# func / arg / ret: xlwings' decorators, registering with xlOil
+# ---------------------------------------------------------------------------
+
+
+def arg(name, convert=None, doc=None, **options):
+    """xlwings.arg: read options and help of one argument."""
+    def decorate(function):
+        if convert is not None:
+            options["convert"] = convert
+        function.__dict__.setdefault("_xlo_args", {})[name] = (dict(options), doc)
+        return function
+    return decorate
+
+
+def ret(**options):
+    """xlwings.ret: options of the result (expand="table")."""
+    def decorate(function):
+        function._xlo_ret = dict(options)
+        return function
+    return decorate
+
+
+def func(function=None, *, category="", volatile=False):
+    """xlwings.func: register the function as a worksheet function."""
+    def decorate(function):
+        _register(function, category, volatile)
+        return function
+    return decorate if function is None else decorate(function)
+
+
+def _register(function, category, volatile):
+    name = function.__name__
+    declared = function.__dict__.get("_xlo_args", {})
+    ret_options = function.__dict__.get("_xlo_ret", {})
+    params = [p for p in inspect.signature(function).parameters.values()]
+    has_caller = any(p.name == "caller" for p in params)
+    spec = []
+    for position, p in enumerate((p for p in params if p.name != "caller"), start=1):
+        options, doc = declared.get(p.name, ({}, None))
+        # Without a doc, xlwings registers "Positional argument <n>" as the argument's help.
+        spec.append((p.name, options, doc if doc else f"Positional argument {position}",
+                     p.default is inspect.Parameter.empty))
+    REGISTERED[name] = {"args": spec, "ret": ret_options, "category": category, "volatile": volatile}
+    if xlo is None:
+        return
+
+    names = [p.name for p in params]
+    expand = ret_options.get("expand")
 
     def worksheet_function(*args):
-        values = [_c.read(_c.xloil_raw(a), opt) for a, opt in zip(args, options)]
-        # An argument left out: xlwings passes the Python default (None), not a converted value.
-        values = [None if a is None else v for a, v in zip(args, values)]
-        return _c.xloil_result(_c.written(call(*values)), _NUM)
+        kwargs = {}
+        for (arg_name, options, _help, _required), value in zip(spec, args):
+            # An argument left out: xlwings passes the Python default (None), not a converted value.
+            kwargs[arg_name] = None if value is None else _c.read(_c.xloil_raw(value), options)
+        if has_caller:
+            kwargs["caller"] = _Caller(xlo.Caller().range.to_com())
+        result = function(**{n: kwargs[n] for n in names if n in kwargs})
+        if expand:
+            _resize_if_needed(result)
+        return _c.xloil_result(_c.written(result), _NUM)
 
-    params = [inspect.Parameter(arg, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=_ARRAY,
-                                default=inspect.Parameter.empty if required else None)
-              for arg, _opt, _help, required in spec]
-    worksheet_function.__signature__ = inspect.Signature(params)
+    worksheet_function.__signature__ = inspect.Signature(
+        [inspect.Parameter(arg_name, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=_ARRAY,
+                           default=inspect.Parameter.empty if required else None)
+         for arg_name, _options, _help, required in spec])
     worksheet_function.__name__ = name
-    original = getattr(_x, name)
-    worksheet_function.__doc__ = original.__doc__
-    help_text = inspect.cleandoc(original.__doc__ or "").split("\n\n")[0].replace("\n", " ")
-    # Error cells are passed to the function as xlwings does (ErrorPropagation=false in extraplus.ini).
-    xlo.func(worksheet_function, name=name, help=help_text, group=_CATEGORY,
-             args={arg: h for arg, _opt, h, _req in spec if h},
-             macro=name.endswith(("_PLOT", "_PLOT_LOG")))
-    return worksheet_function
+    worksheet_function.__doc__ = function.__doc__
+    help_text = inspect.cleandoc(function.__doc__ or "").split("\n\n")[0].replace("\n", " ")
+    # Error cells reach the function as under xlwings (ErrorPropagation=false in extraplus.ini).
+    # Macro type: the plot functions and the resize read the caller's sheet and position, which an
+    # ordinary worksheet function may not do.  The arguments are still values (Excel calculates them).
+    xlo.func(worksheet_function, name=name, help=help_text, group=category,
+             args={arg_name: h for arg_name, _o, h, _r in spec},
+             macro=bool(has_caller or expand), volatile=volatile)
 
 
 # ---------------------------------------------------------------------------
-# Numeric functions: the extrapolation.py functions, called as xlwings calls them
+# expand="table": xlwings.udfs.call_udf + delayed_resize_dynamic_array_formula
 # ---------------------------------------------------------------------------
 
-_VALUE_NAMES = [n for n in _x.__all__ if not n.endswith(("_PLOT", "_PLOT_LOG"))]
-for _name in _VALUE_NAMES:
-    _make(_name, getattr(_x, _name))
+
+def _result_size(result):
+    """The result's size as xlwings computes it from the written value (at least 1 x 1)."""
+    if isinstance(result, np.ndarray) and result.ndim == 2:
+        return (max(1, result.shape[0]), max(1, result.shape[1]))
+    if isinstance(result, (list, tuple)) and result and isinstance(result[0], (list, tuple)):
+        return (max(1, len(result)), max(1, len(result[0])))
+    return (1, 1)
+
+
+_XL_DONE = 0                 # Application.CalculationState: xlDone
+_RESIZE_WAIT_MS = 100        # as xlwings: the resize runs 0.1 s after the call ...
+_pending_resizes = set()     # ... once per range, and only when Excel has finished calculating
+
+
+def _resize_if_needed(result):
+    """If the calling cells are not the result's size, re-enter the formula as an array formula of
+    that size once the calculation is over (xlwings' expand="table": call_udf schedules
+    delayed_resize_dynamic_array_formula). Writing to the sheet is not possible during it."""
+    try:
+        caller = xlo.Caller().range
+        current = (caller.nrows, caller.ncols)
+    except Exception:   # not called from a sheet (VBA, Evaluate)
+        return
+    size = _result_size(result)
+    if current == size:
+        return
+    rng = caller.to_com()   # the calling cells themselves
+    address = f"{rng.Worksheet.Name}!{rng.Address}"
+    key = (rng.Worksheet.Parent.Name, address)
+    if key in _pending_resizes:
+        return
+    _pending_resizes.add(key)
+
+    def resize():
+        try:
+            if xlo.app().CalculationState != _XL_DONE:
+                xlo.excel_callback(resize, wait=_RESIZE_WAIT_MS)   # still calculating: later
+                return
+        except Exception:
+            pass
+        _pending_resizes.discard(key)
+        try:
+            # The formula's cells as they are now: its whole array formula, or the single cell.
+            # (Re-entering a formula recalculates it at once, and during that calculation the caller
+            # can be reported as one cell of the new array; the array itself is the truth.)
+            first = rng.Cells(1, 1)
+            cells = first.CurrentArray if first.HasArray else first
+            if (cells.Rows.Count, cells.Columns.Count) == size:
+                return
+            # xlwings.udfs.delayed_resize_dynamic_array_formula
+            formula = cells.FormulaArray
+            if not formula:
+                formula = cells.Formula
+            # Not cells.Resize(rows, cols): through pywin32's dynamic dispatch that is Resize()(rows, cols),
+            # i.e. Range.Item(rows, cols), a single cell elsewhere.
+            sheet, row, col = first.Worksheet, first.Row, first.Column
+            target = sheet.Range(sheet.Cells(row, col), sheet.Cells(row + size[0] - 1, col + size[1] - 1))
+            if cells.Columns.Count > size[1] or cells.Rows.Count > size[0]:
+                cells.ClearContents()
+            target.FormulaArray = formula
+        except Exception as exc:   # e.g. the cells below are part of another array formula
+            xlo.log.warn(f"Extraplus: could not resize {address} to {size[0]} x {size[1]} cells: {exc}")
+
+    xlo.excel_callback(resize, wait=_RESIZE_WAIT_MS)
 
 
 # ---------------------------------------------------------------------------
-# Plot functions: extrapolation._run_plot_udf with an xlwings-like caller
+# Plot functions: the caller (xlwings' reserved "caller" argument) and its pictures
 # ---------------------------------------------------------------------------
 
 
@@ -140,19 +288,564 @@ class _Caller:
         self.sheet = _Sheet(range_com.Worksheet)
 
 
-def _plot_function(name: str, model: str, log_plot: bool):
-    def call(x_range, y_range, b_fixed=None, n_fit=None):
-        caller = _Caller(xlo.Caller().range.to_com())
-        return _x._run_plot_udf(x_range=x_range, y_range=y_range, model_type=model, caller=caller,
-                                picture_name=name, log_plot=log_plot, b_fixed=b_fixed, n_fit=n_fit)
-
-    return call
+# ---------------------------------------------------------------------------
+# The worksheet functions: extrapolation.py, lines 593-1005 and 1478-1651, as they are
+# ---------------------------------------------------------------------------
 
 
-_MODELS = {1: _x._EXPONENTIAL, 2: _x._SQRT_EXPONENTIAL, 3: _x._POWER_LAW}
-for _n, _model in _MODELS.items():
-    for _suffix, _log in (("_PLOT", False), ("_PLOT_LOG", True)):
-        _make(f"EXTRAP{_n}{_suffix}", _plot_function(f"EXTRAP{_n}{_suffix}", _model, _log))
+# ---------------------------------------------------------------------------
+# Extrapolated values at infinity
+# ---------------------------------------------------------------------------
+
+
+@func(category="Extrapolation", volatile=False)
+@arg("x_range", np.array, ndim=2, doc="Range containing basis-size x values.")
+@arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
+@arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.", err_to_str=True)
+@arg("n_fit", doc="Optional number of first numeric rows used in the fit.", err_to_str=True)
+@_excel_errors
+def EXTRAP1(x_range, y_range, b_fixed=None, n_fit=None):
+    """Exponential extrapolated value C at infinity."""
+    return _run_udf(x_range, y_range, _EXPONENTIAL, b_fixed, n_fit).value
+
+
+@func(category="Extrapolation", volatile=False)
+@arg("x_range", np.array, ndim=2, doc="Range containing basis-size x values.")
+@arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
+@arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.", err_to_str=True)
+@arg("n_fit", doc="Optional number of first numeric rows used in the fit.", err_to_str=True)
+@_excel_errors
+def EXTRAP2(x_range, y_range, b_fixed=None, n_fit=None):
+    """Square-root-exponential extrapolated value C at infinity."""
+    return _run_udf(x_range, y_range, _SQRT_EXPONENTIAL, b_fixed, n_fit).value
+
+
+@func(category="Extrapolation", volatile=False)
+@arg("x_range", np.array, ndim=2, doc="Range containing positive basis-size x values.")
+@arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
+@arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.", err_to_str=True)
+@arg("n_fit", doc="Optional number of first numeric rows used in the fit.", err_to_str=True)
+@_excel_errors
+def EXTRAP3(x_range, y_range, b_fixed=None, n_fit=None):
+    """Power-law extrapolated value C at infinity."""
+    return _run_udf(x_range, y_range, _POWER_LAW, b_fixed, n_fit).value
+
+
+# ---------------------------------------------------------------------------
+# Fitted values at a finite basis size
+# ---------------------------------------------------------------------------
+
+# target defaults to None so that Excel calls Python (and shows "Error: target
+# is required.") when it is left out, instead of rejecting the formula.
+
+
+@func(category="Extrapolation", volatile=False)
+@arg("x_range", np.array, ndim=2, doc="Range containing basis-size x values.")
+@arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
+@arg("target", doc="Basis size to evaluate the fit at, usually beyond the data (a number > 0).")
+@arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.", err_to_str=True)
+@arg("n_fit", doc="Optional number of first numeric rows used in the fit.", err_to_str=True)
+@_excel_errors
+def FINITE_EXTRAP1(x_range, y_range, target=None, b_fixed=None, n_fit=None):
+    """Exponential fit evaluated at the basis size target."""
+    return _run_udf(x_range, y_range, _EXPONENTIAL, b_fixed, n_fit).predict(target)
+
+
+@func(category="Extrapolation", volatile=False)
+@arg("x_range", np.array, ndim=2, doc="Range containing basis-size x values.")
+@arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
+@arg("target", doc="Basis size to evaluate the fit at, usually beyond the data (a number > 0).")
+@arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.", err_to_str=True)
+@arg("n_fit", doc="Optional number of first numeric rows used in the fit.", err_to_str=True)
+@_excel_errors
+def FINITE_EXTRAP2(x_range, y_range, target=None, b_fixed=None, n_fit=None):
+    """Square-root-exponential fit evaluated at the basis size target."""
+    return _run_udf(x_range, y_range, _SQRT_EXPONENTIAL, b_fixed, n_fit).predict(target)
+
+
+@func(category="Extrapolation", volatile=False)
+@arg("x_range", np.array, ndim=2, doc="Range containing positive basis-size x values.")
+@arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
+@arg("target", doc="Basis size to evaluate the fit at, usually beyond the data (a number > 0).")
+@arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.", err_to_str=True)
+@arg("n_fit", doc="Optional number of first numeric rows used in the fit.", err_to_str=True)
+@_excel_errors
+def FINITE_EXTRAP3(x_range, y_range, target=None, b_fixed=None, n_fit=None):
+    """Power-law fit evaluated at the basis size target."""
+    return _run_udf(x_range, y_range, _POWER_LAW, b_fixed, n_fit).predict(target)
+
+
+# ---------------------------------------------------------------------------
+# Uncertainty values
+# ---------------------------------------------------------------------------
+
+
+@func(category="Extrapolation", volatile=False)
+@arg("x_range", np.array, ndim=2)
+@arg("y_range", np.array, ndim=2)
+@arg("b_fixed", err_to_str=True)
+@arg("n_fit", err_to_str=True)
+@_excel_errors
+def UNCERTAINTY1(
+    x_range,
+    y_range,
+    b_fixed=None,
+    n_fit=None,
+):
+    """Exponential asymptote uncertainty in the original y units."""
+    return _run_udf(
+        x_range,
+        y_range,
+        _EXPONENTIAL,
+        b_fixed,
+        n_fit,
+    ).uncertainty
+
+
+@func(category="Extrapolation", volatile=False)
+@arg("x_range", np.array, ndim=2)
+@arg("y_range", np.array, ndim=2)
+@arg("b_fixed", err_to_str=True)
+@arg("n_fit", err_to_str=True)
+@_excel_errors
+def UNCERTAINTY2(
+    x_range,
+    y_range,
+    b_fixed=None,
+    n_fit=None,
+):
+    """Square-root-exponential asymptote uncertainty in original y units."""
+    return _run_udf(
+        x_range,
+        y_range,
+        _SQRT_EXPONENTIAL,
+        b_fixed,
+        n_fit,
+    ).uncertainty
+
+
+@func(category="Extrapolation", volatile=False)
+@arg("x_range", np.array, ndim=2)
+@arg("y_range", np.array, ndim=2)
+@arg("b_fixed", err_to_str=True)
+@arg("n_fit", err_to_str=True)
+@_excel_errors
+def UNCERTAINTY3(
+    x_range,
+    y_range,
+    b_fixed=None,
+    n_fit=None,
+):
+    """Power-law asymptote uncertainty in the original y units."""
+    return _run_udf(
+        x_range,
+        y_range,
+        _POWER_LAW,
+        b_fixed,
+        n_fit,
+    ).uncertainty
+
+
+# ---------------------------------------------------------------------------
+# Fitted B values
+# ---------------------------------------------------------------------------
+
+
+@func(category="Extrapolation", volatile=False)
+@arg("x_range", np.array, ndim=2)
+@arg("y_range", np.array, ndim=2)
+@arg("b_fixed", err_to_str=True)
+@arg("n_fit", err_to_str=True)
+@_excel_errors
+def DECAY_RATE1(x_range, y_range, b_fixed=None, n_fit=None):
+    """Exponential B for the normalized variable x/x_max."""
+    return _run_udf(x_range, y_range, _EXPONENTIAL, b_fixed, n_fit).decay_rate
+
+
+@func(category="Extrapolation", volatile=False)
+@arg("x_range", np.array, ndim=2)
+@arg("y_range", np.array, ndim=2)
+@arg("b_fixed", err_to_str=True)
+@arg("n_fit", err_to_str=True)
+@_excel_errors
+def DECAY_RATE2(x_range, y_range, b_fixed=None, n_fit=None):
+    """Square-root-exponential B for sqrt(x/x_max)."""
+    return _run_udf(x_range, y_range, _SQRT_EXPONENTIAL, b_fixed, n_fit).decay_rate
+
+
+@func(category="Extrapolation", volatile=False)
+@arg("x_range", np.array, ndim=2)
+@arg("y_range", np.array, ndim=2)
+@arg("b_fixed", err_to_str=True)
+@arg("n_fit", err_to_str=True)
+@_excel_errors
+def DECAY_RATE3(x_range, y_range, b_fixed=None, n_fit=None):
+    """Power-law B for (x/x_max)^(-B)."""
+    return _run_udf(x_range, y_range, _POWER_LAW, b_fixed, n_fit).decay_rate
+
+
+# ---------------------------------------------------------------------------
+# Combined spill functions: C, uncertainty, B
+# ---------------------------------------------------------------------------
+
+
+@func(category="Extrapolation", volatile=False)
+@ret(expand="table")
+@arg("x_range", np.array, ndim=2)
+@arg("y_range", np.array, ndim=2)
+@arg("b_fixed", err_to_str=True)
+@arg("n_fit", err_to_str=True)
+@_excel_errors(shape=(3, 1))
+def EXTRAP1_V(
+    x_range,
+    y_range,
+    b_fixed=None,
+    n_fit=None,
+):
+    """Exponential fit. Spills C, uncertainty, and B vertically."""
+    result = _run_udf(
+        x_range,
+        y_range,
+        _EXPONENTIAL,
+        b_fixed,
+        n_fit,
+    )
+    return _vertical_fit_output(result)
+
+
+@func(category="Extrapolation", volatile=False)
+@ret(expand="table")
+@arg("x_range", np.array, ndim=2)
+@arg("y_range", np.array, ndim=2)
+@arg("b_fixed", err_to_str=True)
+@arg("n_fit", err_to_str=True)
+@_excel_errors(shape=(3, 1))
+def EXTRAP2_V(
+    x_range,
+    y_range,
+    b_fixed=None,
+    n_fit=None,
+):
+    """Square-root-exponential fit. Spills C, uncertainty, and B vertically."""
+    result = _run_udf(
+        x_range,
+        y_range,
+        _SQRT_EXPONENTIAL,
+        b_fixed,
+        n_fit,
+    )
+    return _vertical_fit_output(result)
+
+
+@func(category="Extrapolation", volatile=False)
+@ret(expand="table")
+@arg("x_range", np.array, ndim=2)
+@arg("y_range", np.array, ndim=2)
+@arg("b_fixed", err_to_str=True)
+@arg("n_fit", err_to_str=True)
+@_excel_errors(shape=(3, 1))
+def EXTRAP3_V(
+    x_range,
+    y_range,
+    b_fixed=None,
+    n_fit=None,
+):
+    """Power-law fit. Spills C, uncertainty, and B vertically."""
+    result = _run_udf(
+        x_range,
+        y_range,
+        _POWER_LAW,
+        b_fixed,
+        n_fit,
+    )
+    return _vertical_fit_output(result)
+
+
+@func(category="Extrapolation", volatile=False)
+@ret(expand="table")
+@arg("x_range", np.array, ndim=2)
+@arg("y_range", np.array, ndim=2)
+@arg("b_fixed", err_to_str=True)
+@arg("n_fit", err_to_str=True)
+@_excel_errors(shape=(1, 3))
+def EXTRAP1_H(
+    x_range,
+    y_range,
+    b_fixed=None,
+    n_fit=None,
+):
+    """Exponential fit. Spills C, uncertainty, and B horizontally."""
+    result = _run_udf(
+        x_range,
+        y_range,
+        _EXPONENTIAL,
+        b_fixed,
+        n_fit,
+    )
+    return _horizontal_fit_output(result)
+
+
+@func(category="Extrapolation", volatile=False)
+@ret(expand="table")
+@arg("x_range", np.array, ndim=2)
+@arg("y_range", np.array, ndim=2)
+@arg("b_fixed", err_to_str=True)
+@arg("n_fit", err_to_str=True)
+@_excel_errors(shape=(1, 3))
+def EXTRAP2_H(
+    x_range,
+    y_range,
+    b_fixed=None,
+    n_fit=None,
+):
+    """Square-root-exponential fit. Spills C, uncertainty, and B horizontally."""
+    result = _run_udf(
+        x_range,
+        y_range,
+        _SQRT_EXPONENTIAL,
+        b_fixed,
+        n_fit,
+    )
+    return _horizontal_fit_output(result)
+
+
+@func(category="Extrapolation", volatile=False)
+@ret(expand="table")
+@arg("x_range", np.array, ndim=2)
+@arg("y_range", np.array, ndim=2)
+@arg("b_fixed", err_to_str=True)
+@arg("n_fit", err_to_str=True)
+@_excel_errors(shape=(1, 3))
+def EXTRAP3_H(
+    x_range,
+    y_range,
+    b_fixed=None,
+    n_fit=None,
+):
+    """Power-law fit. Spills C, uncertainty, and B horizontally."""
+    result = _run_udf(
+        x_range,
+        y_range,
+        _POWER_LAW,
+        b_fixed,
+        n_fit,
+    )
+    return _horizontal_fit_output(result)
+
+
+# ---------------------------------------------------------------------------
+# All three models in one call
+# ---------------------------------------------------------------------------
+
+
+@func(category="Extrapolation", volatile=False)
+@arg("x_range", np.array, ndim=2, doc="Range containing basis-size x values.")
+@arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
+@arg("b_fixed", ndim=2, err_to_str=True,   # not np.array: it reads blank cells as NaN
+        doc="Optional: 3 cells with a fixed B for models 1, 2, 3 (a blank cell fits that B). Leave out to fit all.")
+@_excel_errors(shape=(3, 3))
+def EXTRAP_ALL_V(x_range, y_range, b_fixed=None):
+    """All three models: columns 1-3 are EXTRAP1_V-EXTRAP3_V (rows C, uncertainty, B)."""
+    columns = []
+    for model, b in zip((_EXPONENTIAL, _SQRT_EXPONENTIAL, _POWER_LAW), _b_fixed_per_model(b_fixed)):
+        try:
+            columns.append(_vertical_fit_output(_run_udf(x_range, y_range, model, b)))
+        except Exception as exc:   # this model only: the others are still shown
+            columns.append(np.full((3, 1), _error_text(exc), dtype=object))
+    return np.hstack(columns)
+
+
+# ---------------------------------------------------------------------------
+# Installed version
+# ---------------------------------------------------------------------------
+
+
+@func(category="Extrapolation", volatile=False)
+@_excel_errors
+def EXTRAPLUS_VERSION():
+    """Installed version of the extraplus package."""
+    return extraplus.__version__
+
+
+@func(category="Extrapolation", volatile=False)
+@_excel_errors
+def EXTRAPLUS_CACHE_STATS():
+    """State of the result cache: mode, file, hits and misses (Ctrl+Alt+F9 refreshes it)."""
+    return _CACHE.stats()
+
+
+
+# ---------------------------------------------------------------------------
+# Matplotlib plots in Excel
+# ---------------------------------------------------------------------------
+
+
+@func(category="Extrapolation", volatile=False)
+@arg("x_range", np.array, ndim=2, doc="Range containing basis-size x values.")
+@arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
+@arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.")
+@arg("n_fit", doc="Optional number of first numeric rows used in the fit.")
+def EXTRAP1_PLOT(
+    x_range,
+    y_range,
+    caller,
+    b_fixed=None,
+    n_fit=None,
+):
+    """
+    Fit the exponential model and insert extrap.py's standard Matplotlib plot
+    directly below the calling Excel cell.
+    """
+    return _run_plot_udf(
+        x_range=x_range,
+        y_range=y_range,
+        model_type=_EXPONENTIAL,
+        caller=caller,
+        picture_name="EXTRAP1_PLOT",
+        log_plot=False,
+        b_fixed=b_fixed,
+        n_fit=n_fit,
+    )
+
+
+@func(category="Extrapolation", volatile=False)
+@arg("x_range", np.array, ndim=2, doc="Range containing basis-size x values.")
+@arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
+@arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.")
+@arg("n_fit", doc="Optional number of first numeric rows used in the fit.")
+def EXTRAP2_PLOT(
+    x_range,
+    y_range,
+    caller,
+    b_fixed=None,
+    n_fit=None,
+):
+    """
+    Fit the square-root-exponential model and insert extrap.py's standard
+    Matplotlib plot directly below the calling Excel cell.
+    """
+    return _run_plot_udf(
+        x_range=x_range,
+        y_range=y_range,
+        model_type=_SQRT_EXPONENTIAL,
+        caller=caller,
+        picture_name="EXTRAP2_PLOT",
+        log_plot=False,
+        b_fixed=b_fixed,
+        n_fit=n_fit,
+    )
+
+
+@func(category="Extrapolation", volatile=False)
+@arg("x_range", np.array, ndim=2, doc="Range containing positive basis-size x values.")
+@arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
+@arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.")
+@arg("n_fit", doc="Optional number of first numeric rows used in the fit.")
+def EXTRAP3_PLOT(
+    x_range,
+    y_range,
+    caller,
+    b_fixed=None,
+    n_fit=None,
+):
+    """
+    Fit the power-law model and insert extrap.py's standard Matplotlib plot
+    directly below the calling Excel cell.
+    """
+    return _run_plot_udf(
+        x_range=x_range,
+        y_range=y_range,
+        model_type=_POWER_LAW,
+        caller=caller,
+        picture_name="EXTRAP3_PLOT",
+        log_plot=False,
+        b_fixed=b_fixed,
+        n_fit=n_fit,
+    )
+
+
+@func(category="Extrapolation", volatile=False)
+@arg("x_range", np.array, ndim=2, doc="Range containing basis-size x values.")
+@arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
+@arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.")
+@arg("n_fit", doc="Optional number of first numeric rows used in the fit.")
+def EXTRAP1_PLOT_LOG(
+    x_range,
+    y_range,
+    caller,
+    b_fixed=None,
+    n_fit=None,
+):
+    """
+    Fit the exponential model and insert extrap.py's logarithmic Matplotlib
+    plot directly below the calling Excel cell.
+    """
+    return _run_plot_udf(
+        x_range=x_range,
+        y_range=y_range,
+        model_type=_EXPONENTIAL,
+        caller=caller,
+        picture_name="EXTRAP1_PLOT_LOG",
+        log_plot=True,
+        b_fixed=b_fixed,
+        n_fit=n_fit,
+    )
+
+
+@func(category="Extrapolation", volatile=False)
+@arg("x_range", np.array, ndim=2, doc="Range containing basis-size x values.")
+@arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
+@arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.")
+@arg("n_fit", doc="Optional number of first numeric rows used in the fit.")
+def EXTRAP2_PLOT_LOG(
+    x_range,
+    y_range,
+    caller,
+    b_fixed=None,
+    n_fit=None,
+):
+    """
+    Fit the square-root-exponential model and insert extrap.py's logarithmic
+    Matplotlib plot directly below the calling Excel cell.
+    """
+    return _run_plot_udf(
+        x_range=x_range,
+        y_range=y_range,
+        model_type=_SQRT_EXPONENTIAL,
+        caller=caller,
+        picture_name="EXTRAP2_PLOT_LOG",
+        log_plot=True,
+        b_fixed=b_fixed,
+        n_fit=n_fit,
+    )
+
+
+@func(category="Extrapolation", volatile=False)
+@arg("x_range", np.array, ndim=2, doc="Range containing positive basis-size x values.")
+@arg("y_range", np.array, ndim=2, doc="Range containing the corresponding y values.")
+@arg("b_fixed", doc="Optional positive fixed B. Leave blank to fit B.")
+@arg("n_fit", doc="Optional number of first numeric rows used in the fit.")
+def EXTRAP3_PLOT_LOG(
+    x_range,
+    y_range,
+    caller,
+    b_fixed=None,
+    n_fit=None,
+):
+    """
+    Fit the power-law model and insert extrap.py's logarithmic Matplotlib plot
+    directly below the calling Excel cell.
+    """
+    return _run_plot_udf(
+        x_range=x_range,
+        y_range=y_range,
+        model_type=_POWER_LAW,
+        caller=caller,
+        picture_name="EXTRAP3_PLOT_LOG",
+        log_plot=True,
+        b_fixed=b_fixed,
+        n_fit=n_fit,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -409,8 +1102,9 @@ def ExtraplusConvertWorkbook():
         xlo.app().StatusBar = _m.summary(report).replace("\n", " ")[:250]
 
 
-xlo.func(ExtraplusConvertWorkbook, command=True)
-xlo.event.WorkbookOpen += _on_workbook_open
+if xlo is not None:
+    xlo.func(ExtraplusConvertWorkbook, command=True)
+    xlo.event.WorkbookOpen += _on_workbook_open
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +1169,8 @@ def _on_before_save(name, save_as_ui, cancel):
         cancel.value = True
 
 
-xlo.event.WorkbookBeforeSave += _on_before_save
+if xlo is not None:
+    xlo.event.WorkbookBeforeSave += _on_before_save
 
 
 def _check_open_workbooks():
@@ -487,7 +1182,9 @@ def _check_open_workbooks():
         pass
 
 
-xlo.excel_callback(_check_open_workbooks)
+if xlo is not None:
+    xlo.excel_callback(_check_open_workbooks)
 
-_GUI = xlo.ExcelGUI(ribbon=_RIBBON, funcmap={"writeValues": _on_write_values, "convertWorkbook": _on_convert},
-                    name="Extraplus")
+if xlo is not None:
+    _GUI = xlo.ExcelGUI(ribbon=_RIBBON, funcmap={"writeValues": _on_write_values, "convertWorkbook": _on_convert},
+                        name="Extraplus")
